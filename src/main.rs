@@ -95,8 +95,8 @@ SLACK_COOKIE override), the Web API serves threads, search, the newest
 messages, every conversation you are a member of, and unread markers; a
 thread lands in the cache, the open conversation is re-checked every
 --poll seconds. Without a sign-in, slackdump does the same more slowly,
-and `a` still archives a new conversation into the root. Nothing is ever
-written to Slack.
+and `a` still archives a new conversation into the root. The only writes
+to Slack are m and M, which move your own read marker.
 
 exit codes
   0  ok        1  no archive, or the conversation was not found
@@ -168,7 +168,15 @@ fn parse_args() -> Result<Opts, String> {
             "--no-images" => opts.no_images = true,
             "--image-protocol" => {
                 let v = value("--image-protocol")?;
-                opts.query_protocol = matches!(v.as_str(), "query" | "auto");
+                opts.query_protocol = match v.as_str() {
+                    "query" | "auto" => true,
+                    "halfblocks" => false,
+                    other => {
+                        return Err(format!(
+                            "--image-protocol: {other} is not halfblocks or query"
+                        ))
+                    }
+                };
             }
             "--fetch-file" => {
                 let url = value("--fetch-file")?;

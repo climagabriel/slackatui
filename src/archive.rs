@@ -123,6 +123,8 @@ pub struct Msg {
 #[derive(Clone, Debug)]
 pub struct FileInfo {
     pub id: String,
+    /// The conversation the message carrying the file belongs to.
+    pub channel: String,
     pub name: String,
     pub filetype: String,
     pub size: Option<i64>,
@@ -182,30 +184,36 @@ impl Msg {
                 if name.is_empty() {
                     name = s("id");
                 }
-                let n = |k: &str| f.get(k).and_then(Value::as_u64).unwrap_or(0) as u32;
+                let n = |k: &str| {
+                    f.get(k)
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        .min(u32::MAX as u64) as u32
+                };
                 let opt = |k: &str| {
                     f.get(k)
                         .and_then(Value::as_str)
                         .filter(|u| !u.is_empty())
                         .map(str::to_string)
                 };
+                // A width and a height from the same rendition, or none.
+                let (width, height) = if n("original_w") > 0 && n("original_h") > 0 {
+                    (n("original_w"), n("original_h"))
+                } else if n("thumb_360_w") > 0 && n("thumb_360_h") > 0 {
+                    (n("thumb_360_w"), n("thumb_360_h"))
+                } else {
+                    (0, 0)
+                };
                 out.push(FileInfo {
                     id: s("id"),
+                    channel: self.channel_id.clone(),
                     name,
                     filetype: s("filetype"),
                     size: f.get("size").and_then(Value::as_i64),
                     mode: s("mode"),
                     mimetype: s("mimetype"),
-                    width: if n("original_w") > 0 {
-                        n("original_w")
-                    } else {
-                        n("thumb_360_w")
-                    },
-                    height: if n("original_h") > 0 {
-                        n("original_h")
-                    } else {
-                        n("thumb_360_h")
-                    },
+                    width,
+                    height,
                     thumb: opt("thumb_720")
                         .or_else(|| opt("thumb_480"))
                         .or_else(|| opt("thumb_360")),

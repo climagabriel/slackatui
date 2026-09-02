@@ -281,21 +281,31 @@ fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
         frame.render_widget(Paragraph::new(Span::styled(text, dim)), inner);
         return;
     }
-    let img = match app.images.get(&key) {
-        Some(ImageState::Ready(img)) => img.clone(),
+    // Encode once per image: the fitted protocol is kept on the view and
+    // rebuilt only when the shown image changes.
+    let stale = match app.stack.last() {
+        Some(View::Image { shown, .. }) => shown.as_ref().map(|(k, _)| k != &key).unwrap_or(true),
         _ => return,
     };
-    let Some(picker) = app.picker.as_ref() else {
-        return;
-    };
-    let fresh = picker.new_resize_protocol(img);
-    if let Some(View::Image { shown, .. }) = app.stack.last_mut() {
-        if shown.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+    if stale {
+        let img = match app.images.get(&key) {
+            Some(ImageState::Ready(img)) => img.clone(),
+            _ => return,
+        };
+        let Some(picker) = app.picker.as_ref() else {
+            return;
+        };
+        let fresh = picker.new_resize_protocol(img);
+        if let Some(View::Image { shown, .. }) = app.stack.last_mut() {
             *shown = Some((key.clone(), fresh));
         }
-        if let Some((_, proto)) = shown.as_mut() {
-            frame.render_stateful_widget(StatefulImage::new(), inner, proto);
-        }
+    }
+    if let Some(View::Image {
+        shown: Some((_, proto)),
+        ..
+    }) = app.stack.last_mut()
+    {
+        frame.render_stateful_widget(StatefulImage::new(), inner, proto);
     }
 }
 

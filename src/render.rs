@@ -101,7 +101,7 @@ pub fn image_cells(f: &FileInfo, font: (u16, u16), width: usize) -> Option<(u16,
         return None;
     }
     let (fw, fh) = (font.0.max(1) as f64, font.1.max(1) as f64);
-    let max_cols = width.saturating_sub(3).clamp(8, 80) as f64;
+    let max_cols = width.saturating_sub(3).clamp(1, 80) as f64;
     let cols = (f.width as f64 / fw).ceil().min(max_cols);
     let rows = (f.height as f64 * (cols * fw / f.width as f64) / fh)
         .ceil()
@@ -1177,18 +1177,23 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
     Rendered { lines, images }
 }
 
+/// Each bar of a divider: the line fits `width`, bars capped at 40 cells.
+fn bar_len(text: &str, width: usize) -> usize {
+    (width.saturating_sub(text.width() + 2) / 2).clamp(1, 40)
+}
+
 /// The divider that opens the unread part of a conversation.
 pub fn divider_new(text: &str, width: usize) -> Line<'static> {
     let style = Style::new()
         .fg(Color::LightYellow)
         .add_modifier(Modifier::BOLD);
-    let bar = "─".repeat(width.saturating_sub(text.width() + 4).clamp(2, 40));
+    let bar = "─".repeat(bar_len(text, width));
     Line::from(Span::styled(format!("{bar} {text} {bar}"), style))
 }
 
 pub fn divider(text: &str, width: usize) -> Line<'static> {
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let bar = "─".repeat(width.saturating_sub(text.width() + 4).clamp(2, 40));
+    let bar = "─".repeat(bar_len(text, width));
     Line::from(Span::styled(format!("{bar} {text} {bar}"), dim))
 }
 
@@ -1298,6 +1303,41 @@ mod tests {
         let segs = mrkdwn("&gt; quoted line\nplain", &c, Sty::default());
         let texts: Vec<String> = wrap(&segs, 40, "").iter().map(line_text).collect();
         assert_eq!(texts, vec!["│ quoted line", "plain"]);
+    }
+
+    #[test]
+    fn dividers_fit_the_width_and_images_get_a_column_on_narrow_panes() {
+        for w in [4usize, 12, 20, 60, 200] {
+            let d = line_text(&divider("Wed 2026-09-02", w));
+            let n = line_text(&divider_new("new", w));
+            assert!(
+                d.width() <= w.max(20),
+                "divider {} wide for width {w}",
+                d.width()
+            );
+            assert!(
+                n.width() <= w.max(9),
+                "new divider {} wide for width {w}",
+                n.width()
+            );
+        }
+        let f = FileInfo {
+            id: "F1".into(),
+            channel: "C1".into(),
+            name: "a.png".into(),
+            filetype: "png".into(),
+            size: None,
+            mode: "hosted".into(),
+            mimetype: "image/png".into(),
+            width: 4000,
+            height: 1000,
+            thumb: None,
+            url: None,
+        };
+        let (cols, rows) = image_cells(&f, (10, 20), 5).unwrap();
+        assert!(cols >= 1 && rows >= 1);
+        let (cols, rows) = image_cells(&f, (10, 20), 120).unwrap();
+        assert!(cols <= 80 && rows <= 14, "{cols}x{rows}");
     }
 
     #[test]

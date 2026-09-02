@@ -177,6 +177,14 @@ impl Client {
 
     /// A file's bytes, with the session's credentials as files.slack.com wants them.
     pub fn download(&self, url: &str) -> Result<Vec<u8>, String> {
+        // The session credentials go to Slack's own file hosts only.
+        let host = url
+            .strip_prefix("https://")
+            .and_then(|r| r.split('/').next())
+            .ok_or_else(|| format!("GET file: {url}: not an https URL"))?;
+        if host != "slack.com" && !host.ends_with(".slack.com") {
+            return Err(format!("GET file: refusing to send the session to {host}"));
+        }
         let mut resp = self
             .agent
             .get(url)
@@ -186,6 +194,17 @@ impl Client {
             .map_err(|e| format!("GET file: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("GET file: HTTP {}", resp.status().as_u16()));
+        }
+        let html = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|t| t.starts_with("text/html"))
+            .unwrap_or(false);
+        if html {
+            return Err(
+                "GET file: Slack answered with a page, not the file (session expired?)".to_string(),
+            );
         }
         let bytes = resp
             .body_mut()

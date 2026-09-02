@@ -365,6 +365,8 @@ pub struct App {
     pub file_job: Option<Job>,
     /// `C`: cached conversations in light green.
     pub highlight_cached: bool,
+    /// Bumped by every mark; a counts result from before it is stale.
+    pub counts_gen: u64,
 }
 
 impl App {
@@ -412,6 +414,7 @@ impl App {
             inline: HashMap::new(),
             file_job: None,
             highlight_cached: false,
+            counts_gen: 0,
         };
         app.apply_filter();
         if live {
@@ -1127,6 +1130,15 @@ impl App {
             } else {
                 o.list.cursor + n
             };
+            if was_empty {
+                let last_read = self.corpus.convs[conv].last_read;
+                if last_read > 0 {
+                    if let Some(first_new) = o.list.msgs.iter().position(|m| m.id > last_read) {
+                        o.list.cursor = first_new;
+                        o.list.align_top = true;
+                    }
+                }
+            }
             o.list.mark_dirty();
         }
         o.total = o.list.len() as i64;
@@ -1192,7 +1204,7 @@ impl App {
                 mine: 0,
                 score: 0.0,
                 first_id: created,
-                last_id: created,
+                last_id: 0,
                 live_only: true,
                 unread: false,
                 mentions: 0,
@@ -1213,7 +1225,7 @@ impl App {
     }
 
     /// Unread markers from `client.counts`, and last activity for
-    /// conversations no archive holds.
+    /// conversations no archive holds. Lists re-render only on a change.
     fn apply_counts(&mut self, v: &Value) {
         let mut changed = false;
         for key in ["channels", "ims", "mpims"] {
@@ -1225,6 +1237,7 @@ impl App {
                     continue;
                 };
                 let conv = &mut self.corpus.convs[idx];
+                let before = (conv.unread, conv.mentions, conv.last_read, conv.last_id);
                 conv.unread = c
                     .get("has_unreads")
                     .and_then(Value::as_bool)
@@ -1242,7 +1255,7 @@ impl App {
                         conv.last_id = latest;
                     }
                 }
-                changed = true;
+                changed |= before != (conv.unread, conv.mentions, conv.last_read, conv.last_id);
             }
         }
         if changed {
@@ -1331,10 +1344,11 @@ impl App {
         }
     }
 
-    /// A local copy of a file: the archive's own upload first, then the cache.
+    /// A local copy of a file: the upload directory of the archive holding
+    /// the file's conversation first, then the cache.
     fn local_file(&self, f: &crate::archive::FileInfo, full: bool) -> Option<PathBuf> {
-        if let Some(o) = self.open.as_ref() {
-            let conv = &self.corpus.convs[o.conv];
+        if let Some(idx) = self.corpus.conv_by_channel(&f.channel) {
+            let conv = &self.corpus.convs[idx];
             if !conv.live_only {
                 let dir = self.corpus.archives[conv.archive]
                     .dir
@@ -1357,6 +1371,8 @@ impl App {
     }
 
     /// Have a file's pixels ready or on their way. `full` wants the original.
+    /// A download waits in the queue until a sign-in provides the client, so
+    /// an image first seen before sign-in still arrives.
     pub fn ensure_image(&mut self, f: &crate::archive::FileInfo, full: bool) {
         let key = if full {
             format!("{}:full", f.id)
@@ -1379,8 +1395,8 @@ impl App {
         } else {
             f.thumb.clone().or_else(|| f.url.clone())
         };
-        let state = match (self.api.is_some(), url) {
-            (true, Some(url)) => {
+        let state = match url {
+            Some(url) => {
                 let name = if full {
                     format!("{}.{}", f.id, f.ext())
                 } else {
@@ -1391,8 +1407,7 @@ impl App {
                     dest: self.cache_dir.join("files").join(name),
                 }
             }
-            (false, _) => ImageState::Failed("not signed in".to_string()),
-            (_, None) => ImageState::Failed("no download URL".to_string()),
+            None => ImageState::Failed("no download URL".to_string()),
         };
         self.images.insert(key, state);
     }
@@ -1433,73 +1448,93 @@ impl App {
         self.inline.get(id).map(|(_, _, p)| p)
     }
 
-    /// `m`: the read marker of a conversation moves to its newest message
-    /// here; the highlighted one in the list, the open one otherwise.
-    fn mark_read(&mut self) {
+    /// What a mark applies to: the highlighted conversation from the list,
+    /// else the conversation of the selected message, which in a search or
+    /// threads view is not necessarily the open one.
+    fn mark_target(&self) -> Result<(usize, Option<Msg>), String> {
+        match self.focus {
+            Focus::Convs => {
+                let idx = *self
+                    .filtered
+                    .get(self.conv_cursor)
+                    .ok_or("nothing highlighted")?;
+                Ok((idx, None))
+            }
+            Focus::Msgs => {
+                let m = self.selected().cloned().ok_or("no message selected")?;
+                let idx = self.corpus.conv_by_channel(&m.channel_id).ok_or_else(|| {
+                    format!("{} is not a conversation this tool knows", m.channel_id)
+                })?;
+                Ok((idx, Some(m)))
+            }
+        }
+    }
+
+    fn mark_with(&mut self, idx: usize, id: i64) {
         let Some(c) = self.api.clone() else {
-            self.status = "marking read needs the Slack sign-in".to_string();
+            self.status = "marking needs the Slack sign-in".to_string();
             return;
         };
         if self.job.is_some() {
             self.status = "a fetch is already running".to_string();
             return;
         }
-        let (idx, id) = match (self.focus, self.open.as_ref()) {
-            (Focus::Convs, _) => {
-                let Some(&idx) = self.filtered.get(self.conv_cursor) else {
-                    return;
-                };
-                (idx, self.corpus.convs[idx].last_id)
-            }
-            (_, Some(o)) => (
-                o.conv,
-                o.list
-                    .msgs
-                    .last()
-                    .map(|m| m.id)
-                    .unwrap_or(self.corpus.convs[o.conv].last_id),
-            ),
-            _ => return,
-        };
-        if id == 0 {
-            self.status = "nothing to mark".to_string();
+        if id <= 0 {
+            self.status =
+                "nothing to mark: no message of that conversation is known yet".to_string();
             return;
         }
         let cid = self.corpus.convs[idx].id.clone();
         self.job = Some(live::api_mark(c, idx, cid, id));
     }
 
-    /// `M`: the read marker moves to just before the message under the
-    /// cursor, so that message and everything after it read as unread; in
-    /// the list, the highlighted conversation's newest message becomes unread.
-    fn mark_unread(&mut self) {
-        let Some(c) = self.api.clone() else {
-            self.status = "marking unread needs the Slack sign-in".to_string();
-            return;
-        };
-        if self.job.is_some() {
-            self.status = "a fetch is already running".to_string();
-            return;
-        }
-        let (idx, id) = match (self.focus, self.open.as_ref()) {
-            (Focus::Convs, _) => {
-                let Some(&idx) = self.filtered.get(self.conv_cursor) else {
-                    return;
-                };
-                (idx, self.corpus.convs[idx].last_id)
+    /// `m`: the read marker moves to the newest message known of the target
+    /// conversation: the newest loaded when it is the open one, else the
+    /// newest the archive or Slack's counts reported.
+    fn mark_read(&mut self) {
+        let (idx, _) = match self.mark_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = e;
+                return;
             }
-            (_, Some(o)) => match self.selected() {
-                Some(m) => (o.conv, m.id),
-                None => return,
-            },
-            _ => return,
         };
-        if id <= 1 {
-            self.status = "nothing to mark".to_string();
-            return;
-        }
-        let cid = self.corpus.convs[idx].id.clone();
-        self.job = Some(live::api_mark(c, idx, cid, id - 1));
+        let newest_loaded = self
+            .open
+            .as_ref()
+            .filter(|o| o.conv == idx)
+            .and_then(|o| o.list.msgs.last().map(|m| m.id));
+        let id = newest_loaded.unwrap_or(self.corpus.convs[idx].last_id);
+        self.mark_with(idx, id);
+    }
+
+    /// `M`: the marker moves to the message before the one under the cursor,
+    /// so that one and everything after it read as unread. When the previous
+    /// message is not loaded, the timestamp one microsecond earlier stands in;
+    /// from the list, the conversation's newest known message becomes unread.
+    fn mark_unread(&mut self) {
+        let (idx, sel) = match self.mark_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let id = match sel {
+            Some(m) => {
+                let previous = self.active_list().and_then(|l| {
+                    let at = l.msgs.iter().position(|x| x.id == m.id)?;
+                    l.msgs[..at]
+                        .iter()
+                        .rev()
+                        .find(|x| x.channel_id == m.channel_id)
+                        .map(|x| x.id)
+                });
+                previous.unwrap_or(m.id - 1)
+            }
+            None => self.corpus.convs[idx].last_id - 1,
+        };
+        self.mark_with(idx, id);
     }
 
     /// Esc in the list: the home view, with no filter and nothing open.
@@ -1511,6 +1546,7 @@ impl App {
         self.open = None;
         self.stack.clear();
         self.status.clear();
+        self.focus = Focus::Convs;
     }
 
     /// `i`: the selected message's images, full pane.
@@ -1663,11 +1699,14 @@ impl App {
                 Ok(Done::Conversations(list)) => {
                     self.merge_conversations(list);
                     if let Some(c) = self.api.clone() {
-                        self.bg = Some(live::api_counts(c));
+                        self.bg = Some(live::api_counts(c, self.counts_gen));
                     }
                 }
                 Ok(Done::Counts(v)) => {
-                    self.apply_counts(&v);
+                    // A counts snapshot taken before a mark would undo it.
+                    if matches!(job.kind, JobKind::Counts { gen } if gen == self.counts_gen) {
+                        self.apply_counts(&v);
+                    }
                     self.last_counts = Instant::now();
                 }
                 Ok(Done::Messages(msgs)) => {
@@ -1698,7 +1737,7 @@ impl App {
                     }
                 } else if self.last_counts.elapsed() >= self.poll_every * 2 {
                     self.last_counts = Instant::now();
-                    self.bg = Some(live::api_counts(c));
+                    self.bg = Some(live::api_counts(c, self.counts_gen));
                 }
             }
         }
@@ -1759,6 +1798,7 @@ impl App {
                 let c = &mut self.corpus.convs[conv];
                 c.last_read = id;
                 c.unread = c.last_id > id;
+                self.counts_gen += 1;
                 if !c.unread {
                     c.mentions = 0;
                 }
@@ -2008,7 +2048,12 @@ impl App {
                     }
                 }
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
-                    self.stack.pop();
+                    // The originals are large; keep only thumbnails once the viewer closes.
+                    if let Some(View::Image { files, .. }) = self.stack.pop() {
+                        for f in files {
+                            self.images.remove(&format!("{}:full", f.id));
+                        }
+                    }
                 }
                 _ => {}
             }

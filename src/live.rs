@@ -33,8 +33,8 @@ pub enum JobKind {
     Older { conv: usize },
     /// The conversations the user is a member of.
     Conversations,
-    /// Unread state per conversation.
-    Counts,
+    /// Unread state per conversation, tagged with the generation it was asked for.
+    Counts { gen: u64 },
     /// One file into the file cache.
     File { id: String },
     /// The read marker of `conv` moved to message `id`.
@@ -257,9 +257,12 @@ pub fn fetch_file(client: Arc<Client>, id: String, url: String, dest: PathBuf) -
     spawn(JobKind::File { id }, String::new(), move || {
         let bytes = client.download(&url)?;
         if let Some(d) = dest.parent() {
-            let _ = std::fs::create_dir_all(d);
+            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+        // Whole file or nothing: a reader must never open a truncated copy.
+        let part = dest.with_extension("part");
+        std::fs::write(&part, &bytes).map_err(|e| e.to_string())?;
+        std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
         Ok(Done::File(dest))
     })
 }
@@ -275,8 +278,8 @@ pub fn api_mark(client: Arc<Client>, conv: usize, cid: String, id: i64) -> Job {
     )
 }
 
-pub fn api_counts(client: Arc<Client>) -> Job {
-    spawn(JobKind::Counts, String::new(), move || {
+pub fn api_counts(client: Arc<Client>, gen: u64) -> Job {
+    spawn(JobKind::Counts { gen }, String::new(), move || {
         Ok(Done::Counts(client.counts()?))
     })
 }
