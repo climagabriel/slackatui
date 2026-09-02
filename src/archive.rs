@@ -61,6 +61,8 @@ pub struct Conv {
     pub msgs: i64,
     /// Messages written by the archive's owner, replies included.
     pub mine: i64,
+    /// The same messages weighted by recency: each counts 2^(-age / half-life).
+    pub score: f64,
     pub first_id: i64,
     pub last_id: i64,
 }
@@ -199,7 +201,7 @@ fn ts_to_id(ts: &str) -> Option<i64> {
 }
 
 impl Corpus {
-    pub fn open(root: &Path) -> Result<Corpus, String> {
+    pub fn open(root: &Path, half_life_days: f64) -> Result<Corpus, String> {
         let mut archives = Vec::new();
         for set in ARCHIVE_SETS {
             let dir = root.join(set);
@@ -247,7 +249,7 @@ impl Corpus {
             .unwrap_or_else(|| "https://slack.com".to_string());
         let mut convs = Vec::new();
         for (ai, a) in archives.iter_mut().enumerate() {
-            match a.scan_convs(ai, me.as_deref()) {
+            match a.scan_convs(ai, me.as_deref(), half_life_days) {
                 Ok(mut c) => convs.append(&mut c),
                 Err(e) => eprintln!("slack-tui: {}: {e}", a.rel),
             }
@@ -439,7 +441,12 @@ impl Archive {
         "bot".to_string()
     }
 
-    fn scan_convs(&mut self, ai: usize, me: Option<&str>) -> rusqlite::Result<Vec<Conv>> {
+    fn scan_convs(
+        &mut self,
+        ai: usize,
+        me: Option<&str>,
+        half_life_days: f64,
+    ) -> rusqlite::Result<Vec<Conv>> {
         struct Meta {
             name: String,
             kind: Kind,
@@ -501,19 +508,32 @@ impl Archive {
                 }
             }
         }
-        // The owner's messages per channel. The LIKE prefilter keeps the JSON
-        // parse to rows that can match: 197 ms -> 56 ms on the largest archive.
-        let mut mine: HashMap<String, i64> = HashMap::new();
+        // The owner's messages per channel: how many, and a recency-weighted
+        // score in which a message counts 2^(-age / half-life). The LIKE
+        // prefilter keeps the JSON parse to rows that can match: 197 ms -> 56 ms
+        // on the largest archive.
+        let mut mine: HashMap<String, (i64, f64)> = HashMap::new();
         if let Some(me) = me {
             let like = format!("%\"user\":\"{}\"%", me.replace(['%', '_'], ""));
             let mut stmt = self.conn.prepare(
-                "SELECT CHANNEL_ID, COUNT(DISTINCT TS) FROM MESSAGE \
-                 WHERE DATA LIKE ?1 AND json_extract(DATA, '$.user') = ?2 GROUP BY CHANNEL_ID",
+                "SELECT DISTINCT CHANNEL_ID, TS FROM MESSAGE \
+                 WHERE DATA LIKE ?1 AND json_extract(DATA, '$.user') = ?2",
             )?;
             let rows = stmt.query_map(params![like, me], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?;
-            mine = rows.flatten().collect();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let half_life_secs = half_life_days.max(0.01) * 86_400.0;
+            for (cid, ts) in rows.flatten() {
+                let secs: f64 = ts.parse().unwrap_or(0.0);
+                let age = (now - secs).max(0.0);
+                let e = mine.entry(cid).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += 0.5f64.powf(age / half_life_secs);
+            }
         }
         let mut convs = Vec::new();
         let mut stmt = self.conn.prepare(
@@ -536,7 +556,7 @@ impl Archive {
                 ),
                 None => (cid.clone(), Kind::Channel, false),
             };
-            let mine = mine.get(&cid).copied().unwrap_or(0);
+            let (mine, score) = mine.get(&cid).copied().unwrap_or((0, 0.0));
             convs.push(Conv {
                 archive: ai,
                 id: cid,
@@ -545,6 +565,7 @@ impl Archive {
                 archived,
                 msgs,
                 mine,
+                score,
                 first_id,
                 last_id,
             });

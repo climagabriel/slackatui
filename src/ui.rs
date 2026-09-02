@@ -36,13 +36,9 @@ fn border(focused: bool) -> Style {
 fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Convs;
     let title = if app.filter.is_empty() {
-        format!(
-            " conversations {} · by {} ",
-            app.filtered.len(),
-            app.sort.label()
-        )
+        format!(" {} · by {} ", app.filtered.len(), app.sort_label())
     } else {
-        format!(" conversations {} · '{}' ", app.filtered.len(), app.filter)
+        format!(" {} · '{}' ", app.filtered.len(), app.filter)
     };
     let block = Block::bordered().title(title).border_style(border(focused));
     let inner = block.inner(area);
@@ -54,10 +50,10 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&i| {
             let c = app.conv(i);
-            // The number that ordered the list: the owner's messages under
-            // "my activity", the conversation's total otherwise.
+            // The number that ordered the list: the owner's recency-weighted
+            // messages under "my activity", the conversation's total otherwise.
             let count = human_count(if app.sort == Sort::Mine {
-                c.mine
+                c.score.round() as i64
             } else {
                 c.msgs
             });

@@ -27,9 +27,10 @@ Opens every slackdump.sqlite under <root>/full/ and <root>/dms/ read-only
 the conversations on the left, the messages of the selected one on the
 right. Enter on a message opens its thread; Esc goes back.
 
-Conversations are ordered by your own activity: the ones you wrote the
-most messages in come first (s cycles to name, recent, size). Your user
-id comes from the DM archive, or from SLACK_SELF_USER_ID.
+Conversations are ordered by your own activity, weighted by recency: each
+message you wrote counts 2^(-age / half-life), so where you wrote last
+week outranks where you wrote a lot a year ago (s cycles to name, recent,
+size). Your user id comes from the DM archive, or from SLACK_SELF_USER_ID.
 
 flags
   --root DIR      archive root (default $SLACKDUMPS, then /srv/slackdumps)
@@ -39,6 +40,8 @@ flags
   --dump NAME     print the newest messages of one conversation as text and exit
   --limit N       with --dump: how many top-level messages (default 100)
   --width W       with --dump: wrap width (default 100)
+  --half-life D   days after which one of your messages counts half in the
+                  activity order (default 30)
   --help          this text
 
 environment
@@ -71,6 +74,7 @@ struct Opts {
     dump: Option<String>,
     limit: usize,
     width: usize,
+    half_life: f64,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -84,6 +88,7 @@ fn parse_args() -> Result<Opts, String> {
         dump: None,
         limit: 100,
         width: 100,
+        half_life: 30.0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -102,6 +107,13 @@ fn parse_args() -> Result<Opts, String> {
                 opts.limit = value("--limit")?
                     .parse()
                     .map_err(|_| "--limit wants a number".to_string())?
+            }
+            "--half-life" => {
+                opts.half_life = value("--half-life")?
+                    .parse()
+                    .ok()
+                    .filter(|d: &f64| *d > 0.0)
+                    .ok_or_else(|| "--half-life wants a positive number of days".to_string())?
             }
             "--width" => {
                 opts.width = value("--width")?
@@ -140,26 +152,27 @@ fn run() -> i32 {
             return 2;
         }
     };
-    let corpus = match Corpus::open(&opts.root) {
+    let corpus = match Corpus::open(&opts.root, opts.half_life) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("slack-tui: {e}");
             return 1;
         }
     };
-    let mut app = App::new(corpus, opts.tz);
+    let mut app = App::new(corpus, opts.tz, opts.half_life);
     if opts.list {
         let mut text = String::new();
         text.push_str(&format!(
-            "{:<48} {:>6} {:>8}  {:<10} → {:<10}  {}\n",
-            "CONVERSATION", "MINE", "MSGS", "FIRST", "LAST", "ARCHIVE"
+            "{:<48} {:>7} {:>6} {:>8}  {:<10} → {:<10}  {}\n",
+            "CONVERSATION", "SCORE", "MINE", "MSGS", "FIRST", "LAST", "ARCHIVE"
         ));
         for &i in &app.filtered {
             let c = app.conv(i);
             let a = &app.corpus.archives[c.archive];
             text.push_str(&format!(
-                "{:<48} {:>6} {:>8}  {} → {}  {}\n",
+                "{:<48} {:>7.1} {:>6} {:>8}  {} → {}  {}\n",
                 c.name,
+                c.score,
                 c.mine,
                 c.msgs,
                 app.tz.fmt(c.first_id / 1_000_000, "%Y-%m-%d"),

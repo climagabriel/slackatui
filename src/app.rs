@@ -253,10 +253,13 @@ pub struct App {
     pub quit: bool,
     /// Inner height of the messages pane at the last draw.
     pub msgs_height: usize,
+    /// Days after which one of the owner's messages counts half, in the
+    /// activity order.
+    pub half_life_days: f64,
 }
 
 impl App {
-    pub fn new(corpus: Corpus, tz: Tz) -> App {
+    pub fn new(corpus: Corpus, tz: Tz, half_life_days: f64) -> App {
         let mut app = App {
             corpus,
             tz,
@@ -272,9 +275,18 @@ impl App {
             status: String::new(),
             quit: false,
             msgs_height: 0,
+            half_life_days,
         };
         app.apply_filter();
         app
+    }
+
+    /// The sort as the title names it.
+    pub fn sort_label(&self) -> String {
+        match self.sort {
+            Sort::Mine => format!("my activity ({:.0}d half-life)", self.half_life_days),
+            other => other.label().to_string(),
+        }
     }
 
     pub fn conv(&self, i: usize) -> &Conv {
@@ -315,12 +327,13 @@ impl App {
                         convs[b].archive,
                     ))
             }),
+            // Recency-weighted score first; ties by raw count, then last activity.
             Sort::Mine => idx.sort_by(|&a, &b| {
-                (convs[b].mine, convs[b].msgs, convs[b].last_id).cmp(&(
-                    convs[a].mine,
-                    convs[a].msgs,
-                    convs[a].last_id,
-                ))
+                convs[b]
+                    .score
+                    .partial_cmp(&convs[a].score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then((convs[b].mine, convs[b].last_id).cmp(&(convs[a].mine, convs[a].last_id)))
             }),
             Sort::Recent => idx.sort_by(|&a, &b| convs[b].last_id.cmp(&convs[a].last_id)),
             Sort::Size => idx.sort_by(|&a, &b| convs[b].msgs.cmp(&convs[a].msgs)),
@@ -789,7 +802,7 @@ impl App {
             (KeyCode::Char('s'), false) => {
                 self.sort = self.sort.next();
                 self.apply_filter();
-                self.status = format!("sorted by {}", self.sort.label());
+                self.status = format!("sorted by {}", self.sort_label());
                 if self.sort == Sort::Mine && self.corpus.me.is_none() {
                     self.status =
                         "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
