@@ -141,7 +141,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         .find(|v| !matches!(v, View::Raw { .. }))
     {
         Some(View::Thread { list, live, .. }) => (list, live.as_deref().unwrap_or(conv_archive)),
-        Some(View::Search { list, .. }) => (list, conv_archive),
+        Some(View::Search { list, .. }) | Some(View::Threads { list }) => (list, conv_archive),
         _ => (&mut open.list, conv_archive),
     };
     let ctx = Ctx {
@@ -264,6 +264,7 @@ const HELP: &[(&str, &str)] = &[
         "from a search hit or a thread: show the message in the channel",
     ),
     ("d", "go to a date (YYYY-MM-DD)"),
+    ("T", "threads you took part in, newest reply first"),
     ("v", "raw JSON of the selected message"),
     ("r", "reload the conversation from the archive"),
     (

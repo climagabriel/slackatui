@@ -447,7 +447,7 @@ impl Archive {
                 }
             }
             if let Some(mut m) = Msg::from_api(cid, data) {
-                m.channel_name = name.filter(|n| !n.is_empty());
+                m.channel_name = name.filter(|n| !n.is_empty()).map(|n| format!("#{n}"));
                 out.push(m);
             }
         }
@@ -917,6 +917,35 @@ impl Archive {
         let mut msgs = self.query_msgs(&sql, &[&cid, &root])?;
         self.reply_stats(cid, &mut msgs)?;
         Ok(msgs)
+    }
+
+    /// Roots of every thread the owner wrote in.
+    pub fn my_threads(&self, me: &str) -> rusqlite::Result<Vec<Msg>> {
+        let like = format!("%\"user\":\"{}\"%", me.replace(['%', '_'], ""));
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT CHANNEL_ID, THREAD_TS FROM MESSAGE \
+             WHERE THREAD_TS IS NOT NULL AND DATA LIKE ?1 AND json_extract(DATA, '$.user') = ?2",
+        )?;
+        let roots: Vec<(String, String)> = stmt
+            .query_map(params![like, me], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .flatten()
+            .collect();
+        let sql = format!(
+            "SELECT {cols} FROM MESSAGE m WHERE m.CHANNEL_ID = ?1 AND m.ID = ?2 ORDER BY m.ID ASC, m.CHUNK_ID DESC",
+            cols = Self::COLS
+        );
+        let mut out = Vec::new();
+        for (cid, ts) in roots {
+            let Some(root) = ts_to_id(&ts) else {
+                continue;
+            };
+            let mut msgs = self.query_msgs(&sql, &[&cid, &root])?;
+            self.reply_stats(&cid, &mut msgs)?;
+            out.extend(msgs);
+        }
+        Ok(out)
     }
 
     /// Fill `archived_replies` / `latest_reply_id` for the parents in `msgs`.

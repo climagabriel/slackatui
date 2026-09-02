@@ -185,6 +185,25 @@ pub fn plain(segs: &[Seg]) -> String {
     segs.iter().map(|s| s.text.as_str()).collect()
 }
 
+/// A Slack emoji as a character: the element's own code points when it
+/// carries them, else the shortcode table; a custom emoji stays `:name:`.
+pub fn emoji(name: &str, unicode: Option<&str>) -> String {
+    if let Some(u) = unicode.filter(|u| !u.is_empty()) {
+        let chars: Option<String> = u
+            .split('-')
+            .map(|h| u32::from_str_radix(h, 16).ok().and_then(char::from_u32))
+            .collect();
+        if let Some(s) = chars {
+            return s;
+        }
+    }
+    let bare = name.split("::").next().unwrap_or(name);
+    match emojis::get_by_shortcode(bare) {
+        Some(e) => e.as_str().to_string(),
+        None => format!(":{name}:"),
+    }
+}
+
 pub fn unescape(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -310,6 +329,25 @@ fn inline(cs: &[char], base: Sty, ctx: &Ctx, out: &mut Vec<Seg>) {
                         out.push(Seg::new(unescape(&inner), Sty { code: true, ..base }));
                         i = end + 1;
                         continue;
+                    }
+                }
+            }
+            ':' => {
+                // `:name:` with a known shortcode becomes the character.
+                if let Some(end) = find_char(cs, i + 1, ':') {
+                    let name: String = cs[i + 1..end].iter().collect();
+                    let plausible = !name.is_empty()
+                        && name.len() <= 40
+                        && name
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '+' | '-'));
+                    if plausible {
+                        if let Some(e) = emojis::get_by_shortcode(&name) {
+                            flush(&mut buf, base, out);
+                            out.push(Seg::new(e.as_str(), base));
+                            i = end + 1;
+                            continue;
+                        }
                     }
                 }
             }
@@ -644,7 +682,10 @@ fn section(el: &Value, ctx: &Ctx, base: Sty, out: &mut Vec<Seg>) {
                 format!("#{}", ctx.channel(s("channel_id"))),
                 mention,
             )),
-            "emoji" => out.push(Seg::new(format!(":{}:", s("name")), base)),
+            "emoji" => out.push(Seg::new(
+                emoji(s("name"), e.get("unicode").and_then(Value::as_str)),
+                base,
+            )),
             "broadcast" => out.push(Seg::new(format!("@{}", s("range")), mention)),
             "date" => {
                 let fb = s("fallback");
@@ -1010,7 +1051,7 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Vec<L
         spans.push(Span::styled(" bot", dim));
     }
     if let Some(c) = &m.channel_name {
-        spans.push(Span::styled(format!(" in #{c}"), dim));
+        spans.push(Span::styled(format!(" in {c}"), dim));
     }
     if m.edited {
         spans.push(Span::styled(" (edited)", dim));
@@ -1056,7 +1097,7 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Vec<L
     if !reactions.is_empty() {
         let s = reactions
             .iter()
-            .map(|(n, c)| format!(":{n}: {c}"))
+            .map(|(n, c)| format!("{} {c}", emoji(n, None)))
             .collect::<Vec<_>>()
             .join("   ");
         lines.push(Line::from(Span::styled(format!("  {s}"), dim)));

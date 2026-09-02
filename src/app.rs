@@ -152,11 +152,14 @@ impl MsgList {
         self.flat_w = width;
         self.dirty = false;
         let first = self.first.get(self.cursor).copied().unwrap_or(0);
-        self.scroll = if self.align_top {
-            first.saturating_sub(1)
+        // A fresh list, or a jump, keeps the line above the cursor on screen:
+        // that is the day divider.
+        let back = if self.align_top || offset == 0 {
+            1
         } else {
-            first.saturating_sub(offset)
+            offset
         };
+        self.scroll = first.saturating_sub(back);
         self.align_top = false;
     }
 
@@ -238,6 +241,8 @@ pub enum View {
         lines: Vec<String>,
         scroll: usize,
     },
+    /// Roots of the threads the owner wrote in, across every archive.
+    Threads { list: MsgList },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -364,12 +369,24 @@ impl App {
 
     pub fn apply_filter(&mut self) {
         let needle = self.filter.trim_start_matches(['#', '@']).to_lowercase();
+        // Substring first, then the characters in order anywhere in the name.
+        let rank = |name: &str| -> Option<u8> {
+            let n = name.to_lowercase();
+            if needle.is_empty() || n.contains(&needle) {
+                return Some(0);
+            }
+            let mut rest = n.chars();
+            for ch in needle.chars() {
+                if !rest.any(|c| c == ch) {
+                    return None;
+                }
+            }
+            Some(1)
+        };
         let mut idx: Vec<usize> = (0..self.corpus.convs.len())
             .filter(|&i| {
                 let c = &self.corpus.convs[i];
-                needle.is_empty()
-                    || c.name.to_lowercase().contains(&needle)
-                    || c.id.to_lowercase() == needle
+                rank(&c.name).is_some() || c.id.to_lowercase() == needle
             })
             .collect();
         let convs = &self.corpus.convs;
@@ -402,6 +419,9 @@ impl App {
             }),
             Sort::Recent => idx.sort_by(|&a, &b| convs[b].last_id.cmp(&convs[a].last_id)),
             Sort::Size => idx.sort_by(|&a, &b| convs[b].msgs.cmp(&convs[a].msgs)),
+        }
+        if !needle.is_empty() {
+            idx.sort_by_key(|&i| rank(&convs[i].name).unwrap_or(2));
         }
         // Keep the highlighted conversation highlighted across a re-sort.
         let current = self.filtered.get(self.conv_cursor).copied();
@@ -792,7 +812,7 @@ impl App {
                 .filter(|&i| !self.corpus.convs[i].live_only)
             {
                 let search = match self.stack.last() {
-                    Some(View::Search { .. }) => self.stack.pop(),
+                    Some(View::Search { .. }) | Some(View::Threads { .. }) => self.stack.pop(),
                     _ => None,
                 };
                 self.open_conv(idx);
@@ -1154,6 +1174,48 @@ impl App {
         }
     }
 
+    /// Every thread the owner wrote in, newest reply first, from the cache.
+    fn open_my_threads(&mut self) {
+        let Some(me) = self.corpus.me.clone() else {
+            self.status = "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
+            return;
+        };
+        if self.open.is_none() {
+            let Some(&idx) = self.filtered.get(self.conv_cursor) else {
+                return;
+            };
+            if !self.open_conv(idx) {
+                return;
+            }
+        }
+        let mut roots: Vec<Msg> = Vec::new();
+        let mut seen: HashSet<(String, i64)> = HashSet::new();
+        for (ai, a) in self.corpus.archives.iter().enumerate() {
+            let Ok(msgs) = a.my_threads(&me) else {
+                continue;
+            };
+            for mut m in msgs {
+                if !seen.insert((m.channel_id.clone(), m.id)) {
+                    continue;
+                }
+                m.channel_name = self
+                    .corpus
+                    .convs
+                    .iter()
+                    .find(|c| c.archive == ai && c.id == m.channel_id && !c.live_only)
+                    .map(|c| c.name.clone());
+                roots.push(m);
+            }
+        }
+        roots.sort_by_key(|m| std::cmp::Reverse(m.latest_reply_id.unwrap_or(m.id)));
+        let n = roots.len();
+        self.stack.push(View::Threads {
+            list: MsgList::new(roots, false),
+        });
+        self.focus = Focus::Msgs;
+        self.status = format!("{n} threads you took part in, newest reply first");
+    }
+
     fn prompt_archive(&mut self) {
         // A hit from a conversation not cached yet: offer its id.
         let prefill = self
@@ -1409,7 +1471,9 @@ impl App {
             .rev()
             .find(|v| !matches!(v, View::Raw { .. }))
         {
-            Some(View::Thread { list, .. }) | Some(View::Search { list, .. }) => Some(list),
+            Some(View::Thread { list, .. })
+            | Some(View::Search { list, .. })
+            | Some(View::Threads { list }) => Some(list),
             _ => self.open.as_ref().map(|o| &o.list),
         }
     }
@@ -1421,7 +1485,9 @@ impl App {
             .rev()
             .find(|v| !matches!(v, View::Raw { .. }))
         {
-            Some(View::Thread { list, .. }) | Some(View::Search { list, .. }) => Some(list),
+            Some(View::Thread { list, .. })
+            | Some(View::Search { list, .. })
+            | Some(View::Threads { list }) => Some(list),
             _ => self.open.as_mut().map(|o| &mut o.list),
         }
     }
@@ -1443,6 +1509,10 @@ impl App {
         let a = &self.corpus.archives[conv.archive];
         match self.stack.last() {
             Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
+            Some(View::Threads { list }) => format!(
+                "threads you took part in · {} · newest reply first",
+                list.len()
+            ),
             Some(View::Thread {
                 list, live, place, ..
             }) => {
@@ -1518,10 +1588,11 @@ impl App {
 
     pub fn hints(&self) -> &'static str {
         match (self.focus, self.stack.last()) {
-            (Focus::Convs, _) => "j/k move  Enter open  / filter  s sort  a archive from Slack  Tab messages  ? help  q quit",
+            (Focus::Convs, _) => "j/k move  Enter open  / filter  s sort  T my threads  a archive from Slack  Tab messages  ? help  q quit",
             (_, Some(View::Raw { .. })) => "j/k scroll  Esc back  q quit",
             (_, Some(View::Thread { .. })) => "j/k move  Enter raw  o show in channel  / search  R refresh  Esc back  q quit",
             (_, Some(View::Search { .. })) => "j/k move  Enter open hit  o show in channel  a archive its channel  Esc back  q quit",
+            (_, Some(View::Threads { .. })) => "j/k move  Enter open thread  o show in channel  Esc back  q quit",
             _ => "j/k move  Enter thread  / search  d date  v raw  g/G ends  r reload  R refresh from Slack  h conversations  ? help  q quit",
         }
     }
@@ -1636,6 +1707,7 @@ impl App {
                 }
             }
             (KeyCode::Char('a'), false) => self.prompt_archive(),
+            (KeyCode::Char('T'), false) => self.open_my_threads(),
             (KeyCode::Char('s'), false) => {
                 self.sort = self.sort.next();
                 self.apply_filter();
@@ -1766,6 +1838,7 @@ impl App {
             (KeyCode::Char('r'), false) => self.reload(),
             (KeyCode::Char('R'), false) => self.refresh(),
             (KeyCode::Char('a'), false) => self.prompt_archive(),
+            (KeyCode::Char('T'), false) => self.open_my_threads(),
             (KeyCode::Esc, _) | (KeyCode::Char('h'), false) | (KeyCode::Left, _) => {
                 if self.stack.pop().is_none() {
                     self.focus = Focus::Convs;

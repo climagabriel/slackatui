@@ -202,7 +202,7 @@ pub fn api_search(client: Arc<Client>, query: String) -> Job {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 if let Some(mut msg) = Msg::from_api(cid, m) {
-                    msg.channel_name = name.filter(|n| !n.is_empty());
+                    msg.channel_name = name.filter(|n| !n.is_empty()).map(|n| format!("#{n}"));
                     out.push(msg);
                 }
             }
