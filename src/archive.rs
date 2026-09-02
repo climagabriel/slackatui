@@ -70,6 +70,8 @@ pub struct Conv {
     pub live_only: bool,
     pub unread: bool,
     pub mentions: i64,
+    /// Slack's read marker for the owner, as a message id; 0 when unknown.
+    pub last_read: i64,
 }
 
 pub struct Corpus {
@@ -118,11 +120,35 @@ pub struct Msg {
     pub channel_name: Option<String>,
 }
 
+#[derive(Clone, Debug)]
 pub struct FileInfo {
+    pub id: String,
     pub name: String,
     pub filetype: String,
     pub size: Option<i64>,
     pub mode: String,
+    pub mimetype: String,
+    pub width: u32,
+    pub height: u32,
+    /// A small rendition and the original, for a download.
+    pub thumb: Option<String>,
+    pub url: Option<String>,
+}
+
+impl FileInfo {
+    pub fn is_image(&self) -> bool {
+        self.mimetype.starts_with("image/") && !self.mimetype.contains("svg")
+    }
+
+    /// The extension the cached copy gets.
+    pub fn ext(&self) -> String {
+        self.name
+            .rsplit('.')
+            .next()
+            .filter(|e| e.len() <= 5)
+            .unwrap_or("bin")
+            .to_lowercase()
+    }
 }
 
 impl Msg {
@@ -156,11 +182,34 @@ impl Msg {
                 if name.is_empty() {
                     name = s("id");
                 }
+                let n = |k: &str| f.get(k).and_then(Value::as_u64).unwrap_or(0) as u32;
+                let opt = |k: &str| {
+                    f.get(k)
+                        .and_then(Value::as_str)
+                        .filter(|u| !u.is_empty())
+                        .map(str::to_string)
+                };
                 out.push(FileInfo {
+                    id: s("id"),
                     name,
                     filetype: s("filetype"),
                     size: f.get("size").and_then(Value::as_i64),
                     mode: s("mode"),
+                    mimetype: s("mimetype"),
+                    width: if n("original_w") > 0 {
+                        n("original_w")
+                    } else {
+                        n("thumb_360_w")
+                    },
+                    height: if n("original_h") > 0 {
+                        n("original_h")
+                    } else {
+                        n("thumb_360_h")
+                    },
+                    thumb: opt("thumb_720")
+                        .or_else(|| opt("thumb_480"))
+                        .or_else(|| opt("thumb_360")),
+                    url: opt("url_private_download").or_else(|| opt("url_private")),
                 });
             }
         }
@@ -680,6 +729,7 @@ impl Archive {
                 live_only: false,
                 unread: false,
                 mentions: 0,
+                last_read: 0,
             });
         }
         convs.sort_by(|x, y| x.id.cmp(&y.id));

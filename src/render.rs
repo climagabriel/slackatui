@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::archive::{Archive, Corpus, Msg};
+use crate::archive::{Archive, Corpus, FileInfo, Msg};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tz {
@@ -73,6 +73,44 @@ pub struct Ctx<'a> {
     /// Every other archive: a user or channel named elsewhere still resolves.
     pub corpus: &'a Corpus,
     pub tz: Tz,
+    /// Cell size in pixels when inline images are on: rows get reserved for them.
+    pub image_font: Option<(u16, u16)>,
+    /// The owner's read marker in this timeline: what follows it is new.
+    pub last_read: Option<i64>,
+}
+
+/// Rows reserved under a message for one image, at their position.
+#[derive(Clone, Debug)]
+pub struct ImageSlot {
+    pub file: FileInfo,
+    /// Index of the first reserved line within the message's lines.
+    pub line: usize,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+pub struct Rendered {
+    pub lines: Vec<Line<'static>>,
+    pub images: Vec<ImageSlot>,
+}
+
+/// Cells an image takes: its natural size at this font, capped to the pane
+/// and to 14 rows; the renderer keeps the aspect ratio inside that box.
+pub fn image_cells(f: &FileInfo, font: (u16, u16), width: usize) -> Option<(u16, u16)> {
+    if !f.is_image() || f.width == 0 || f.height == 0 {
+        return None;
+    }
+    let (fw, fh) = (font.0.max(1) as f64, font.1.max(1) as f64);
+    let max_cols = width.saturating_sub(3).clamp(8, 80) as f64;
+    let cols = (f.width as f64 / fw).ceil().min(max_cols);
+    let rows = (f.height as f64 * (cols * fw / f.width as f64) / fh)
+        .ceil()
+        .clamp(1.0, 14.0);
+    let cols = (f.width as f64 * (rows * fh / f.height as f64) / fw)
+        .ceil()
+        .min(cols)
+        .max(1.0);
+    Some((cols as u16, rows as u16))
 }
 
 impl Ctx<'_> {
@@ -1006,7 +1044,7 @@ fn human_bytes(n: i64) -> String {
 
 /// One message as lines: header, wrapped body, files, reactions, thread
 /// footer. `in_thread` drops the footer (the replies are on screen).
-pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Vec<Line<'static>> {
+pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rendered {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let time = ctx.tz.fmt(m.secs(), "%H:%M");
     let sub = m.subtype.as_deref().unwrap_or("");
@@ -1036,9 +1074,13 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Vec<L
         if let Some(first) = lines.first_mut() {
             first.spans[0] = Span::styled(format!("{time}  · "), dim);
         }
-        return lines;
+        return Rendered {
+            lines,
+            images: Vec::new(),
+        };
     }
     let mut lines = Vec::new();
+    let mut images = Vec::new();
     let mut spans = vec![
         Span::styled(time, dim),
         Span::raw("  "),
@@ -1092,6 +1134,19 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Vec<L
             s.push(')');
         }
         lines.push(Line::from(Span::styled(s, dim)));
+        if let Some(font) = ctx.image_font {
+            if let Some((cols, rows)) = image_cells(&f, font, width) {
+                images.push(ImageSlot {
+                    file: f.clone(),
+                    line: lines.len(),
+                    cols,
+                    rows,
+                });
+                for _ in 0..rows {
+                    lines.push(Line::from(""));
+                }
+            }
+        }
     }
     let reactions = m.reactions();
     if !reactions.is_empty() {
@@ -1119,7 +1174,16 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Vec<L
         };
         lines.push(Line::from(Span::styled(s, Style::new().fg(Color::Yellow))));
     }
-    lines
+    Rendered { lines, images }
+}
+
+/// The divider that opens the unread part of a conversation.
+pub fn divider_new(text: &str, width: usize) -> Line<'static> {
+    let style = Style::new()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD);
+    let bar = "─".repeat(width.saturating_sub(text.width() + 4).clamp(2, 40));
+    Line::from(Span::styled(format!("{bar} {text} {bar}"), style))
 }
 
 pub fn divider(text: &str, width: usize) -> Line<'static> {
@@ -1141,6 +1205,8 @@ mod tests {
             archive,
             corpus,
             tz: Tz::Utc,
+            image_font: None,
+            last_read: None,
         }
     }
 

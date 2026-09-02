@@ -8,12 +8,13 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Focus, Mode, PromptKind, Sort, View};
+use crate::app::{App, Focus, ImageState, Mode, PromptKind, Sort, View};
 use crate::render::{self, Ctx};
+use ratatui_image::{Image, StatefulImage};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
+    let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let conv_w = (area.width / 4).clamp(22, 40);
     let [left, right] =
         Layout::horizontal([Constraint::Length(conv_w), Constraint::Min(20)]).areas(main);
@@ -75,17 +76,20 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             let name = clip(&name, room);
             let pad = room.saturating_sub(name.width());
-            let name_style = if c.unread {
+            let mut name_style = if c.unread {
                 Style::new()
                     .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD)
-            } else if Some(i) == open_idx {
-                Style::new().add_modifier(Modifier::BOLD)
+            } else if app.highlight_cached && !c.live_only {
+                Style::new().fg(Color::LightGreen)
             } else if c.live_only {
                 Style::new().add_modifier(Modifier::DIM)
             } else {
                 Style::new()
             };
+            if Some(i) == open_idx {
+                name_style = name_style.add_modifier(Modifier::BOLD);
+            }
             ListItem::new(Line::from(vec![
                 Span::styled(name, name_style),
                 Span::raw(" ".repeat(pad + 1)),
@@ -120,6 +124,10 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     if inner.width < 4 || inner.height == 0 {
         return;
     }
+    if let Some(View::Image { .. }) = app.stack.last() {
+        draw_image_view(frame, app, inner);
+        return;
+    }
     if let Some(View::Raw { lines, scroll, .. }) = app.stack.last() {
         let shown: Vec<Line> = lines
             .iter()
@@ -130,6 +138,18 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(Text::from(shown)), inner);
         return;
     }
+    let image_font = app.image_font();
+    // The read marker applies to the conversation's own timeline only.
+    let last_read = match (
+        app.stack
+            .iter()
+            .rev()
+            .find(|v| !matches!(v, View::Raw { .. } | View::Image { .. })),
+        app.open.as_ref(),
+    ) {
+        (None, Some(o)) => Some(app.corpus.convs[o.conv].last_read).filter(|v| *v > 0),
+        _ => None,
+    };
     let App {
         corpus,
         open,
@@ -160,6 +180,8 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         archive,
         corpus,
         tz: *tz,
+        image_font,
+        last_read,
     };
     let text_w = inner.width as usize - 1;
     list.rebuild(&ctx, text_w);
@@ -197,42 +219,109 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         shown.push(line);
     }
     frame.render_widget(Paragraph::new(Text::from(shown)), inner);
+    // Inline images: one rect per slot whose first row is on screen.
+    let slots: Vec<(u16, crate::render::ImageSlot)> = list
+        .flat
+        .iter()
+        .enumerate()
+        .skip(list.scroll)
+        .take(inner.height as usize)
+        .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s)))
+        .collect();
+    for (row, slot) in slots {
+        app.ensure_image(&slot.file, false);
+        let x = inner.x + 3;
+        let y = inner.y + row;
+        let width = slot.cols.min(inner.width.saturating_sub(3));
+        let height = slot.rows.min(inner.bottom().saturating_sub(y));
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let note = match app.images.get(&slot.file.id) {
+            Some(ImageState::Ready(_)) => None,
+            Some(ImageState::Failed(e)) => Some(format!("(image: {e})")),
+            Some(_) => Some("(loading image)".to_string()),
+            None => Some("(image)".to_string()),
+        };
+        match note {
+            Some(text) => frame.render_widget(
+                Paragraph::new(Span::styled(text, Style::new().add_modifier(Modifier::DIM))),
+                Rect { height: 1, ..area },
+            ),
+            None => {
+                if let Some(proto) = app.inline_protocol(&slot.file.id, slot.cols, slot.rows) {
+                    frame.render_widget(Image::new(proto).allow_clipping(true), area);
+                }
+            }
+        }
+    }
+}
+
+/// The full-pane viewer: the original file, fitted to the pane.
+fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
+    let Some(View::Image { files, index, .. }) = app.stack.last() else {
+        return;
+    };
+    let file = files[*index].clone();
+    app.ensure_image(&file, true);
+    let key = format!("{}:full", file.id);
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let note = match app.images.get(&key) {
+        Some(ImageState::Ready(_)) => None,
+        Some(ImageState::Failed(e)) => Some(format!("  image failed: {e}")),
+        _ => Some("  loading the original from Slack".to_string()),
+    };
+    if let Some(text) = note {
+        frame.render_widget(Paragraph::new(Span::styled(text, dim)), inner);
+        return;
+    }
+    let img = match app.images.get(&key) {
+        Some(ImageState::Ready(img)) => img.clone(),
+        _ => return,
+    };
+    let Some(picker) = app.picker.as_ref() else {
+        return;
+    };
+    let fresh = picker.new_resize_protocol(img);
+    if let Some(View::Image { shown, .. }) = app.stack.last_mut() {
+        if shown.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+            *shown = Some((key.clone(), fresh));
+        }
+        if let Some((_, proto)) = shown.as_mut() {
+            frame.render_stateful_widget(StatefulImage::new(), inner, proto);
+        }
+    }
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let [top, bottom] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    let first = match &app.mode {
-        Mode::Prompt { kind, buf, .. } => {
-            let label = match kind {
-                PromptKind::Filter => "filter conversations",
-                PromptKind::Search => "search this conversation",
-                PromptKind::Date => "go to date (YYYY-MM-DD)",
-                PromptKind::Archive => {
-                    "archive a conversation from Slack, last 90 days (URL or id)"
-                }
-            };
-            Line::from(vec![
-                Span::styled(format!(" {label}: "), Style::new().fg(Color::Cyan)),
-                Span::raw(buf.clone()),
-                Span::styled("▏", Style::new().fg(Color::Cyan)),
-            ])
-        }
-        Mode::Normal => Line::from(Span::styled(format!(" {}", app.hints()), dim)),
-    };
-    frame.render_widget(Paragraph::new(first), top);
-    // Status first: an error must not hide behind a long permalink.
-    let mut second = vec![Span::styled(format!(" {} ", app.tz.label()), dim)];
-    if !app.status.is_empty() {
-        second.push(Span::styled(
-            format!("{}  ", app.status),
-            Style::new().fg(Color::Yellow),
-        ));
+    // One line: a prompt when one is open; else the clock, a running job,
+    // the last status, and the selected message's permalink. H lists the keys.
+    if let Mode::Prompt { kind, buf, .. } = &app.mode {
+        let label = match kind {
+            PromptKind::Filter => "filter conversations",
+            PromptKind::Search => "search this conversation",
+            PromptKind::Date => "go to date (YYYY-MM-DD)",
+            PromptKind::Archive => "archive a conversation from Slack, last 90 days (URL or id)",
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" {label}: "), Style::new().fg(Color::Cyan)),
+            Span::raw(buf.clone()),
+            Span::styled("▏", Style::new().fg(Color::Cyan)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
     }
+    let mut spans = vec![Span::styled(format!(" {} ", app.tz.label()), dim)];
     if let Some(job) = &app.job {
         let frame_char = crate::live::SPINNER[app.spinner % crate::live::SPINNER.len()];
-        second.push(Span::styled(
+        spans.push(Span::styled(
             format!(
                 "{frame_char} {} ({}s)  ",
                 job.label,
@@ -241,13 +330,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
+    if !app.status.is_empty() {
+        spans.push(Span::styled(
+            format!("{}  ", app.status),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     if let Some(m) = app.selected() {
-        second.push(Span::styled(
+        spans.push(Span::styled(
             m.permalink(&app.corpus.workspace_url),
             Style::new().fg(Color::Blue),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(second)), bottom);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 const HELP: &[(&str, &str)] = &[
@@ -277,6 +372,25 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("d", "go to a date (YYYY-MM-DD)"),
     ("T", "threads you took part in, newest reply first"),
+    (
+        "i",
+        "the selected message's images, full pane; j/k between them",
+    ),
+    ("I", "inline image thumbnails on/off"),
+    ("C", "highlight cached conversations in light green on/off"),
+    (
+        "m",
+        "mark read: the highlighted conversation, or the open one at its newest message",
+    ),
+    (
+        "M",
+        "mark unread from the message under the cursor (the highlighted conversation in the list)",
+    ),
+    (
+        "Esc in the list",
+        "drop the filter, then close the conversation: the home view",
+    ),
+    ("?, H", "this guide"),
     ("v", "raw JSON of the selected message"),
     ("r", "reload the conversation from the archive"),
     (
@@ -290,6 +404,8 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("q, Ctrl-c", "quit"),
 ];
+
+const HELP_NOTE: &str = "The unread part of a conversation starts at the highlighted day divider; the list marks unread conversations with ● and the mention count.";
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let w = 96.min(area.width.saturating_sub(2));
@@ -309,6 +425,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ]));
     }
     lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  {HELP_NOTE}"),
+        Style::new().add_modifier(Modifier::DIM),
+    )));
     lines.push(Line::from(Span::styled(
         "  any key closes this",
         Style::new().add_modifier(Modifier::DIM),
@@ -357,6 +477,8 @@ pub fn dump(app: &mut App, width: usize) -> String {
         archive: &app.corpus.archives[conv.archive],
         corpus: &app.corpus,
         tz: app.tz,
+        image_font: None,
+        last_read: None,
     };
     open.list.rebuild(&ctx, width);
     open.list

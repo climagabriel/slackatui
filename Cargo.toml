@@ -13,6 +13,8 @@ unicode-width = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 ureq = "3"
 emojis = "0.6"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+image = "0.25"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 hmac = "0.12"

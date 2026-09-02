@@ -16,6 +16,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use crate::app::{App, Focus};
 use crate::archive::Corpus;
 use crate::render::Tz;
+use ratatui_image::picker::Picker;
 
 const HELP: &str = "\
 slack-tui - read the local slackdump archives in the terminal
@@ -49,6 +50,13 @@ flags
   --poll SECS     re-check the open conversation and unread counts this often
                   when signed in (default 60, 0 = never)
   --auth-check    sign in through the desktop app and print who you are
+  --no-images     no inline thumbnails and no image viewer
+  --image-protocol MODE
+                  half-blocks (default) or query: ask the terminal for a
+                  native kitty/Sixel/iTerm2 protocol (may eat the first key on
+                  a terminal without escape-sequence passthrough)
+  --fetch-file URL OUT
+                  download one Slack file with the signed-in session (debug)
   --help          this text
 
 environment
@@ -71,7 +79,15 @@ keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
   Enter thread, Esc back, / filter or search, d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
-  R refresh from Slack, a archive a conversation not cached yet
+  R refresh from Slack, a archive a conversation not cached yet,
+  i view a message's images, I inline thumbnails on/off, C highlight cached,
+  m mark read, M mark unread from the cursor, H the key guide,
+  Esc in the list closes the conversation
+
+Images: thumbnails under messages and a full-pane viewer, through the
+kitty, Sixel or iTerm2 protocol when the terminal has one and half-block
+cells otherwise. Files come from the archive's own uploads, then from the
+cache, then from Slack when signed in.
 
 When the cache cannot answer, Slack is asked in the background. Signed in
 through the desktop app's session (nothing to copy; SLACK_TOKEN and
@@ -105,6 +121,9 @@ struct Opts {
     no_live: bool,
     auth_check: bool,
     poll: u64,
+    no_images: bool,
+    query_protocol: bool,
+    fetch_file: Option<(String, String)>,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -122,6 +141,9 @@ fn parse_args() -> Result<Opts, String> {
         no_live: false,
         auth_check: false,
         poll: 60,
+        no_images: false,
+        query_protocol: false,
+        fetch_file: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -143,6 +165,16 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--no-live" => opts.no_live = true,
             "--auth-check" => opts.auth_check = true,
+            "--no-images" => opts.no_images = true,
+            "--image-protocol" => {
+                let v = value("--image-protocol")?;
+                opts.query_protocol = matches!(v.as_str(), "query" | "auto");
+            }
+            "--fetch-file" => {
+                let url = value("--fetch-file")?;
+                let out = value("--fetch-file")?;
+                opts.fetch_file = Some((url, out));
+            }
             "--poll" => {
                 opts.poll = value("--poll")?
                     .parse()
@@ -233,7 +265,7 @@ fn run() -> i32 {
             return 1;
         }
     };
-    if opts.auth_check {
+    if opts.auth_check || opts.fetch_file.is_some() {
         let scratch = std::env::temp_dir().join("slack-tui");
         let agent = api::agent();
         let auth = match auth::from_env() {
@@ -247,6 +279,30 @@ fn run() -> i32 {
             },
         };
         println!("credentials: {}", auth.source);
+        if let Some((url, out)) = &opts.fetch_file {
+            let client = api::Client::new(auth);
+            return match client.download(url) {
+                Ok(bytes) => {
+                    let kind = image::guess_format(&bytes)
+                        .map(|f| format!("{f:?}"))
+                        .unwrap_or_else(|_| "not an image".to_string());
+                    match std::fs::write(out, &bytes) {
+                        Ok(()) => {
+                            println!("fetched {} bytes ({kind}) into {out}", bytes.len());
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("slack-tui: {e}");
+                            1
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("slack-tui: {e}");
+                    1
+                }
+            };
+        }
         let client = api::Client::new(auth);
         match client.auth_test() {
             Ok((uid, user, team)) => println!("auth.test: ok, user {user} ({uid}), team {team}"),
@@ -267,6 +323,20 @@ fn run() -> i32 {
                     })
                     .count();
                 println!("client.counts: ok, {unread} conversations with unreads");
+                if let Some(c) = v
+                    .get("channels")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first())
+                {
+                    let keys: Vec<&str> = c
+                        .as_object()
+                        .map(|o| o.keys().map(String::as_str).collect())
+                        .unwrap_or_default();
+                    println!(
+                        "client.counts: channel fields {keys:?}; last_read={:?}",
+                        c.get("last_read")
+                    );
+                }
             }
             Err(e) => println!("client.counts: {e} (unread markers will be off)"),
         }
@@ -332,7 +402,7 @@ fn run() -> i32 {
             return emit(&text);
         }
     }
-    match tui(&mut app) {
+    match tui(&mut app, opts.no_images, opts.query_protocol) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("slack-tui: {e}");
@@ -341,8 +411,30 @@ fn run() -> i32 {
     }
 }
 
-fn tui(app: &mut App) -> std::io::Result<()> {
+fn tui(app: &mut App, no_images: bool, query_protocol: bool) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    if !no_images {
+        // Half-blocks by default: they work in every terminal and need no
+        // capability query. --image-protocol query asks the terminal which of
+        // kitty/Sixel/iTerm2 it speaks, for a terminal that has one; that query
+        // prints escape sequences whose responses come back as input, so on a
+        // terminal without passthrough it can swallow the first keypress. The
+        // query drains its own responses here before the loop reads a real key.
+        app.picker = Some(if query_protocol {
+            let p = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+            let cap = std::time::Instant::now() + Duration::from_millis(1000);
+            while event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                let _ = event::read();
+                if std::time::Instant::now() >= cap {
+                    break;
+                }
+            }
+            p
+        } else {
+            Picker::halfblocks()
+        });
+        app.inline_images = true;
+    }
     if app.open.is_none() {
         app.focus = Focus::Convs;
     }

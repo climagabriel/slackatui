@@ -175,6 +175,37 @@ impl Client {
         Ok(out)
     }
 
+    /// A file's bytes, with the session's credentials as files.slack.com wants them.
+    pub fn download(&self, url: &str) -> Result<Vec<u8>, String> {
+        let mut resp = self
+            .agent
+            .get(url)
+            .header("Authorization", &format!("Bearer {}", self.auth.token))
+            .header("Cookie", &format!("d={}", self.auth.cookie))
+            .call()
+            .map_err(|e| format!("GET file: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GET file: HTTP {}", resp.status().as_u16()));
+        }
+        let bytes = resp
+            .body_mut()
+            .with_config()
+            .limit(64 * 1024 * 1024)
+            .read_to_vec()
+            .map_err(|e| format!("GET file: {e}"))?;
+        if bytes.starts_with(b"<") {
+            return Err("Slack answered with a page, not the file (session expired?)".to_string());
+        }
+        Ok(bytes)
+    }
+
+    /// Move the read marker of a conversation to a message: the one write
+    /// this client makes.
+    pub fn mark(&self, cid: &str, ts: &str) -> Result<(), String> {
+        self.call("conversations.mark", &[("channel", cid), ("ts", ts)])
+            .map(|_| ())
+    }
+
     /// Unread state per conversation, as the web client fetches it.
     pub fn counts(&self) -> Result<Value, String> {
         self.call("client.counts", &[("thread_counts_by_channel", "false")])

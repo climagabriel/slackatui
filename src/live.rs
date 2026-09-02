@@ -35,6 +35,10 @@ pub enum JobKind {
     Conversations,
     /// Unread state per conversation.
     Counts,
+    /// One file into the file cache.
+    File { id: String },
+    /// The read marker of `conv` moved to message `id`.
+    Mark { conv: usize, id: i64 },
 }
 
 pub enum Done {
@@ -48,6 +52,8 @@ pub enum Done {
     Messages(Vec<Msg>),
     Conversations(Vec<Value>),
     Counts(Value),
+    File(PathBuf),
+    Marked,
 }
 
 pub struct Job {
@@ -245,6 +251,28 @@ pub fn api_conversations(client: Arc<Client>) -> Job {
     spawn(JobKind::Conversations, String::new(), move || {
         Ok(Done::Conversations(client.my_conversations()?))
     })
+}
+
+pub fn fetch_file(client: Arc<Client>, id: String, url: String, dest: PathBuf) -> Job {
+    spawn(JobKind::File { id }, String::new(), move || {
+        let bytes = client.download(&url)?;
+        if let Some(d) = dest.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+        Ok(Done::File(dest))
+    })
+}
+
+pub fn api_mark(client: Arc<Client>, conv: usize, cid: String, id: i64) -> Job {
+    spawn(
+        JobKind::Mark { conv, id },
+        "marking read".to_string(),
+        move || {
+            client.mark(&cid, &id_to_ts(id))?;
+            Ok(Done::Marked)
+        },
+    )
 }
 
 pub fn api_counts(client: Arc<Client>) -> Job {

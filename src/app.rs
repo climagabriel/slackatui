@@ -1,7 +1,7 @@
 //! Application state and key handling. Views stack on top of the timeline:
 //! thread, search hits, raw JSON. Esc pops.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +14,10 @@ use serde_json::Value;
 use crate::api::Client;
 use crate::archive::{ts_to_id, Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
 use crate::live::{self, Done, Job, JobKind};
-use crate::render::{self, Ctx, Tz};
+use crate::render::{self, Ctx, ImageSlot, Tz};
+use image::DynamicImage;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::{Protocol, StatefulProtocol};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
@@ -53,6 +56,8 @@ impl Sort {
 pub struct FlatLine {
     pub msg: Option<usize>,
     pub line: Line<'static>,
+    /// An image starts on this line and takes the rows below it.
+    pub image: Option<ImageSlot>,
 }
 
 /// A scrollable list of messages rendered into lines. The cursor is a
@@ -115,23 +120,53 @@ impl MsgList {
             self.flat.push(FlatLine {
                 msg: None,
                 line: render::divider(note, width),
+                image: None,
             });
         }
         let mut prev_day = None;
+        let mut new_marked = false;
         for (i, m) in self.msgs.iter().enumerate() {
             let day = ctx.tz.day(m.secs());
+            // The first message past the read marker opens the unread part:
+            // its day divider lights up, or a "new" line stands in for one.
+            let new_here = !new_marked && ctx.last_read.is_some_and(|lr| m.id > lr);
             if prev_day != Some(day) {
                 let text = ctx.tz.fmt(m.secs(), "%a %Y-%m-%d");
+                let line = if new_here {
+                    render::divider_new(&format!("{text} · new"), width)
+                } else {
+                    render::divider(&text, width)
+                };
                 self.flat.push(FlatLine {
                     msg: None,
-                    line: render::divider(&text, width),
+                    line,
+                    image: None,
                 });
                 prev_day = Some(day);
+            } else if new_here {
+                self.flat.push(FlatLine {
+                    msg: None,
+                    line: render::divider_new("new", width),
+                    image: None,
+                });
             }
-            let lines = render::message_lines(m, ctx, width, self.in_thread);
-            self.first.push(self.flat.len());
-            for line in lines {
-                self.flat.push(FlatLine { msg: Some(i), line });
+            if new_here {
+                new_marked = true;
+            }
+            let rendered = render::message_lines(m, ctx, width, self.in_thread);
+            let base = self.flat.len();
+            self.first.push(base);
+            for line in rendered.lines {
+                self.flat.push(FlatLine {
+                    msg: Some(i),
+                    line,
+                    image: None,
+                });
+            }
+            for slot in rendered.images {
+                if let Some(fl) = self.flat.get_mut(base + slot.line) {
+                    fl.image = Some(slot);
+                }
             }
             self.last.push(self.flat.len().saturating_sub(1));
             if self.in_thread && i == 0 && self.msgs.len() > 1 {
@@ -140,6 +175,7 @@ impl MsgList {
                 self.flat.push(FlatLine {
                     msg: None,
                     line: render::divider(&text, width),
+                    image: None,
                 });
             }
         }
@@ -147,6 +183,7 @@ impl MsgList {
             self.flat.push(FlatLine {
                 msg: None,
                 line: render::divider(note, width),
+                image: None,
             });
         }
         self.flat_w = width;
@@ -243,6 +280,25 @@ pub enum View {
     },
     /// Roots of the threads the owner wrote in, across every archive.
     Threads { list: MsgList },
+    /// One message's images, full pane, one at a time.
+    Image {
+        files: Vec<crate::archive::FileInfo>,
+        index: usize,
+        /// The fitted encoding of the current image, built on first draw.
+        shown: Option<(String, StatefulProtocol)>,
+    },
+}
+
+/// What is known about one file's pixels.
+pub enum ImageState {
+    /// Waiting for the one file download slot.
+    Queued {
+        url: String,
+        dest: PathBuf,
+    },
+    Loading,
+    Ready(DynamicImage),
+    Failed(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -299,6 +355,16 @@ pub struct App {
     pub poll_every: Duration,
     pub last_poll: Instant,
     pub last_counts: Instant,
+    /// The terminal's image protocol, when images are on at all.
+    pub picker: Option<Picker>,
+    pub inline_images: bool,
+    /// Decoded files by key: the file id for a thumbnail, `id:full` for the original.
+    pub images: HashMap<String, ImageState>,
+    /// Encoded inline thumbnails, by file id, with the cell size they were made for.
+    pub inline: HashMap<String, (u16, u16, Protocol)>,
+    pub file_job: Option<Job>,
+    /// `C`: cached conversations in light green.
+    pub highlight_cached: bool,
 }
 
 impl App {
@@ -340,6 +406,12 @@ impl App {
             poll_every: Duration::from_secs(poll_secs),
             last_poll: Instant::now(),
             last_counts: Instant::now(),
+            picker: None,
+            inline_images: false,
+            images: HashMap::new(),
+            inline: HashMap::new(),
+            file_job: None,
+            highlight_cached: false,
         };
         app.apply_filter();
         if live {
@@ -439,6 +511,8 @@ impl App {
             archive: &self.corpus.archives[self.corpus.convs[conv].archive],
             corpus: &self.corpus,
             tz: self.tz,
+            image_font: self.image_font(),
+            last_read: None,
         }
     }
 
@@ -483,6 +557,15 @@ impl App {
         let since = msgs.last().map(|m| m.id).unwrap_or(0);
         let mut list = MsgList::new(msgs, false);
         list.cursor = list.len().saturating_sub(1);
+        // Land on the first unread message when the page holds one, with
+        // the highlighted divider above it on screen.
+        let last_read = self.corpus.convs[idx].last_read;
+        if last_read > 0 {
+            if let Some(first_new) = list.msgs.iter().position(|m| m.id > last_read) {
+                list.cursor = first_new;
+                list.align_top = true;
+            }
+        }
         self.open = Some(Open {
             conv: idx,
             list,
@@ -1113,6 +1196,7 @@ impl App {
                 live_only: true,
                 unread: false,
                 mentions: 0,
+                last_read: 0,
             });
             if !raw.is_empty() {
                 self.corpus.channel_names.entry(id).or_insert(raw);
@@ -1146,6 +1230,13 @@ impl App {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 conv.mentions = c.get("mention_count").and_then(Value::as_i64).unwrap_or(0);
+                if let Some(lr) = c
+                    .get("last_read")
+                    .and_then(Value::as_str)
+                    .and_then(ts_to_id)
+                {
+                    conv.last_read = lr;
+                }
                 if let Some(latest) = c.get("latest").and_then(Value::as_str).and_then(ts_to_id) {
                     if latest > conv.last_id {
                         conv.last_id = latest;
@@ -1156,6 +1247,7 @@ impl App {
         }
         if changed {
             self.apply_filter();
+            self.mark_all_dirty();
         }
     }
 
@@ -1214,6 +1306,233 @@ impl App {
         });
         self.focus = Focus::Msgs;
         self.status = format!("{n} threads you took part in, newest reply first");
+    }
+
+    pub fn image_font(&self) -> Option<(u16, u16)> {
+        if !self.inline_images {
+            return None;
+        }
+        self.picker
+            .as_ref()
+            .map(|p| (p.font_size().width, p.font_size().height))
+    }
+
+    fn mark_all_dirty(&mut self) {
+        if let Some(o) = self.open.as_mut() {
+            o.list.mark_dirty();
+        }
+        for v in &mut self.stack {
+            match v {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } => {
+                    list.mark_dirty()
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A local copy of a file: the archive's own upload first, then the cache.
+    fn local_file(&self, f: &crate::archive::FileInfo, full: bool) -> Option<PathBuf> {
+        if let Some(o) = self.open.as_ref() {
+            let conv = &self.corpus.convs[o.conv];
+            if !conv.live_only {
+                let dir = self.corpus.archives[conv.archive]
+                    .dir
+                    .join("__uploads")
+                    .join(&f.id);
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    if let Some(e) = rd.flatten().find(|e| e.path().is_file()) {
+                        return Some(e.path());
+                    }
+                }
+            }
+        }
+        let name = if full {
+            format!("{}.{}", f.id, f.ext())
+        } else {
+            format!("{}.thumb.{}", f.id, f.ext())
+        };
+        let cached = self.cache_dir.join("files").join(name);
+        cached.is_file().then_some(cached)
+    }
+
+    /// Have a file's pixels ready or on their way. `full` wants the original.
+    pub fn ensure_image(&mut self, f: &crate::archive::FileInfo, full: bool) {
+        let key = if full {
+            format!("{}:full", f.id)
+        } else {
+            f.id.clone()
+        };
+        if self.images.contains_key(&key) {
+            return;
+        }
+        if let Some(path) = self.local_file(f, full) {
+            let state = match image::open(&path) {
+                Ok(img) => ImageState::Ready(img),
+                Err(e) => ImageState::Failed(format!("{e}")),
+            };
+            self.images.insert(key, state);
+            return;
+        }
+        let url = if full {
+            f.url.clone()
+        } else {
+            f.thumb.clone().or_else(|| f.url.clone())
+        };
+        let state = match (self.api.is_some(), url) {
+            (true, Some(url)) => {
+                let name = if full {
+                    format!("{}.{}", f.id, f.ext())
+                } else {
+                    format!("{}.thumb.{}", f.id, f.ext())
+                };
+                ImageState::Queued {
+                    url,
+                    dest: self.cache_dir.join("files").join(name),
+                }
+            }
+            (false, _) => ImageState::Failed("not signed in".to_string()),
+            (_, None) => ImageState::Failed("no download URL".to_string()),
+        };
+        self.images.insert(key, state);
+    }
+
+    /// Start the next queued download when the slot is free.
+    fn pump_files(&mut self) {
+        if self.file_job.is_some() {
+            return;
+        }
+        let Some(client) = self.api.clone() else {
+            return;
+        };
+        let next = self.images.iter().find_map(|(k, s)| match s {
+            ImageState::Queued { url, dest } => Some((k.clone(), url.clone(), dest.clone())),
+            _ => None,
+        });
+        if let Some((key, url, dest)) = next {
+            self.images.insert(key.clone(), ImageState::Loading);
+            self.file_job = Some(live::fetch_file(client, key, url, dest));
+        }
+    }
+
+    /// The inline encoding of a thumbnail for a cell box, cached by size.
+    pub fn inline_protocol(&mut self, id: &str, cols: u16, rows: u16) -> Option<&Protocol> {
+        let fresh = matches!(self.inline.get(id), Some((c, r, _)) if *c == cols && *r == rows);
+        if !fresh {
+            let picker = self.picker.as_ref()?;
+            let img = match self.images.get(id) {
+                Some(ImageState::Ready(img)) => img,
+                _ => return None,
+            };
+            let size = ratatui::layout::Size::new(cols, rows);
+            let proto = picker
+                .new_protocol(img.clone(), size, ratatui_image::Resize::Fit(None))
+                .ok()?;
+            self.inline.insert(id.to_string(), (cols, rows, proto));
+        }
+        self.inline.get(id).map(|(_, _, p)| p)
+    }
+
+    /// `m`: the read marker of a conversation moves to its newest message
+    /// here; the highlighted one in the list, the open one otherwise.
+    fn mark_read(&mut self) {
+        let Some(c) = self.api.clone() else {
+            self.status = "marking read needs the Slack sign-in".to_string();
+            return;
+        };
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        let (idx, id) = match (self.focus, self.open.as_ref()) {
+            (Focus::Convs, _) => {
+                let Some(&idx) = self.filtered.get(self.conv_cursor) else {
+                    return;
+                };
+                (idx, self.corpus.convs[idx].last_id)
+            }
+            (_, Some(o)) => (
+                o.conv,
+                o.list
+                    .msgs
+                    .last()
+                    .map(|m| m.id)
+                    .unwrap_or(self.corpus.convs[o.conv].last_id),
+            ),
+            _ => return,
+        };
+        if id == 0 {
+            self.status = "nothing to mark".to_string();
+            return;
+        }
+        let cid = self.corpus.convs[idx].id.clone();
+        self.job = Some(live::api_mark(c, idx, cid, id));
+    }
+
+    /// `M`: the read marker moves to just before the message under the
+    /// cursor, so that message and everything after it read as unread; in
+    /// the list, the highlighted conversation's newest message becomes unread.
+    fn mark_unread(&mut self) {
+        let Some(c) = self.api.clone() else {
+            self.status = "marking unread needs the Slack sign-in".to_string();
+            return;
+        };
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        let (idx, id) = match (self.focus, self.open.as_ref()) {
+            (Focus::Convs, _) => {
+                let Some(&idx) = self.filtered.get(self.conv_cursor) else {
+                    return;
+                };
+                (idx, self.corpus.convs[idx].last_id)
+            }
+            (_, Some(o)) => match self.selected() {
+                Some(m) => (o.conv, m.id),
+                None => return,
+            },
+            _ => return,
+        };
+        if id <= 1 {
+            self.status = "nothing to mark".to_string();
+            return;
+        }
+        let cid = self.corpus.convs[idx].id.clone();
+        self.job = Some(live::api_mark(c, idx, cid, id - 1));
+    }
+
+    /// Esc in the list: the home view, with no filter and nothing open.
+    fn go_home(&mut self) {
+        if !self.filter.is_empty() {
+            self.filter.clear();
+            self.apply_filter();
+        }
+        self.open = None;
+        self.stack.clear();
+        self.status.clear();
+    }
+
+    /// `i`: the selected message's images, full pane.
+    fn open_images(&mut self) {
+        let Some(m) = self.selected() else {
+            return;
+        };
+        let files: Vec<crate::archive::FileInfo> =
+            m.files().into_iter().filter(|f| f.is_image()).collect();
+        if files.is_empty() {
+            self.status = "no image on this message".to_string();
+            return;
+        }
+        if self.picker.is_none() {
+            self.status = "images are off (--no-images)".to_string();
+            return;
+        }
+        self.stack.push(View::Image {
+            files,
+            index: 0,
+            shown: None,
+        });
     }
 
     fn prompt_archive(&mut self) {
@@ -1316,6 +1635,22 @@ impl App {
     /// Advance the spinner and collect a finished job.
     pub fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+        // The file slot: one download at a time, decoded on arrival.
+        if let Some(outcome) = self.file_job.as_ref().and_then(|j| j.poll()) {
+            let job = self.file_job.take().expect("polled");
+            if let JobKind::File { id } = job.kind {
+                let state = match outcome {
+                    Ok(Done::File(path)) => match image::open(&path) {
+                        Ok(img) => ImageState::Ready(img),
+                        Err(e) => ImageState::Failed(format!("{e}")),
+                    },
+                    Ok(_) => ImageState::Failed("unexpected result".to_string()),
+                    Err(e) => ImageState::Failed(e),
+                };
+                self.images.insert(id, state);
+            }
+        }
+        self.pump_files();
         // The quiet slot: sign-in, the conversation list, counts, tails.
         if let Some(outcome) = self.bg.as_ref().and_then(|j| j.poll()) {
             let job = self.bg.take().expect("polled");
@@ -1420,6 +1755,23 @@ impl App {
             (JobKind::ArchiveNew { spec }, Done::Archived(dir)) => self.finish_archive(&dir, &spec),
             (JobKind::Tail { conv }, Done::Messages(msgs)) => self.append_tail(conv, msgs, false),
             (JobKind::Older { conv }, Done::Messages(msgs)) => self.prepend_older(conv, msgs),
+            (JobKind::Mark { conv, id }, Done::Marked) => {
+                let c = &mut self.corpus.convs[conv];
+                c.last_read = id;
+                c.unread = c.last_id > id;
+                if !c.unread {
+                    c.mentions = 0;
+                }
+                let name = c.name.clone();
+                let what = if c.unread {
+                    "marked unread"
+                } else {
+                    "marked read"
+                };
+                self.apply_filter();
+                self.mark_all_dirty();
+                self.status = format!("{name} {what}");
+            }
             _ => {}
         }
     }
@@ -1469,7 +1821,7 @@ impl App {
             .stack
             .iter()
             .rev()
-            .find(|v| !matches!(v, View::Raw { .. }))
+            .find(|v| !matches!(v, View::Raw { .. } | View::Image { .. }))
         {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
@@ -1483,7 +1835,7 @@ impl App {
             .stack
             .iter_mut()
             .rev()
-            .find(|v| !matches!(v, View::Raw { .. }))
+            .find(|v| !matches!(v, View::Raw { .. } | View::Image { .. }))
         {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
@@ -1509,6 +1861,21 @@ impl App {
         let a = &self.corpus.archives[conv.archive];
         match self.stack.last() {
             Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
+            Some(View::Image { files, index, .. }) => {
+                let f = &files[*index];
+                format!(
+                    "image {}/{} · {} · {}x{} · {}",
+                    index + 1,
+                    files.len(),
+                    f.name,
+                    f.width,
+                    f.height,
+                    self.picker
+                        .as_ref()
+                        .map(|p| format!("{:?}", p.protocol_type()).to_lowercase())
+                        .unwrap_or_default()
+                )
+            }
             Some(View::Threads { list }) => format!(
                 "threads you took part in · {} · newest reply first",
                 list.len()
@@ -1586,17 +1953,6 @@ impl App {
         }
     }
 
-    pub fn hints(&self) -> &'static str {
-        match (self.focus, self.stack.last()) {
-            (Focus::Convs, _) => "j/k move  Enter open  / filter  s sort  T my threads  a archive from Slack  Tab messages  ? help  q quit",
-            (_, Some(View::Raw { .. })) => "j/k scroll  Esc back  q quit",
-            (_, Some(View::Thread { .. })) => "j/k move  Enter raw  o show in channel  / search  R refresh  Esc back  q quit",
-            (_, Some(View::Search { .. })) => "j/k move  Enter open hit  o show in channel  a archive its channel  Esc back  q quit",
-            (_, Some(View::Threads { .. })) => "j/k move  Enter open thread  o show in channel  Esc back  q quit",
-            _ => "j/k move  Enter thread  / search  d date  v raw  g/G ends  r reload  R refresh from Slack  h conversations  ? help  q quit",
-        }
-    }
-
     // ----------------------------------------------------------------- keys
 
     pub fn on_key(&mut self, k: KeyEvent) {
@@ -1614,7 +1970,7 @@ impl App {
                 self.quit = true;
                 return;
             }
-            (KeyCode::Char('?'), false) => {
+            (KeyCode::Char('?'), false) | (KeyCode::Char('H'), false) => {
                 self.help = true;
                 return;
             }
@@ -1622,6 +1978,40 @@ impl App {
         }
         if let Some(View::Raw { .. }) = self.stack.last() {
             self.on_raw_key(k, ctrl);
+            return;
+        }
+        if let Some(View::Image {
+            files,
+            index,
+            shown,
+        }) = self.stack.last_mut()
+        {
+            match k.code {
+                KeyCode::Char('j')
+                | KeyCode::Down
+                | KeyCode::Char('l')
+                | KeyCode::Right
+                | KeyCode::Char('n') => {
+                    if *index + 1 < files.len() {
+                        *index += 1;
+                        *shown = None;
+                    }
+                }
+                KeyCode::Char('k')
+                | KeyCode::Up
+                | KeyCode::Char('h')
+                | KeyCode::Left
+                | KeyCode::Char('p') => {
+                    if *index > 0 {
+                        *index -= 1;
+                        *shown = None;
+                    }
+                }
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
+                    self.stack.pop();
+                }
+                _ => {}
+            }
             return;
         }
         match self.focus {
@@ -1700,14 +2090,14 @@ impl App {
                     previous: self.filter.clone(),
                 };
             }
-            (KeyCode::Esc, _) => {
-                if !self.filter.is_empty() {
-                    self.filter.clear();
-                    self.apply_filter();
-                }
-            }
+            (KeyCode::Esc, _) => self.go_home(),
             (KeyCode::Char('a'), false) => self.prompt_archive(),
             (KeyCode::Char('T'), false) => self.open_my_threads(),
+            (KeyCode::Char('C'), false) => {
+                self.highlight_cached = !self.highlight_cached;
+            }
+            (KeyCode::Char('m'), false) => self.mark_read(),
+            (KeyCode::Char('M'), false) => self.mark_unread(),
             (KeyCode::Char('s'), false) => {
                 self.sort = self.sort.next();
                 self.apply_filter();
@@ -1839,7 +2229,30 @@ impl App {
             (KeyCode::Char('R'), false) => self.refresh(),
             (KeyCode::Char('a'), false) => self.prompt_archive(),
             (KeyCode::Char('T'), false) => self.open_my_threads(),
-            (KeyCode::Esc, _) | (KeyCode::Char('h'), false) | (KeyCode::Left, _) => {
+            (KeyCode::Char('C'), false) => {
+                self.highlight_cached = !self.highlight_cached;
+            }
+            (KeyCode::Char('i'), false) => self.open_images(),
+            (KeyCode::Char('m'), false) => self.mark_read(),
+            (KeyCode::Char('M'), false) => self.mark_unread(),
+            (KeyCode::Char('I'), false) => {
+                self.inline_images = !self.inline_images && self.picker.is_some();
+                self.mark_all_dirty();
+                self.status = if self.inline_images {
+                    "inline images on"
+                } else {
+                    "inline images off"
+                }
+                .to_string();
+            }
+            (KeyCode::Esc, _) => {
+                // Unwind one stacked view; from the bare timeline, straight home.
+                if self.stack.pop().is_none() {
+                    self.go_home();
+                }
+            }
+            (KeyCode::Char('h'), false) | (KeyCode::Left, _) => {
+                // Back out one view, keeping the conversation open to browse the list.
                 if self.stack.pop().is_none() {
                     self.focus = Focus::Convs;
                 }
@@ -1898,5 +2311,75 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::{Archive, Corpus, Msg};
+    use crate::render::{line_text, Ctx, Tz};
+    use serde_json::json;
+
+    fn msg(secs: i64, text: &str) -> Msg {
+        Msg::from_api(
+            "C1".to_string(),
+            json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unread_divider_opens_at_the_first_message_past_the_marker() {
+        // Two days, four messages; the marker sits after the second.
+        let a = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let day = 86_400;
+        let msgs = vec![
+            msg(day + 10, "old one"),
+            msg(day + 20, "old two"),
+            msg(2 * day + 10, "new one"),
+            msg(2 * day + 20, "new two"),
+        ];
+        let read_marker = 2 * day * 1_000_000; // between day 1 and day 2
+        let mut list = MsgList::new(msgs, false);
+        let ctx = Ctx {
+            archive: &a,
+            corpus: &corpus,
+            tz: Tz::Utc,
+            image_font: None,
+            last_read: Some(read_marker),
+        };
+        list.rebuild(&ctx, 60);
+        let texts: Vec<String> = list.flat.iter().map(|fl| line_text(&fl.line)).collect();
+        let new_line = texts
+            .iter()
+            .position(|t| t.contains("new"))
+            .expect("a new divider");
+        // The divider is the day-2 header carrying "new", above "new one".
+        assert!(texts[new_line].contains("new"), "{:?}", texts[new_line]);
+        let body = texts.iter().position(|t| t.contains("new one")).unwrap();
+        assert!(new_line < body);
+        // Nothing before the marker is flagged.
+        assert!(texts[..new_line].iter().all(|t| !t.contains("· new")));
+    }
+
+    #[test]
+    fn no_marker_means_no_new_divider() {
+        let a = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let mut list = MsgList::new(vec![msg(100, "a"), msg(200, "b")], false);
+        let ctx = Ctx {
+            archive: &a,
+            corpus: &corpus,
+            tz: Tz::Utc,
+            image_font: None,
+            last_read: None,
+        };
+        list.rebuild(&ctx, 60);
+        assert!(list
+            .flat
+            .iter()
+            .all(|fl| !line_text(&fl.line).contains("new")));
     }
 }
