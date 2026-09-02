@@ -63,11 +63,23 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
                 name.push('†');
             }
             if c.unread {
-                name.insert_str(0, "● ");
+                // The marker carries the mention count; the name itself lights up.
+                name.insert_str(
+                    0,
+                    &if c.mentions > 0 {
+                        format!("●{} ", c.mentions)
+                    } else {
+                        "● ".to_string()
+                    },
+                );
             }
             let name = clip(&name, room);
             let pad = room.saturating_sub(name.width());
-            let name_style = if Some(i) == open_idx {
+            let name_style = if c.unread {
+                Style::new()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if Some(i) == open_idx {
                 Style::new().add_modifier(Modifier::BOLD)
             } else if c.live_only {
                 Style::new().add_modifier(Modifier::DIM)
