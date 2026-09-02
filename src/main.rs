@@ -2,6 +2,7 @@
 
 mod app;
 mod archive;
+mod live;
 mod render;
 mod ui;
 
@@ -42,9 +43,15 @@ flags
   --width W       with --dump: wrap width (default 100)
   --half-life D   days after which one of your messages counts half in the
                   activity order (default 30)
+  --no-live       never go to Slack: cache only (also when slackdump is absent)
   --help          this text
 
 environment
+  SLACKDUMP            the slackdump binary (default: slackdump on PATH)
+  SLACKDUMP_LOCK       lock file shared with the hourly refresh
+                       (default /var/lock/slackdump-sync.lock)
+  SLACK_TUI_CACHE      where fetched threads live
+                       (default $XDG_CACHE_HOME/slack-tui/live, i.e. ~/.cache/...)
   SLACKDUMPS           archive root when --root is not given
   SLACK_SELF_USER_ID   your own user id: names direct messages by the other
                        party and counts your messages per conversation
@@ -53,7 +60,14 @@ environment
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
   Enter thread, Esc back, / filter or search, d go to date, v raw JSON,
-  o show a hit or a thread root in the channel, r reload, s sort, q quit
+  o show a hit or a thread root in the channel, r reload, s sort, q quit,
+  R refresh from Slack, a archive a conversation not cached yet
+
+When the cache cannot answer, slackdump goes to Slack in the background:
+a thread whose replies are not archived is fetched into the cache, `/`
+searches the whole workspace after the cached hits, R resumes the open
+archive, a archives a new conversation into the root. Nothing is ever
+written to Slack.
 
 exit codes
   0  ok        1  no archive, or the conversation was not found
@@ -75,6 +89,7 @@ struct Opts {
     limit: usize,
     width: usize,
     half_life: f64,
+    no_live: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -89,6 +104,7 @@ fn parse_args() -> Result<Opts, String> {
         limit: 100,
         width: 100,
         half_life: 30.0,
+        no_live: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -108,6 +124,7 @@ fn parse_args() -> Result<Opts, String> {
                     .parse()
                     .map_err(|_| "--limit wants a number".to_string())?
             }
+            "--no-live" => opts.no_live = true,
             "--half-life" => {
                 opts.half_life = value("--half-life")?
                     .parse()
@@ -159,7 +176,30 @@ fn run() -> i32 {
             return 1;
         }
     };
-    let mut app = App::new(corpus, opts.tz, opts.half_life);
+    let live_enabled = !opts.no_live && live::available();
+    // Own variable first: XDG_CACHE_HOME also moves slackdump's credential
+    // store, so it cannot serve as a test knob.
+    let cache_dir = std::env::var_os("SLACK_TUI_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("slack-tui")
+                .join("live")
+        });
+    let lock = std::env::var_os("SLACKDUMP_LOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lock/slackdump-sync.lock"));
+    let mut app = App::new(
+        corpus,
+        opts.tz,
+        opts.half_life,
+        live_enabled,
+        cache_dir,
+        lock,
+    );
     if opts.list {
         let mut text = String::new();
         text.push_str(&format!(
@@ -232,6 +272,7 @@ fn tui(app: &mut App) -> std::io::Result<()> {
             Ok(false) => {}
             Err(e) => break Err(e),
         }
+        app.tick();
         if app.quit {
             break Ok(());
         }

@@ -3,15 +3,13 @@
 //! attachments (what alert bots post), then greedy word-wrap into styled
 //! ratatui lines.
 
-use std::collections::HashMap;
-
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Utc};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::archive::{Archive, Msg};
+use crate::archive::{Archive, Corpus, Msg};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tz {
@@ -70,17 +68,78 @@ impl Tz {
 }
 
 pub struct Ctx<'a> {
+    /// The archive of the conversation on screen: its users and channels first.
     pub archive: &'a Archive,
+    /// Every other archive: a user or channel named elsewhere still resolves.
+    pub corpus: &'a Corpus,
     pub tz: Tz,
-    pub channels: &'a HashMap<String, String>,
 }
 
 impl Ctx<'_> {
     fn channel(&self, cid: &str) -> String {
         self.archive
             .channel_name(cid)
-            .or_else(|| self.channels.get(cid).cloned())
+            .or_else(|| self.corpus.channel_names.get(cid).cloned())
             .unwrap_or_else(|| cid.to_string())
+    }
+
+    pub fn user(&self, uid: &str) -> String {
+        if uid == "USLACKBOT" {
+            return "Slackbot".to_string();
+        }
+        self.archive
+            .user(uid)
+            .or_else(|| self.corpus.user_name(uid))
+            .unwrap_or_else(|| uid.to_string())
+    }
+
+    pub fn user_is_bot(&self, uid: &str) -> bool {
+        self.archive.user_is_bot(uid) || self.corpus.user_is_bot(uid)
+    }
+
+    /// Who wrote it, as a reader would name them.
+    pub fn author(&self, m: &Msg) -> String {
+        let d = &m.data;
+        let username = d
+            .get("username")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if let Some(uid) = &m.user {
+            if let Some(name) = self
+                .archive
+                .user(uid)
+                .or_else(|| self.corpus.user_name(uid))
+            {
+                return name;
+            }
+            if uid == "USLACKBOT" {
+                return "Slackbot".to_string();
+            }
+            // A search hit names its poster even when no archive knows the id.
+            return username.map(str::to_string).unwrap_or_else(|| uid.clone());
+        }
+        if let Some(u) = username {
+            return u.to_string();
+        }
+        if let Some(u) = d
+            .pointer("/bot_profile/name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return u.to_string();
+        }
+        if let Some(u) = d
+            .get("attachments")
+            .and_then(Value::as_array)
+            .and_then(|a| {
+                a.iter()
+                    .find_map(|x| x.get("author_name").and_then(Value::as_str))
+            })
+            .filter(|s| !s.is_empty())
+        {
+            return u.to_string();
+        }
+        "bot".to_string()
     }
 }
 
@@ -289,9 +348,7 @@ fn angle(inner: &str, base: Sty, ctx: &Ctx) -> Option<Vec<Seg>> {
         ..base
     };
     if let Some(uid) = head.strip_prefix('@') {
-        let name = label
-            .map(unescape)
-            .unwrap_or_else(|| ctx.archive.user_name(uid));
+        let name = label.map(unescape).unwrap_or_else(|| ctx.user(uid));
         return Some(vec![Seg::new(format!("@{name}"), m)]);
     }
     if let Some(cid) = head.strip_prefix('#') {
@@ -563,10 +620,7 @@ fn section(el: &Value, ctx: &Ctx, base: Sty, out: &mut Vec<Seg>) {
                     out.push(Seg::new(url, l));
                 }
             }
-            "user" => out.push(Seg::new(
-                format!("@{}", ctx.archive.user_name(s("user_id"))),
-                mention,
-            )),
+            "user" => out.push(Seg::new(format!("@{}", ctx.user(s("user_id"))), mention)),
             "usergroup" => {
                 let id = s("usergroup_id");
                 out.push(Seg::new(
@@ -937,14 +991,14 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Vec<L
         Span::raw("  "),
         Span::styled(String::new(), Style::new().add_modifier(Modifier::BOLD)),
     ];
-    let author = ctx.archive.author(m);
-    let tag_bot = author != "bot"
-        && (m.is_bot()
-            || m.user
-                .as_deref()
-                .is_some_and(|u| ctx.archive.user_is_bot(u)));
+    let author = ctx.author(m);
+    let tag_bot =
+        author != "bot" && (m.is_bot() || m.user.as_deref().is_some_and(|u| ctx.user_is_bot(u)));
     if tag_bot {
         spans.push(Span::styled(" bot", dim));
+    }
+    if let Some(c) = &m.channel_name {
+        spans.push(Span::styled(format!(" in #{c}"), dim));
     }
     if m.edited {
         spans.push(Span::styled(" (edited)", dim));
@@ -1021,11 +1075,11 @@ pub fn line_text(l: &Line) -> String {
 mod tests {
     use super::*;
 
-    fn ctx<'a>(archive: &'a Archive, channels: &'a HashMap<String, String>) -> Ctx<'a> {
+    fn ctx<'a>(archive: &'a Archive, corpus: &'a Corpus) -> Ctx<'a> {
         Ctx {
             archive,
+            corpus,
             tz: Tz::Utc,
-            channels,
         }
     }
 
@@ -1036,7 +1090,7 @@ mod tests {
     #[test]
     fn mentions_links_and_entities() {
         let a = Archive::stub(&[("U1", "gabriel.clima")], &[("C1", "team-alpha")]);
-        let none = HashMap::new();
+        let none = Corpus::stub(&[]);
         let c = ctx(&a, &none);
         let segs = mrkdwn(
             "<@U1> see <#C1|team-alpha> &amp; <#C1>: <https://x.y/z|the page> or <https://x.y/z>",
@@ -1053,8 +1107,7 @@ mod tests {
     #[test]
     fn channel_name_falls_back_to_the_corpus() {
         let a = Archive::stub(&[], &[]);
-        let mut all = HashMap::new();
-        all.insert("C9".to_string(), "alerts-alpha".to_string());
+        let all = Corpus::stub(&[("C9", "alerts-alpha")]);
         let c = ctx(&a, &all);
         assert_eq!(
             text(&mrkdwn("on<#C9>", &c, Sty::default())),
@@ -1082,7 +1135,7 @@ mod tests {
     #[test]
     fn emphasis_code_and_fences() {
         let a = Archive::stub(&[], &[]);
-        let none = HashMap::new();
+        let none = Corpus::stub(&[]);
         let c = ctx(&a, &none);
         let segs = mrkdwn(
             "*bold* and `code` but snake_case and 2*3*4 stay",
@@ -1105,7 +1158,7 @@ mod tests {
     #[test]
     fn quotes_keep_their_bar_on_blank_lines() {
         let a = Archive::stub(&[], &[]);
-        let none = HashMap::new();
+        let none = Corpus::stub(&[]);
         let c = ctx(&a, &none);
         let q = Sty {
             quote: true,
@@ -1139,7 +1192,7 @@ mod tests {
     #[test]
     fn rich_text_blocks_render_lists_and_links() {
         let a = Archive::stub(&[("U1", "gwen.parker")], &[]);
-        let none = HashMap::new();
+        let none = Corpus::stub(&[]);
         let c = ctx(&a, &none);
         let blocks: Value = serde_json::from_str(
             r#"[{"type":"rich_text","elements":[

@@ -113,7 +113,14 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(Text::from(shown)), inner);
         return;
     }
-    let Some(open) = app.open.as_mut() else {
+    let App {
+        corpus,
+        open,
+        stack,
+        tz,
+        ..
+    } = app;
+    let Some(open) = open.as_mut() else {
         let hint = Line::from(Span::styled(
             "  select a conversation and press Enter",
             Style::new().add_modifier(Modifier::DIM),
@@ -121,20 +128,21 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(hint), inner);
         return;
     };
-    let conv = &app.corpus.convs[open.conv];
-    let ctx = Ctx {
-        archive: &app.corpus.archives[conv.archive],
-        tz: app.tz,
-        channels: &app.corpus.channel_names,
-    };
-    let list = match app
-        .stack
+    let conv = &corpus.convs[open.conv];
+    let conv_archive = &corpus.archives[conv.archive];
+    let (list, archive) = match stack
         .iter_mut()
         .rev()
         .find(|v| !matches!(v, View::Raw { .. }))
     {
-        Some(View::Thread { list, .. }) | Some(View::Search { list, .. }) => list,
-        _ => &mut open.list,
+        Some(View::Thread { list, live, .. }) => (list, live.as_deref().unwrap_or(conv_archive)),
+        Some(View::Search { list, .. }) => (list, conv_archive),
+        _ => (&mut open.list, conv_archive),
+    };
+    let ctx = Ctx {
+        archive,
+        corpus,
+        tz: *tz,
     };
     let text_w = inner.width as usize - 1;
     list.rebuild(&ctx, text_w);
@@ -184,6 +192,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 PromptKind::Filter => "filter conversations",
                 PromptKind::Search => "search this conversation",
                 PromptKind::Date => "go to date (YYYY-MM-DD)",
+                PromptKind::Archive => {
+                    "archive a conversation from Slack, last 90 days (URL or id)"
+                }
             };
             Line::from(vec![
                 Span::styled(format!(" {label}: "), Style::new().fg(Color::Cyan)),
@@ -194,17 +205,29 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => Line::from(Span::styled(format!(" {}", app.hints()), dim)),
     };
     frame.render_widget(Paragraph::new(first), top);
+    // Status first: an error must not hide behind a long permalink.
     let mut second = vec![Span::styled(format!(" {} ", app.tz.label()), dim)];
+    if !app.status.is_empty() {
+        second.push(Span::styled(
+            format!("{}  ", app.status),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    if let Some(job) = &app.job {
+        let frame_char = crate::live::SPINNER[app.spinner % crate::live::SPINNER.len()];
+        second.push(Span::styled(
+            format!(
+                "{frame_char} {} ({}s)  ",
+                job.label,
+                job.started.elapsed().as_secs()
+            ),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     if let Some(m) = app.selected() {
         second.push(Span::styled(
             m.permalink(&app.corpus.workspace_url),
             Style::new().fg(Color::Blue),
-        ));
-    }
-    if !app.status.is_empty() {
-        second.push(Span::styled(
-            format!("  {}", app.status),
-            Style::new().fg(Color::Yellow),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(second)), bottom);
@@ -236,10 +259,12 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("d", "go to a date (YYYY-MM-DD)"),
     ("v", "raw JSON of the selected message"),
+    ("r", "reload the conversation from the archive"),
     (
-        "r",
-        "reload the conversation (the archive refreshes hourly)",
+        "R",
+        "refresh the conversation from Slack now (a slackdump resume)",
     ),
+    ("a", "archive a conversation not cached yet (URL or id)"),
     (
         "s",
         "sort conversations: my activity (messages you wrote), name, recent, size",
@@ -311,8 +336,8 @@ pub fn dump(app: &mut App, width: usize) -> String {
     let conv = &app.corpus.convs[open.conv];
     let ctx = Ctx {
         archive: &app.corpus.archives[conv.archive],
+        corpus: &app.corpus,
         tz: app.tz,
-        channels: &app.corpus.channel_names,
     };
     open.list.rebuild(&ctx, width);
     open.list

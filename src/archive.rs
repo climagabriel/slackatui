@@ -45,6 +45,7 @@ pub struct User {
 pub struct Archive {
     /// `full/team-alpha_20260428`: the directory relative to the root.
     pub rel: String,
+    pub dir: PathBuf,
     pub conn: Connection,
     users: RefCell<Option<HashMap<String, User>>>,
     pub channel_names: HashMap<String, String>,
@@ -68,6 +69,7 @@ pub struct Conv {
 }
 
 pub struct Corpus {
+    pub root: PathBuf,
     pub archives: Vec<Archive>,
     pub convs: Vec<Conv>,
     pub workspace_url: String,
@@ -77,6 +79,7 @@ pub struct Corpus {
     /// Channel id -> name across every archive: a mention of a channel
     /// archived elsewhere still gets its name.
     pub channel_names: HashMap<String, String>,
+    pub half_life_days: f64,
 }
 
 /// One message, with the copies slackdump keeps of a thread parent folded in.
@@ -104,6 +107,8 @@ pub struct Msg {
     pub edited: bool,
     /// `thread_broadcast`: a reply that was also sent to the channel.
     pub broadcast: bool,
+    /// Set on a live search hit: the conversation it came from.
+    pub channel_name: Option<String>,
 }
 
 pub struct FileInfo {
@@ -212,22 +217,23 @@ impl Corpus {
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| p.join("slackdump.sqlite").is_file())
+                // A hidden directory is an archive still being written.
+                .filter(|p| {
+                    !p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .starts_with('.')
+                })
                 .collect();
             subs.sort();
             for sub in subs {
-                let db = sub.join("slackdump.sqlite");
                 let rel = format!(
                     "{}/{}",
                     set,
                     sub.file_name().unwrap_or_default().to_string_lossy()
                 );
-                match open_ro(&db) {
-                    Ok(conn) => archives.push(Archive {
-                        rel,
-                        conn,
-                        users: RefCell::new(None),
-                        channel_names: HashMap::new(),
-                    }),
+                match Archive::open(rel.clone(), &sub) {
+                    Ok(a) => archives.push(a),
                     Err(e) => eprintln!("slack-tui: {rel}: {e}"),
                 }
             }
@@ -254,23 +260,81 @@ impl Corpus {
                 Err(e) => eprintln!("slack-tui: {}: {e}", a.rel),
             }
         }
-        let mut channel_names = HashMap::new();
-        for a in &archives {
-            for (id, name) in &a.channel_names {
-                if !name.is_empty() {
-                    channel_names
-                        .entry(id.clone())
-                        .or_insert_with(|| name.clone());
-                }
-            }
-        }
-        Ok(Corpus {
-            archives,
+        let mut corpus = Corpus {
+            root: root.to_path_buf(),
+            archives: Vec::new(),
             convs,
             workspace_url,
-            channel_names,
+            channel_names: HashMap::new(),
             me,
-        })
+            half_life_days,
+        };
+        for a in archives {
+            corpus.learn_channels(&a);
+            corpus.archives.push(a);
+        }
+        Ok(corpus)
+    }
+
+    fn learn_channels(&mut self, a: &Archive) {
+        for (id, name) in &a.channel_names {
+            if !name.is_empty() {
+                self.channel_names
+                    .entry(id.clone())
+                    .or_insert_with(|| name.clone());
+            }
+        }
+    }
+
+    /// Register an archive directory created after startup; returns the
+    /// indices of its conversations.
+    pub fn add_archive(&mut self, dir: &Path) -> Result<Vec<usize>, String> {
+        let rel = dir
+            .strip_prefix(&self.root)
+            .unwrap_or(dir)
+            .to_string_lossy()
+            .to_string();
+        let mut a = Archive::open(rel, dir).map_err(|e| e.to_string())?;
+        let ai = self.archives.len();
+        let convs = a
+            .scan_convs(ai, self.me.as_deref(), self.half_life_days)
+            .map_err(|e| e.to_string())?;
+        self.learn_channels(&a);
+        self.archives.push(a);
+        let first = self.convs.len();
+        let n = convs.len();
+        self.convs.extend(convs);
+        Ok((first..first + n).collect())
+    }
+
+    /// A user's name from any archive: the first S_USER row wins.
+    pub fn user_name(&self, uid: &str) -> Option<String> {
+        self.archives.iter().find_map(|a| a.user(uid))
+    }
+
+    pub fn user_is_bot(&self, uid: &str) -> bool {
+        self.archives.iter().any(|a| a.user_is_bot(uid))
+    }
+
+    /// The conversation holding a channel id, if archived.
+    pub fn conv_by_channel(&self, cid: &str) -> Option<usize> {
+        self.convs.iter().position(|c| c.id == cid)
+    }
+
+    #[cfg(test)]
+    pub fn stub(channels: &[(&str, &str)]) -> Corpus {
+        Corpus {
+            root: PathBuf::new(),
+            archives: Vec::new(),
+            convs: Vec::new(),
+            workspace_url: String::new(),
+            channel_names: channels
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect(),
+            me: None,
+            half_life_days: 30.0,
+        }
     }
 
     /// Find a conversation by its display name, with or without the `#`/`@`.
@@ -300,6 +364,7 @@ impl Archive {
             .collect();
         Archive {
             rel: "test".to_string(),
+            dir: PathBuf::new(),
             conn: Connection::open_in_memory().expect("in-memory sqlite"),
             users: RefCell::new(Some(map)),
             channel_names: channels
@@ -307,6 +372,56 @@ impl Archive {
                 .map(|(id, name)| (id.to_string(), name.to_string()))
                 .collect(),
         }
+    }
+
+    /// Open an archive directory read-only.
+    pub fn open(rel: String, dir: &Path) -> rusqlite::Result<Archive> {
+        let conn = open_ro(&dir.join("slackdump.sqlite"))?;
+        Ok(Archive {
+            rel,
+            dir: dir.to_path_buf(),
+            conn,
+            users: RefCell::new(None),
+            channel_names: HashMap::new(),
+        })
+    }
+
+    /// Fresh message stats for one channel: (distinct messages, first id, last id).
+    pub fn channel_stats(&self, cid: &str) -> rusqlite::Result<(i64, i64, i64)> {
+        self.conn.query_row(
+            "SELECT COUNT(DISTINCT TS), IFNULL(MIN(ID), 0), IFNULL(MAX(ID), 0) FROM MESSAGE WHERE CHANNEL_ID = ?1",
+            params![cid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+    }
+
+    /// The rows a `slackdump search` run wrote: hits across the workspace.
+    pub fn search_hits(&self) -> rusqlite::Result<Vec<Msg>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT CHANNEL_ID, CHANNEL_NAME, TS, DATA FROM SEARCH_MESSAGE ORDER BY CAST(TS AS REAL) DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for (cid, name, ts, blob) in rows.flatten() {
+            let mut data: Value = serde_json::from_slice(&blob).unwrap_or(Value::Null);
+            if data.get("ts").is_none() {
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("ts".to_string(), Value::String(ts.clone()));
+                }
+            }
+            if let Some(mut m) = Msg::from_api(cid, data) {
+                m.channel_name = name.filter(|n| !n.is_empty());
+                out.push(m);
+            }
+        }
+        Ok(out)
     }
 
     fn self_user(&self) -> Option<String> {
@@ -385,14 +500,16 @@ impl Archive {
         Ref::map(self.users.borrow(), |o| o.as_ref().expect("users loaded"))
     }
 
+    /// A user's name when this archive knows the user.
+    pub fn user(&self, uid: &str) -> Option<String> {
+        self.users().get(uid).map(|u| u.name.clone())
+    }
+
     pub fn user_name(&self, uid: &str) -> String {
         if uid == "USLACKBOT" {
             return "Slackbot".to_string();
         }
-        self.users()
-            .get(uid)
-            .map(|u| u.name.clone())
-            .unwrap_or_else(|| uid.to_string())
+        self.user(uid).unwrap_or_else(|| uid.to_string())
     }
 
     /// A bot user (PagerDuty, Jira, ...) posts with a user id whose S_USER row says so.
@@ -407,41 +524,7 @@ impl Archive {
             .cloned()
     }
 
-    /// Who wrote it, as a reader would name them.
-    pub fn author(&self, m: &Msg) -> String {
-        if let Some(uid) = &m.user {
-            return self.user_name(uid);
-        }
-        let d = &m.data;
-        if let Some(u) = d
-            .get("username")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            return u.to_string();
-        }
-        if let Some(u) = d
-            .pointer("/bot_profile/name")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            return u.to_string();
-        }
-        if let Some(u) = d
-            .get("attachments")
-            .and_then(Value::as_array)
-            .and_then(|a| {
-                a.iter()
-                    .find_map(|x| x.get("author_name").and_then(Value::as_str))
-            })
-            .filter(|s| !s.is_empty())
-        {
-            return u.to_string();
-        }
-        "bot".to_string()
-    }
-
-    fn scan_convs(
+    pub(crate) fn scan_convs(
         &mut self,
         ai: usize,
         me: Option<&str>,
@@ -832,6 +915,58 @@ impl RawRow {
 }
 
 impl Msg {
+    /// A message as the API returns it: a search hit, a dumped thread.
+    pub fn from_api(channel_id: String, data: Value) -> Option<Msg> {
+        let ts = data.get("ts").and_then(Value::as_str)?.to_string();
+        let id = ts_to_id(&ts)?;
+        let subtype = data
+            .get("subtype")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let broadcast = subtype.as_deref() == Some("thread_broadcast");
+        let mut thread_ts = data
+            .get("thread_ts")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if thread_ts.is_none() {
+            // A search hit carries its thread only in the permalink.
+            thread_ts = data
+                .get("permalink")
+                .and_then(Value::as_str)
+                .and_then(|p| p.split_once("thread_ts="))
+                .map(|(_, r)| r.split('&').next().unwrap_or("").to_string())
+                .filter(|s| !s.is_empty());
+        }
+        let parent_id = thread_ts.as_deref().and_then(ts_to_id).filter(|p| *p != id);
+        let reply_count = data.get("reply_count").and_then(Value::as_i64).unwrap_or(0);
+        let latest_reply_id = data
+            .get("latest_reply")
+            .and_then(Value::as_str)
+            .and_then(ts_to_id);
+        Some(Msg {
+            id,
+            ts,
+            channel_id,
+            parent_id,
+            thread_ts,
+            is_parent: reply_count > 0,
+            reply_count,
+            archived_replies: 0,
+            latest_reply_id,
+            user: data.get("user").and_then(Value::as_str).map(str::to_string),
+            subtype,
+            text: data
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            edited: data.get("edited").is_some(),
+            broadcast,
+            channel_name: None,
+            data,
+        })
+    }
+
     fn from_raw(r: RawRow) -> Msg {
         let d = &r.data;
         let subtype = d.get("subtype").and_then(Value::as_str).map(str::to_string);
@@ -873,6 +1008,7 @@ impl Msg {
             text,
             edited: d.get("edited").is_some(),
             broadcast,
+            channel_name: None,
             data: r.data,
         }
     }

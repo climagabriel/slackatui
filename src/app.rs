@@ -1,10 +1,14 @@
 //! Application state and key handling. Views stack on top of the timeline:
 //! thread, search hits, raw JSON. Esc pops.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 
-use crate::archive::{Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
+use crate::archive::{Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
+use crate::live::{self, Done, Job, JobKind};
 use crate::render::{self, Ctx, Tz};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -207,12 +211,18 @@ pub struct Open {
 
 pub enum View {
     Thread {
+        root: i64,
         list: MsgList,
+        /// The archive the thread was fetched into, when it came from Slack.
+        live: Option<Box<Archive>>,
     },
     Search {
         query: String,
         list: MsgList,
         capped: bool,
+        /// Hits Slack added beyond the cache, once it answered.
+        live_hits: Option<usize>,
+        live_pending: bool,
     },
     Raw {
         title: String,
@@ -226,6 +236,7 @@ pub enum PromptKind {
     Filter,
     Search,
     Date,
+    Archive,
 }
 
 pub enum Mode {
@@ -256,10 +267,26 @@ pub struct App {
     /// Days after which one of the owner's messages counts half, in the
     /// activity order.
     pub half_life_days: f64,
+    /// The one slackdump run in flight, if any.
+    pub job: Option<Job>,
+    pub spinner: usize,
+    /// Slack may be consulted when the cache cannot answer.
+    pub live: bool,
+    /// Fetched threads and search results land here.
+    pub cache_dir: PathBuf,
+    /// The lock the hourly refresh takes; a refresh from here takes it too.
+    pub lock: PathBuf,
 }
 
 impl App {
-    pub fn new(corpus: Corpus, tz: Tz, half_life_days: f64) -> App {
+    pub fn new(
+        corpus: Corpus,
+        tz: Tz,
+        half_life_days: f64,
+        live: bool,
+        cache_dir: PathBuf,
+        lock: PathBuf,
+    ) -> App {
         let mut app = App {
             corpus,
             tz,
@@ -276,6 +303,11 @@ impl App {
             quit: false,
             msgs_height: 0,
             half_life_days,
+            job: None,
+            spinner: 0,
+            live,
+            cache_dir,
+            lock,
         };
         app.apply_filter();
         app
@@ -352,8 +384,8 @@ impl App {
     fn ctx_for(&self, conv: usize) -> Ctx<'_> {
         Ctx {
             archive: &self.corpus.archives[self.corpus.convs[conv].archive],
+            corpus: &self.corpus,
             tz: self.tz,
-            channels: &self.corpus.channel_names,
         }
     }
 
@@ -487,25 +519,133 @@ impl App {
         self.update_notes();
     }
 
-    pub fn open_thread(&mut self, root: i64, focus: i64) {
-        let Some(o) = self.open.as_ref() else { return };
-        let conv = &self.corpus.convs[o.conv];
-        let a = &self.corpus.archives[conv.archive];
-        let msgs = match a.thread(&conv.id, root) {
-            Ok(m) => m,
+    /// A thread by channel id: the archive first, then the thread cache,
+    /// then Slack in the background.
+    pub fn open_thread_in(&mut self, cid: String, root: i64, focus: i64) {
+        let msgs = self
+            .corpus
+            .conv_by_channel(&cid)
+            .map(|ci| {
+                self.corpus.archives[self.corpus.convs[ci].archive]
+                    .thread(&cid, root)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let wanted = msgs
+            .first()
+            .filter(|m| m.id == root)
+            .map(|m| m.reply_count)
+            .unwrap_or(0);
+        let have = msgs.len().saturating_sub(1) as i64;
+        let complete = !msgs.is_empty() && have >= wanted;
+        let mut list = MsgList::new(msgs, true);
+        list.cursor = list.msgs.iter().position(|m| m.id == focus).unwrap_or(0);
+        list.align_top = list.cursor > 0;
+        self.stack.push(View::Thread {
+            root,
+            list,
+            live: None,
+        });
+        if complete {
+            return;
+        }
+        let dir = live::thread_dir(&self.cache_dir, &cid, root);
+        if dir.join("slackdump.sqlite").is_file() {
+            self.apply_thread_dir(&dir, &cid, root, focus);
+            return;
+        }
+        if !self.live {
+            self.status = if wanted == 0 && have == 0 {
+                "thread root is not in the archive; live fetch is off".to_string()
+            } else {
+                format!("{have} of {wanted} replies archived; live fetch is off")
+            };
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        self.job = Some(live::fetch_thread(
+            &self.cache_dir,
+            &self.corpus.workspace_url,
+            cid,
+            root,
+            focus,
+        ));
+    }
+
+    /// Show a thread from a fetched archive directory, replacing the view
+    /// of the same thread when it is on top.
+    fn apply_thread_dir(&mut self, dir: &Path, cid: &str, root: i64, focus: i64) {
+        let rel = format!(
+            "live/{}",
+            dir.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let mut a = match Archive::open(rel, dir) {
+            Ok(a) => a,
             Err(e) => {
                 self.status = format!("{e}");
                 return;
             }
         };
+        let _ = a.scan_convs(
+            usize::MAX,
+            self.corpus.me.as_deref(),
+            self.corpus.half_life_days,
+        );
+        let msgs = a.thread(cid, root).unwrap_or_default();
         if msgs.is_empty() {
-            self.status = "thread root is not in the archive".to_string();
+            self.status = "Slack returned no messages for that thread".to_string();
             return;
         }
+        let n = msgs.len() - 1;
         let mut list = MsgList::new(msgs, true);
         list.cursor = list.msgs.iter().position(|m| m.id == focus).unwrap_or(0);
         list.align_top = list.cursor > 0;
-        self.stack.push(View::Thread { list });
+        match self.stack.last_mut() {
+            Some(View::Thread {
+                root: r,
+                list: l,
+                live,
+            }) if *r == root => {
+                *l = list;
+                *live = Some(Box::new(a));
+            }
+            _ => self.stack.push(View::Thread {
+                root,
+                list,
+                live: Some(Box::new(a)),
+            }),
+        }
+        self.status = format!(
+            "{n} {} from Slack",
+            if n == 1 { "reply" } else { "replies" }
+        );
+    }
+
+    /// Open a message's thread wherever it lives: this conversation, another
+    /// archived one (switched to underneath the search view), or Slack.
+    fn open_hit(&mut self, cid: String, root: i64, focus: i64) {
+        let here = self
+            .open
+            .as_ref()
+            .map(|o| self.corpus.convs[o.conv].id == cid)
+            .unwrap_or(false);
+        if !here {
+            if let Some(idx) = self.corpus.conv_by_channel(&cid) {
+                let search = match self.stack.last() {
+                    Some(View::Search { .. }) => self.stack.pop(),
+                    _ => None,
+                };
+                self.open_conv(idx);
+                self.jump_to(root);
+                if let Some(v) = search {
+                    self.stack.push(v);
+                }
+            }
+        }
+        self.open_thread_in(cid, root, focus);
     }
 
     pub fn run_search(&mut self, query: &str) {
@@ -513,7 +653,9 @@ impl App {
         if query.is_empty() {
             return;
         }
-        let Some(o) = self.open.as_ref() else { return };
+        let Some(o) = self.open.as_ref() else {
+            return;
+        };
         let conv_idx = o.conv;
         let ctx = self.ctx_for(conv_idx);
         let conv = &self.corpus.convs[conv_idx];
@@ -536,30 +678,284 @@ impl App {
                     || render::message_urls(m)
                         .iter()
                         .any(|u| u.to_lowercase().contains(&needle))
-                    || ctx.archive.author(m).to_lowercase().contains(&needle)
+                    || ctx.author(m).to_lowercase().contains(&needle)
             })
             .collect();
-        if hits.is_empty() {
-            self.status = format!("no message matching '{query}' in {}", conv.name);
+        let cached = hits.len();
+        let go_live = self.live && self.job.is_none();
+        if cached == 0 && !go_live {
+            self.status = format!(
+                "no message matching '{query}' in {}{}",
+                conv.name,
+                if self.live {
+                    "; a fetch is already running"
+                } else {
+                    ""
+                }
+            );
             return;
         }
-        self.status = format!(
-            "{} hit{} for '{query}'{}",
-            hits.len(),
-            if hits.len() == 1 { "" } else { "s" },
-            if capped {
-                " (first 500 candidates only)"
-            } else {
-                ""
-            }
-        );
+        let plural = if cached == 1 { "" } else { "s" };
+        self.status = if go_live {
+            format!("{cached} cached hit{plural}; searching Slack")
+        } else {
+            format!(
+                "{cached} hit{plural} for '{query}'{}",
+                if capped {
+                    " (first 500 candidates only)"
+                } else {
+                    ""
+                }
+            )
+        };
         // Newest first; the cursor starts on the newest hit.
         let list = MsgList::new(hits, false);
         self.stack.push(View::Search {
             query: query.to_string(),
             list,
             capped,
+            live_hits: None,
+            live_pending: go_live,
         });
+        if go_live {
+            self.job = Some(live::search(&self.cache_dir, query.to_string()));
+        }
+    }
+
+    /// Fold what Slack found into the search view still showing that query.
+    fn merge_live_search(&mut self, query: &str, dir: &Path) {
+        let hits = Archive::open("live/search".to_string(), dir).and_then(|a| a.search_hits());
+        let _ = std::fs::remove_dir_all(dir);
+        let hits = match hits {
+            Ok(h) => h,
+            Err(e) => {
+                self.status = format!("live search: {e}");
+                return;
+            }
+        };
+        let total = hits.len();
+        match self
+            .stack
+            .iter_mut()
+            .rev()
+            .find(|v| matches!(v, View::Search { .. }))
+        {
+            Some(View::Search {
+                query: q,
+                list,
+                live_hits,
+                live_pending,
+                ..
+            }) if q == query => {
+                let cursor_id = list.selected().map(|m| m.id);
+                let mut seen: HashSet<(String, i64)> = list
+                    .msgs
+                    .iter()
+                    .map(|m| (m.channel_id.clone(), m.id))
+                    .collect();
+                let mut added = 0;
+                for h in hits {
+                    if seen.insert((h.channel_id.clone(), h.id)) {
+                        list.msgs.push(h);
+                        added += 1;
+                    }
+                }
+                list.msgs.sort_by(|x, y| y.id.cmp(&x.id));
+                if let Some(id) = cursor_id {
+                    list.cursor = list.msgs.iter().position(|m| m.id == id).unwrap_or(0);
+                }
+                *live_hits = Some(added);
+                *live_pending = false;
+                list.mark_dirty();
+                self.status = format!(
+                    "Slack: {total} hit{}, {added} not in the cache",
+                    if total == 1 { "" } else { "s" }
+                );
+            }
+            _ => self.status = format!("live search finished after its view closed: {total} hits"),
+        }
+    }
+
+    fn refresh(&mut self) {
+        let Some(o) = self.open.as_ref() else {
+            return;
+        };
+        if !self.live {
+            self.status = "live fetch is off (--no-live, or no slackdump)".to_string();
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        let conv = &self.corpus.convs[o.conv];
+        let dir = self.corpus.archives[conv.archive].dir.clone();
+        let lookback =
+            live::lookback_hours(conv.last_id / 1_000_000, chrono::Utc::now().timestamp());
+        self.job = Some(live::refresh(
+            o.conv,
+            o.total,
+            dir,
+            self.lock.clone(),
+            lookback,
+        ));
+    }
+
+    fn refresh_conv_stats(&mut self, idx: usize) {
+        let conv = &self.corpus.convs[idx];
+        let stats = self.corpus.archives[conv.archive].channel_stats(&conv.id);
+        if let Ok((msgs, first, last)) = stats {
+            let c = &mut self.corpus.convs[idx];
+            c.msgs = msgs;
+            if first > 0 {
+                c.first_id = first;
+            }
+            if last > 0 {
+                c.last_id = last;
+            }
+        }
+    }
+
+    fn prompt_archive(&mut self) {
+        // A hit from a conversation not cached yet: offer its id.
+        let prefill = self
+            .selected()
+            .filter(|m| self.corpus.conv_by_channel(&m.channel_id).is_none())
+            .map(|m| m.channel_id.clone())
+            .unwrap_or_default();
+        self.mode = Mode::Prompt {
+            kind: PromptKind::Archive,
+            buf: prefill.clone(),
+            previous: prefill,
+        };
+    }
+
+    fn archive_new(&mut self, spec: &str) {
+        let spec = spec.trim().to_string();
+        if spec.is_empty() {
+            return;
+        }
+        if !self.live {
+            self.status = "live fetch is off (--no-live, or no slackdump)".to_string();
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        self.job = Some(live::archive_new(&self.corpus.root, spec, 90));
+    }
+
+    /// Name a freshly written archive after its conversation, as the
+    /// refresh scripts expect, and open it.
+    fn finish_archive(&mut self, dir: &Path, spec: &str) {
+        let name = match Archive::open("new".to_string(), dir) {
+            Ok(mut a) => a
+                .scan_convs(
+                    usize::MAX,
+                    self.corpus.me.as_deref(),
+                    self.corpus.half_life_days,
+                )
+                .unwrap_or_default()
+                .first()
+                .map(|c| c.name.trim_start_matches(['#', '@']).to_string())
+                .filter(|s| !s.is_empty()),
+            Err(e) => {
+                self.status = format!("{e}");
+                return;
+            }
+        };
+        let Some(name) = name else {
+            let _ = std::fs::remove_dir_all(dir);
+            self.status = format!("slackdump wrote no conversation for {spec}");
+            return;
+        };
+        let slug: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let stamp = chrono::Utc::now().format("%Y%m%d");
+        let final_dir = self
+            .corpus
+            .root
+            .join("full")
+            .join(format!("{slug}_{stamp}"));
+        if final_dir.exists() {
+            let _ = std::fs::remove_dir_all(dir);
+            self.status = format!("already archived: {}", final_dir.display());
+            return;
+        }
+        if let Err(e) = std::fs::rename(dir, &final_dir) {
+            self.status = format!("{e}");
+            return;
+        }
+        match self.corpus.add_archive(&final_dir) {
+            Ok(new) => {
+                self.apply_filter();
+                if let Some(&idx) = new.first() {
+                    self.conv_cursor = self.filtered.iter().position(|&i| i == idx).unwrap_or(0);
+                    self.open_conv(idx);
+                }
+                self.status = format!("archived {name} into {}", final_dir.display());
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Advance the spinner and collect a finished job.
+    pub fn tick(&mut self) {
+        self.spinner = self.spinner.wrapping_add(1);
+        let Some(outcome) = self.job.as_ref().and_then(|j| j.poll()) else {
+            return;
+        };
+        let job = self.job.take().expect("a job was polled");
+        let done = match outcome {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("slackdump: {e}");
+                if let JobKind::Search { query } = &job.kind {
+                    // The view stops saying "searching"; the cached hits stay.
+                    if let Some(View::Search {
+                        query: q,
+                        live_pending,
+                        ..
+                    }) = self.stack.last_mut()
+                    {
+                        if q == query {
+                            *live_pending = false;
+                        }
+                    }
+                }
+                return;
+            }
+        };
+        match (job.kind, done) {
+            (JobKind::Refresh { conv, before }, Done::Refreshed) => {
+                self.refresh_conv_stats(conv);
+                self.open_conv(conv);
+                let new = self.open.as_ref().map(|o| o.total).unwrap_or(before) - before;
+                self.status = format!(
+                    "refreshed: {new} new top-level message{}",
+                    if new == 1 { "" } else { "s" }
+                );
+            }
+            (JobKind::Thread { cid, root, focus }, Done::Thread(dir)) => {
+                if matches!(self.stack.last(), Some(View::Thread { root: r, .. }) if *r == root) {
+                    self.apply_thread_dir(&dir, &cid, root, focus);
+                } else {
+                    self.status = "thread fetched into the cache".to_string();
+                }
+            }
+            (JobKind::Search { query }, Done::Search(dir)) => self.merge_live_search(&query, &dir),
+            (JobKind::ArchiveNew { spec }, Done::Archived(dir)) => self.finish_archive(&dir, &spec),
+            _ => {}
+        }
     }
 
     pub fn open_raw(&mut self) {
@@ -643,14 +1039,21 @@ impl App {
         let a = &self.corpus.archives[conv.archive];
         match self.stack.last() {
             Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
-            Some(View::Thread { list, .. }) => {
+            Some(View::Thread { list, live, .. }) => {
                 let n = list.len().saturating_sub(1);
+                let place = match (live, list.msgs.first()) {
+                    (Some(a), Some(m)) => a
+                        .channel_name(&m.channel_id)
+                        .map(|c| format!("#{c}"))
+                        .unwrap_or_else(|| conv.name.clone()),
+                    _ => conv.name.clone(),
+                };
+                let from = if live.is_some() { " · from Slack" } else { "" };
                 if n == 0 {
-                    format!("message in {} · no replies", conv.name)
+                    format!("message in {place} · no replies{from}")
                 } else {
                     format!(
-                        "thread in {} · {n} {}",
-                        conv.name,
+                        "thread in {place} · {n} {}{from}",
                         if n == 1 { "reply" } else { "replies" }
                     )
                 }
@@ -659,13 +1062,23 @@ impl App {
                 query,
                 list,
                 capped,
-            }) => format!(
-                "search '{query}' in {} · {} hit{}{}",
-                conv.name,
-                list.len(),
-                if list.len() == 1 { "" } else { "s" },
-                if *capped { " (capped)" } else { "" }
-            ),
+                live_hits,
+                live_pending,
+            }) => {
+                let live = if *live_pending {
+                    " · searching Slack".to_string()
+                } else {
+                    live_hits
+                        .map(|n| format!(" · {n} more from Slack"))
+                        .unwrap_or_default()
+                };
+                format!(
+                    "search '{query}' · {} hit{}{}{live}",
+                    list.len(),
+                    if list.len() == 1 { "" } else { "s" },
+                    if *capped { " (capped)" } else { "" }
+                )
+            }
             None => {
                 let span = format!(
                     "{} → {}",
@@ -686,11 +1099,11 @@ impl App {
 
     pub fn hints(&self) -> &'static str {
         match (self.focus, self.stack.last()) {
-            (Focus::Convs, _) => "j/k move  Enter open  / filter  s sort (my activity, name, recent, size)  Tab messages  ? help  q quit",
+            (Focus::Convs, _) => "j/k move  Enter open  / filter  s sort  a archive from Slack  Tab messages  ? help  q quit",
             (_, Some(View::Raw { .. })) => "j/k scroll  Esc back  q quit",
-            (_, Some(View::Thread { .. })) => "j/k move  Enter raw  o show in channel  / search  Esc back  q quit",
-            (_, Some(View::Search { .. })) => "j/k move  Enter thread  o show in channel  Esc back  q quit",
-            _ => "j/k move  Enter thread  / search  d date  v raw  g/G ends  r reload  h conversations  ? help  q quit",
+            (_, Some(View::Thread { .. })) => "j/k move  Enter raw  o show in channel  / search  R refresh  Esc back  q quit",
+            (_, Some(View::Search { .. })) => "j/k move  Enter open hit  o show in channel  a archive its channel  Esc back  q quit",
+            _ => "j/k move  Enter thread  / search  d date  v raw  g/G ends  r reload  R refresh from Slack  h conversations  ? help  q quit",
         }
     }
 
@@ -799,6 +1212,7 @@ impl App {
                     self.apply_filter();
                 }
             }
+            (KeyCode::Char('a'), false) => self.prompt_archive(),
             (KeyCode::Char('s'), false) => {
                 self.sort = self.sort.next();
                 self.apply_filter();
@@ -873,16 +1287,33 @@ impl App {
                 if matches!(self.stack.last(), Some(View::Thread { .. })) {
                     self.open_raw();
                 } else if let Some(m) = self.selected() {
-                    let (root, id) = (m.thread_root(), m.id);
-                    self.open_thread(root, id);
+                    let (cid, root, id) = (m.channel_id.clone(), m.thread_root(), m.id);
+                    self.open_hit(cid, root, id);
                 }
             }
             (KeyCode::Char('v'), false) => self.open_raw(),
             (KeyCode::Char('o'), false) => {
-                if let (false, Some(m)) = (timeline, self.selected()) {
-                    let root = m.thread_root();
-                    self.stack.clear();
-                    self.jump_to(root);
+                let sel = self.selected().map(|m| {
+                    (
+                        m.channel_id.clone(),
+                        m.thread_root(),
+                        m.channel_name.clone(),
+                    )
+                });
+                if let (false, Some((cid, root, name))) = (timeline, sel) {
+                    match self.corpus.conv_by_channel(&cid) {
+                        Some(idx) => {
+                            self.stack.clear();
+                            if self.open.as_ref().map(|o| o.conv) != Some(idx) {
+                                self.open_conv(idx);
+                            }
+                            self.jump_to(root);
+                        }
+                        None => {
+                            self.status =
+                                format!("#{} is not archived; a archives it", name.unwrap_or(cid));
+                        }
+                    }
                 }
             }
             (KeyCode::Char('/'), false) => {
@@ -900,6 +1331,8 @@ impl App {
                 };
             }
             (KeyCode::Char('r'), false) => self.reload(),
+            (KeyCode::Char('R'), false) => self.refresh(),
+            (KeyCode::Char('a'), false) => self.prompt_archive(),
             (KeyCode::Esc, _) | (KeyCode::Char('h'), false) | (KeyCode::Left, _) => {
                 if self.stack.pop().is_none() {
                     self.focus = Focus::Convs;
@@ -940,6 +1373,7 @@ impl App {
                     }
                     PromptKind::Search => self.run_search(&text),
                     PromptKind::Date => self.goto_date(&text),
+                    PromptKind::Archive => self.archive_new(&text),
                 }
             }
             KeyCode::Backspace => {
