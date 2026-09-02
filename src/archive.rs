@@ -66,6 +66,10 @@ pub struct Conv {
     pub score: f64,
     pub first_id: i64,
     pub last_id: i64,
+    /// Known from Slack only: a member conversation no archive holds.
+    pub live_only: bool,
+    pub unread: bool,
+    pub mentions: i64,
 }
 
 pub struct Corpus {
@@ -80,6 +84,9 @@ pub struct Corpus {
     /// archived elsewhere still gets its name.
     pub channel_names: HashMap<String, String>,
     pub half_life_days: f64,
+    /// The workspace's users, from the archive with the most of them: every
+    /// archive stores the whole list, so one table answers for all.
+    users: HashMap<String, User>,
 }
 
 /// One message, with the copies slackdump keeps of a thread parent folded in.
@@ -198,7 +205,7 @@ fn open_ro(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn ts_to_id(ts: &str) -> Option<i64> {
+pub(crate) fn ts_to_id(ts: &str) -> Option<i64> {
     let (secs, frac) = ts.split_once('.')?;
     let secs: i64 = secs.parse().ok()?;
     let frac: i64 = format!("{frac:0<6}").get(..6)?.parse().ok()?;
@@ -206,7 +213,11 @@ fn ts_to_id(ts: &str) -> Option<i64> {
 }
 
 impl Corpus {
-    pub fn open(root: &Path, half_life_days: f64) -> Result<Corpus, String> {
+    pub fn open(
+        root: &Path,
+        half_life_days: f64,
+        stats_cache: Option<PathBuf>,
+    ) -> Result<Corpus, String> {
         let mut archives = Vec::new();
         for set in ARCHIVE_SETS {
             let dir = root.join(set);
@@ -238,6 +249,7 @@ impl Corpus {
                 }
             }
         }
+        crate::trace("open: archives opened");
         if archives.is_empty() {
             return Err(format!(
                 "no slackdump.sqlite under {}/{{{}}}",
@@ -248,14 +260,21 @@ impl Corpus {
         let me = std::env::var("SLACK_SELF_USER_ID")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| archives.iter().find_map(|a| a.self_user()));
+            .or_else(|| {
+                // Only a DM archive can answer; ask those first.
+                let mut order: Vec<&Archive> = archives.iter().collect();
+                order.sort_by_key(|a| !a.rel.starts_with("dms/"));
+                order.into_iter().find_map(|a| a.self_user())
+            });
         let workspace_url = archives
             .iter()
             .find_map(|a| a.workspace_url())
             .unwrap_or_else(|| "https://slack.com".to_string());
+        crate::trace("open: me and workspace url");
+        let mut cache = stats_cache.map(StatsCache::load);
         let mut convs = Vec::new();
         for (ai, a) in archives.iter_mut().enumerate() {
-            match a.scan_convs(ai, me.as_deref(), half_life_days) {
+            match a.scan_convs(ai, me.as_deref(), half_life_days, cache.as_mut()) {
                 Ok(mut c) => convs.append(&mut c),
                 Err(e) => eprintln!("slack-tui: {}: {e}", a.rel),
             }
@@ -268,7 +287,17 @@ impl Corpus {
             channel_names: HashMap::new(),
             me,
             half_life_days,
+            users: HashMap::new(),
         };
+        if let Some(c) = &cache {
+            c.save();
+        }
+        crate::trace("open: conversations scanned");
+        if let Some(best) = archives.iter().max_by_key(|a| a.user_count()) {
+            crate::trace("open: user counts done");
+            corpus.users = best.load_users().unwrap_or_default();
+        }
+        crate::trace("open: users loaded");
         for a in archives {
             corpus.learn_channels(&a);
             corpus.archives.push(a);
@@ -297,7 +326,7 @@ impl Corpus {
         let mut a = Archive::open(rel, dir).map_err(|e| e.to_string())?;
         let ai = self.archives.len();
         let convs = a
-            .scan_convs(ai, self.me.as_deref(), self.half_life_days)
+            .scan_convs(ai, self.me.as_deref(), self.half_life_days, None)
             .map_err(|e| e.to_string())?;
         self.learn_channels(&a);
         self.archives.push(a);
@@ -307,13 +336,13 @@ impl Corpus {
         Ok((first..first + n).collect())
     }
 
-    /// A user's name from any archive: the first S_USER row wins.
+    /// A user's name from the workspace list.
     pub fn user_name(&self, uid: &str) -> Option<String> {
-        self.archives.iter().find_map(|a| a.user(uid))
+        self.users.get(uid).map(|u| u.name.clone())
     }
 
     pub fn user_is_bot(&self, uid: &str) -> bool {
-        self.archives.iter().any(|a| a.user_is_bot(uid))
+        self.users.get(uid).is_some_and(|u| u.is_bot)
     }
 
     /// The conversation holding a channel id, if archived.
@@ -334,6 +363,7 @@ impl Corpus {
                 .collect(),
             me: None,
             half_life_days: 30.0,
+            users: HashMap::new(),
         }
     }
 
@@ -453,13 +483,19 @@ impl Archive {
             .filter(|u| !u.is_empty())
     }
 
+    fn user_count(&self) -> i64 {
+        self.conn
+            .query_row("SELECT COUNT(DISTINCT ID) FROM S_USER", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
     fn load_users(&self) -> rusqlite::Result<HashMap<String, User>> {
         let mut map = HashMap::new();
         let mut stmt = self.conn.prepare(
             "SELECT ID, USERNAME, json_extract(DATA, '$.real_name'), \
              json_extract(DATA, '$.profile.display_name'), \
              json_extract(DATA, '$.deleted'), json_extract(DATA, '$.is_bot') \
-             FROM S_USER ORDER BY CHUNK_ID",
+             FROM S_USER WHERE rowid IN (SELECT MAX(rowid) FROM S_USER GROUP BY ID)",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -529,6 +565,7 @@ impl Archive {
         ai: usize,
         me: Option<&str>,
         half_life_days: f64,
+        cache: Option<&mut StatsCache>,
     ) -> rusqlite::Result<Vec<Conv>> {
         struct Meta {
             name: String,
@@ -595,30 +632,85 @@ impl Archive {
         // score in which a message counts 2^(-age / half-life). The LIKE
         // prefilter keeps the JSON parse to rows that can match: 197 ms -> 56 ms
         // on the largest archive.
-        let mut mine: HashMap<String, (i64, f64)> = HashMap::new();
-        if let Some(me) = me {
-            let like = format!("%\"user\":\"{}\"%", me.replace(['%', '_'], ""));
-            let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT CHANNEL_ID, TS FROM MESSAGE \
-                 WHERE DATA LIKE ?1 AND json_extract(DATA, '$.user') = ?2",
-            )?;
-            let rows = stmt.query_map(params![like, me], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            let half_life_secs = half_life_days.max(0.01) * 86_400.0;
-            for (cid, ts) in rows.flatten() {
-                let secs: f64 = ts.parse().unwrap_or(0.0);
-                let age = (now - secs).max(0.0);
-                let e = mine.entry(cid).or_insert((0, 0.0));
-                e.0 += 1;
-                e.1 += 0.5f64.powf(age / half_life_secs);
+        // Message stats and the owner's message times, cached per archive
+        // and keyed by the database's size and mtime: only what a refresh
+        // touched is recounted.
+        let key = self.stat_key();
+        let stats = match cache.as_ref().and_then(|c| c.get(&self.rel, &key)) {
+            Some(st) => st,
+            None => {
+                let st = self.compute_stats(me)?;
+                if let Some(c) = cache {
+                    c.put(&self.rel, &key, &st);
+                }
+                st
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let half_life_secs = half_life_days.max(0.01) * 86_400.0;
+        let mut convs = Vec::new();
+        for (cid, st) in stats.channels {
+            let (name, kind, archived) = match meta.get(&cid) {
+                Some(m) => (
+                    self.display_name(&cid, m.kind, &m.name, m.im_user.as_deref(), &m.members, me),
+                    m.kind,
+                    m.archived,
+                ),
+                None => (cid.clone(), Kind::Channel, false),
+            };
+            let score: f64 = st
+                .mine
+                .iter()
+                .map(|&t| 0.5f64.powf((now - t as f64).max(0.0) / half_life_secs))
+                .sum();
+            convs.push(Conv {
+                archive: ai,
+                id: cid,
+                name,
+                kind,
+                archived,
+                msgs: st.msgs,
+                mine: st.mine.len() as i64,
+                score,
+                first_id: st.first,
+                last_id: st.last,
+                live_only: false,
+                unread: false,
+                mentions: 0,
+            });
+        }
+        convs.sort_by(|x, y| x.id.cmp(&y.id));
+        Ok(convs)
+    }
+
+    /// Size and mtime of the database and its WAL: what a resume changes.
+    fn stat_key(&self) -> String {
+        let mut key = String::new();
+        for name in ["slackdump.sqlite", "slackdump.sqlite-wal"] {
+            match std::fs::metadata(self.dir.join(name)) {
+                Ok(md) => {
+                    let mtime = md
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    key.push_str(&format!("{}:{}:", md.len(), mtime));
+                }
+                Err(_) => key.push_str("-:"),
             }
         }
-        let mut convs = Vec::new();
+        key
+    }
+
+    /// Per channel: distinct messages, first and last id, and the times of
+    /// the owner's messages. The LIKE prefilter keeps the JSON parse to rows
+    /// that can match: 197 ms -> 56 ms on the largest archive.
+    fn compute_stats(&self, me: Option<&str>) -> rusqlite::Result<ArchiveStats> {
+        let mut channels: HashMap<String, ChannelStats> = HashMap::new();
         let mut stmt = self.conn.prepare(
             "SELECT CHANNEL_ID, COUNT(DISTINCT TS), MIN(ID), MAX(ID) FROM MESSAGE GROUP BY CHANNEL_ID",
         )?;
@@ -630,30 +722,35 @@ impl Archive {
                 r.get::<_, i64>(3)?,
             ))
         })?;
-        for (cid, msgs, first_id, last_id) in rows.flatten() {
-            let (name, kind, archived) = match meta.get(&cid) {
-                Some(m) => (
-                    self.display_name(&cid, m.kind, &m.name, m.im_user.as_deref(), &m.members, me),
-                    m.kind,
-                    m.archived,
-                ),
-                None => (cid.clone(), Kind::Channel, false),
-            };
-            let (mine, score) = mine.get(&cid).copied().unwrap_or((0, 0.0));
-            convs.push(Conv {
-                archive: ai,
-                id: cid,
-                name,
-                kind,
-                archived,
-                msgs,
-                mine,
-                score,
-                first_id,
-                last_id,
-            });
+        for (cid, msgs, first, last) in rows.flatten() {
+            channels.insert(
+                cid,
+                ChannelStats {
+                    msgs,
+                    first,
+                    last,
+                    mine: Vec::new(),
+                },
+            );
         }
-        Ok(convs)
+        if let Some(me) = me {
+            let like = format!("%\"user\":\"{}\"%", me.replace(['%', '_'], ""));
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT CHANNEL_ID, TS FROM MESSAGE \
+                 WHERE DATA LIKE ?1 AND json_extract(DATA, '$.user') = ?2",
+            )?;
+            let rows = stmt.query_map(params![like, me], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for (cid, ts) in rows.flatten() {
+                if let Some(st) = channels.get_mut(&cid) {
+                    if let Some(secs) = ts.split('.').next().and_then(|s| s.parse::<i64>().ok()) {
+                        st.mine.push(secs);
+                    }
+                }
+            }
+        }
+        Ok(ArchiveStats { channels })
     }
 
     fn display_name(
@@ -881,6 +978,93 @@ impl Archive {
         let mut msgs = self.query_msgs(&sql, &[&cid, &like, &like_stored, &(limit as i64)])?;
         self.reply_stats(cid, &mut msgs)?;
         Ok(msgs)
+    }
+}
+
+#[derive(Clone)]
+pub struct ChannelStats {
+    pub msgs: i64,
+    pub first: i64,
+    pub last: i64,
+    /// Unix seconds of the owner's messages, for the recency score.
+    pub mine: Vec<i64>,
+}
+
+#[derive(Clone, Default)]
+pub struct ArchiveStats {
+    pub channels: HashMap<String, ChannelStats>,
+}
+
+/// Per-archive stats on disk, so a start recounts only what changed.
+pub struct StatsCache {
+    path: PathBuf,
+    entries: serde_json::Map<String, Value>,
+    dirty: bool,
+}
+
+impl StatsCache {
+    pub fn load(path: PathBuf) -> StatsCache {
+        let entries = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        StatsCache {
+            path,
+            entries,
+            dirty: false,
+        }
+    }
+
+    fn get(&self, rel: &str, key: &str) -> Option<ArchiveStats> {
+        let e = self.entries.get(rel)?;
+        if e.get("key").and_then(Value::as_str) != Some(key) {
+            return None;
+        }
+        let mut channels = HashMap::new();
+        for (cid, c) in e.get("channels")?.as_object()? {
+            let n = |k: &str| c.get(k).and_then(Value::as_i64).unwrap_or(0);
+            let mine = c
+                .get("mine")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default();
+            channels.insert(
+                cid.clone(),
+                ChannelStats {
+                    msgs: n("msgs"),
+                    first: n("first"),
+                    last: n("last"),
+                    mine,
+                },
+            );
+        }
+        Some(ArchiveStats { channels })
+    }
+
+    fn put(&mut self, rel: &str, key: &str, stats: &ArchiveStats) {
+        let mut channels = serde_json::Map::new();
+        for (cid, c) in &stats.channels {
+            channels.insert(
+                cid.clone(),
+                serde_json::json!({ "msgs": c.msgs, "first": c.first, "last": c.last, "mine": c.mine }),
+            );
+        }
+        self.entries.insert(
+            rel.to_string(),
+            serde_json::json!({ "key": key, "channels": channels }),
+        );
+        self.dirty = true;
+    }
+
+    pub fn save(&self) {
+        if !self.dirty {
+            return;
+        }
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&self.path, Value::Object(self.entries.clone()).to_string());
     }
 }
 

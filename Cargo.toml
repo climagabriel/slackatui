@@ -11,6 +11,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = "1"
 unicode-width = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ureq = "3"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
+sha1 = "0.10"
 
 [profile.release]
 opt-level = 2

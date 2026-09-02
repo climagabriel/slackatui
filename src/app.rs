@@ -3,11 +3,16 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 
-use crate::archive::{Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
+use serde_json::Value;
+
+use crate::api::Client;
+use crate::archive::{ts_to_id, Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
 use crate::live::{self, Done, Job, JobKind};
 use crate::render::{self, Ctx, Tz};
 
@@ -207,14 +212,18 @@ pub struct Open {
     pub total: i64,
     pub has_older: bool,
     pub has_newer: bool,
+    /// Paged from Slack: no archive behind it.
+    pub api_only: bool,
 }
 
 pub enum View {
     Thread {
         root: i64,
         list: MsgList,
-        /// The archive the thread was fetched into, when it came from Slack.
+        /// The archive the thread was fetched into, when slackdump fetched it.
         live: Option<Box<Archive>>,
+        /// Where the thread lives when that is not the open conversation.
+        place: Option<String>,
     },
     Search {
         query: String,
@@ -276,16 +285,28 @@ pub struct App {
     pub cache_dir: PathBuf,
     /// The lock the hourly refresh takes; a refresh from here takes it too.
     pub lock: PathBuf,
+    /// The Web API, once the background sign-in succeeded.
+    pub api: Option<Arc<Client>>,
+    /// Quiet background work: sign-in, conversation list, counts, tails.
+    pub bg: Option<Job>,
+    /// A slackdump binary answers; the fallback engine.
+    pub slackdump: bool,
+    pub poll_every: Duration,
+    pub last_poll: Instant,
+    pub last_counts: Instant,
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         corpus: Corpus,
         tz: Tz,
         half_life_days: f64,
         live: bool,
+        slackdump: bool,
         cache_dir: PathBuf,
         lock: PathBuf,
+        poll_secs: u64,
     ) -> App {
         let mut app = App {
             corpus,
@@ -308,8 +329,20 @@ impl App {
             live,
             cache_dir,
             lock,
+            api: None,
+            bg: None,
+            slackdump,
+            poll_every: Duration::from_secs(poll_secs),
+            last_poll: Instant::now(),
+            last_counts: Instant::now(),
         };
         app.apply_filter();
+        if live {
+            app.bg = Some(live::sign_in(
+                app.corpus.workspace_url.clone(),
+                app.cache_dir.join("tmp"),
+            ));
+        }
         app
     }
 
@@ -391,9 +424,35 @@ impl App {
 
     pub fn open_conv(&mut self, idx: usize) -> bool {
         let conv = &self.corpus.convs[idx];
+        let cid = conv.id.clone();
+        if conv.live_only {
+            let list = MsgList::new(Vec::new(), false);
+            self.open = Some(Open {
+                conv: idx,
+                list,
+                total: 0,
+                has_older: false,
+                has_newer: false,
+                api_only: true,
+            });
+            self.stack.clear();
+            self.focus = Focus::Msgs;
+            match self.api.clone() {
+                Some(c) if self.job.is_none() => {
+                    self.job = Some(live::api_older(c, idx, cid, 0));
+                    self.status = "loading from Slack".to_string();
+                }
+                Some(_) => self.status = "a fetch is already running".to_string(),
+                None => {
+                    self.status = "not signed in, and this conversation is not cached".to_string()
+                }
+            }
+            self.update_notes();
+            return true;
+        }
         let a = &self.corpus.archives[conv.archive];
-        let total = a.timeline_count(&conv.id).unwrap_or(0);
-        let msgs = match a.timeline_page(&conv.id, None, None, PAGE) {
+        let total = a.timeline_count(&cid).unwrap_or(0);
+        let msgs = match a.timeline_page(&cid, None, None, PAGE) {
             Ok(m) => m,
             Err(e) => {
                 self.status = format!("{}: {e}", a.rel);
@@ -401,6 +460,7 @@ impl App {
             }
         };
         let has_older = (msgs.len() as i64) < total;
+        let since = msgs.last().map(|m| m.id).unwrap_or(0);
         let mut list = MsgList::new(msgs, false);
         list.cursor = list.len().saturating_sub(1);
         self.open = Some(Open {
@@ -409,18 +469,31 @@ impl App {
             total,
             has_older,
             has_newer: false,
+            api_only: false,
         });
         self.stack.clear();
         self.focus = Focus::Msgs;
         self.update_notes();
         self.status.clear();
+        // Whatever Slack has past the archive's end, quietly.
+        if let Some(c) = self.api.clone() {
+            if self.bg.is_none() && since > 0 {
+                self.bg = Some(live::api_tail(c, idx, cid, since, true));
+                self.last_poll = Instant::now();
+            }
+        }
         true
     }
 
     fn update_notes(&mut self) {
-        let Some(o) = self.open.as_mut() else { return };
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
         let loaded = o.list.len() as i64;
-        o.list.top_note = if o.has_older {
+        o.list.top_note = if o.api_only {
+            o.has_older
+                .then(|| "older messages on Slack · k loads more".to_string())
+        } else if o.has_older {
             Some(format!(
                 "{} older messages not loaded · k loads more, g loads the oldest",
                 o.total - loaded
@@ -437,8 +510,23 @@ impl App {
     }
 
     fn load_older(&mut self) {
-        let Some(o) = self.open.as_mut() else { return };
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
         if !o.has_older {
+            return;
+        }
+        if o.api_only {
+            let Some(c) = self.api.clone() else {
+                return;
+            };
+            if self.job.is_some() {
+                return;
+            }
+            let idx = o.conv;
+            let before = o.list.msgs.first().map(|m| m.id).unwrap_or(0);
+            let cid = self.corpus.convs[idx].id.clone();
+            self.job = Some(live::api_older(c, idx, cid, before));
             return;
         }
         let conv = &self.corpus.convs[o.conv];
@@ -465,8 +553,10 @@ impl App {
     }
 
     fn load_newer(&mut self) {
-        let Some(o) = self.open.as_mut() else { return };
-        if !o.has_newer {
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
+        if !o.has_newer || o.api_only {
             return;
         }
         let conv = &self.corpus.convs[o.conv];
@@ -494,6 +584,11 @@ impl App {
     /// Re-centre the timeline on a message id: half a page each side.
     pub fn jump_to(&mut self, id: i64) {
         let Some(o) = self.open.as_mut() else { return };
+        if o.api_only {
+            self.status =
+                "only a cached conversation can be positioned; a archives this one".to_string();
+            return;
+        }
         let conv = &self.corpus.convs[o.conv];
         let a = &self.corpus.archives[conv.archive];
         let half = PAGE / 2;
@@ -522,9 +617,26 @@ impl App {
     /// A thread by channel id: the archive first, then the thread cache,
     /// then Slack in the background.
     pub fn open_thread_in(&mut self, cid: String, root: i64, focus: i64) {
+        let here = self
+            .open
+            .as_ref()
+            .map(|o| self.corpus.convs[o.conv].id == cid)
+            .unwrap_or(false);
+        let place = if here {
+            None
+        } else {
+            Some(
+                self.corpus
+                    .channel_names
+                    .get(&cid)
+                    .map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| cid.clone()),
+            )
+        };
         let msgs = self
             .corpus
             .conv_by_channel(&cid)
+            .filter(|&ci| !self.corpus.convs[ci].live_only)
             .map(|ci| {
                 self.corpus.archives[self.corpus.convs[ci].archive]
                     .thread(&cid, root)
@@ -545,8 +657,14 @@ impl App {
             root,
             list,
             live: None,
+            place,
         });
         if complete {
+            return;
+        }
+        // The cache answers first, in either format; Slack only when it cannot.
+        if let Some(msgs) = live::cached_thread(&self.cache_dir, &cid, root) {
+            self.apply_thread_msgs(msgs, root, focus, "the cache");
             return;
         }
         let dir = live::thread_dir(&self.cache_dir, &cid, root);
@@ -554,25 +672,55 @@ impl App {
             self.apply_thread_dir(&dir, &cid, root, focus);
             return;
         }
-        if !self.live {
-            self.status = if wanted == 0 && have == 0 {
-                "thread root is not in the archive; live fetch is off".to_string()
-            } else {
-                format!("{have} of {wanted} replies archived; live fetch is off")
-            };
-            return;
-        }
         if self.job.is_some() {
             self.status = "a fetch is already running".to_string();
             return;
         }
-        self.job = Some(live::fetch_thread(
-            &self.cache_dir,
-            &self.corpus.workspace_url,
-            cid,
-            root,
-            focus,
-        ));
+        if let Some(c) = self.api.clone() {
+            self.job = Some(live::api_thread(c, &self.cache_dir, cid, root, focus));
+        } else if self.slackdump && self.live {
+            self.job = Some(live::fetch_thread(
+                &self.cache_dir,
+                &self.corpus.workspace_url,
+                cid,
+                root,
+                focus,
+            ));
+        } else {
+            self.status = if wanted == 0 && have == 0 {
+                "thread root is not in the archive; not signed in".to_string()
+            } else {
+                format!("{have} of {wanted} replies archived; not signed in")
+            };
+        }
+    }
+
+    /// Show a thread fetched from Slack (or its JSON cache), replacing the
+    /// view of the same thread when it is on top.
+    fn apply_thread_msgs(&mut self, msgs: Vec<Msg>, root: i64, focus: i64, from: &str) {
+        if msgs.is_empty() {
+            self.status = "Slack returned no messages for that thread".to_string();
+            return;
+        }
+        let n = msgs.len() - 1;
+        let mut list = MsgList::new(msgs, true);
+        list.cursor = list.msgs.iter().position(|m| m.id == focus).unwrap_or(0);
+        list.align_top = list.cursor > 0;
+        match self.stack.last_mut() {
+            Some(View::Thread {
+                root: r, list: l, ..
+            }) if *r == root => *l = list,
+            _ => self.stack.push(View::Thread {
+                root,
+                list,
+                live: None,
+                place: None,
+            }),
+        }
+        self.status = format!(
+            "{n} {} from {from}",
+            if n == 1 { "reply" } else { "replies" }
+        );
     }
 
     /// Show a thread from a fetched archive directory, replacing the view
@@ -593,6 +741,7 @@ impl App {
             usize::MAX,
             self.corpus.me.as_deref(),
             self.corpus.half_life_days,
+            None,
         );
         let msgs = a.thread(cid, root).unwrap_or_default();
         if msgs.is_empty() {
@@ -608,6 +757,7 @@ impl App {
                 root: r,
                 list: l,
                 live,
+                ..
             }) if *r == root => {
                 *l = list;
                 *live = Some(Box::new(a));
@@ -616,6 +766,7 @@ impl App {
                 root,
                 list,
                 live: Some(Box::new(a)),
+                place: None,
             }),
         }
         self.status = format!(
@@ -633,7 +784,13 @@ impl App {
             .map(|o| self.corpus.convs[o.conv].id == cid)
             .unwrap_or(false);
         if !here {
-            if let Some(idx) = self.corpus.conv_by_channel(&cid) {
+            // A conversation only on Slack is not switched to: its first page
+            // would compete with the thread for the one fetch slot.
+            if let Some(idx) = self
+                .corpus
+                .conv_by_channel(&cid)
+                .filter(|&i| !self.corpus.convs[i].live_only)
+            {
                 let search = match self.stack.last() {
                     Some(View::Search { .. }) => self.stack.pop(),
                     _ => None,
@@ -682,7 +839,7 @@ impl App {
             })
             .collect();
         let cached = hits.len();
-        let go_live = self.live && self.job.is_none();
+        let go_live = self.live && self.job.is_none() && (self.api.is_some() || self.slackdump);
         if cached == 0 && !go_live {
             self.status = format!(
                 "no message matching '{query}' in {}{}",
@@ -718,7 +875,10 @@ impl App {
             live_pending: go_live,
         });
         if go_live {
-            self.job = Some(live::search(&self.cache_dir, query.to_string()));
+            self.job = Some(match self.api.clone() {
+                Some(c) => live::api_search(c, query.to_string()),
+                None => live::search(&self.cache_dir, query.to_string()),
+            });
         }
     }
 
@@ -726,13 +886,14 @@ impl App {
     fn merge_live_search(&mut self, query: &str, dir: &Path) {
         let hits = Archive::open("live/search".to_string(), dir).and_then(|a| a.search_hits());
         let _ = std::fs::remove_dir_all(dir);
-        let hits = match hits {
-            Ok(h) => h,
-            Err(e) => {
-                self.status = format!("live search: {e}");
-                return;
-            }
-        };
+        match hits {
+            Ok(h) => self.merge_hits(query, h),
+            Err(e) => self.status = format!("live search: {e}"),
+        }
+    }
+
+    /// Fold what Slack found into the search view still showing that query.
+    fn merge_hits(&mut self, query: &str, hits: Vec<Msg>) {
         let total = hits.len();
         match self
             .stack
@@ -780,25 +941,202 @@ impl App {
         let Some(o) = self.open.as_ref() else {
             return;
         };
-        if !self.live {
-            self.status = "live fetch is off (--no-live, or no slackdump)".to_string();
-            return;
-        }
         if self.job.is_some() {
             self.status = "a fetch is already running".to_string();
             return;
         }
-        let conv = &self.corpus.convs[o.conv];
+        let idx = o.conv;
+        let conv = &self.corpus.convs[idx];
+        if let Some(c) = self.api.clone() {
+            let since = o.list.msgs.last().map(|m| m.id).unwrap_or(conv.last_id);
+            if since == 0 {
+                self.job = Some(live::api_older(c, idx, conv.id.clone(), 0));
+            } else {
+                self.job = Some(live::api_tail(c, idx, conv.id.clone(), since, false));
+            }
+            return;
+        }
+        if !self.live || !self.slackdump || o.api_only {
+            self.status = "not signed in, and no slackdump to fall back on".to_string();
+            return;
+        }
         let dir = self.corpus.archives[conv.archive].dir.clone();
         let lookback =
             live::lookback_hours(conv.last_id / 1_000_000, chrono::Utc::now().timestamp());
         self.job = Some(live::refresh(
-            o.conv,
+            idx,
             o.total,
             dir,
             self.lock.clone(),
             lookback,
         ));
+    }
+
+    /// Messages Slack has after what is loaded, appended in place.
+    fn append_tail(&mut self, conv: usize, mut msgs: Vec<Msg>, quiet: bool) {
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
+        if o.conv != conv || o.has_newer {
+            return;
+        }
+        let known: HashSet<i64> = o.list.msgs.iter().map(|m| m.id).collect();
+        msgs.retain(|m| !known.contains(&m.id));
+        let n = msgs.len();
+        if n == 0 {
+            if !quiet {
+                self.status = "nothing newer on Slack".to_string();
+            }
+            return;
+        }
+        let at_end = o.list.cursor + 1 >= o.list.len();
+        o.list.msgs.extend(msgs);
+        if at_end {
+            o.list.cursor = o.list.len() - 1;
+        }
+        o.list.mark_dirty();
+        if let Some(last) = o.list.msgs.last() {
+            let c = &mut self.corpus.convs[conv];
+            if last.id > c.last_id {
+                c.last_id = last.id;
+            }
+        }
+        self.status = format!("{n} new from Slack");
+    }
+
+    /// An older page from Slack for a conversation with no archive.
+    fn prepend_older(&mut self, conv: usize, mut msgs: Vec<Msg>) {
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
+        if o.conv != conv {
+            return;
+        }
+        let known: HashSet<i64> = o.list.msgs.iter().map(|m| m.id).collect();
+        msgs.retain(|m| !known.contains(&m.id));
+        let n = msgs.len();
+        let was_empty = o.list.msgs.is_empty();
+        o.has_older = n >= PAGE;
+        if n > 0 {
+            o.list.msgs.splice(0..0, msgs);
+            o.list.cursor = if was_empty {
+                o.list.len() - 1
+            } else {
+                o.list.cursor + n
+            };
+            o.list.mark_dirty();
+        }
+        o.total = o.list.len() as i64;
+        if let (Some(first), Some(last)) = (o.list.msgs.first(), o.list.msgs.last()) {
+            let c = &mut self.corpus.convs[conv];
+            c.first_id = first.id;
+            if last.id > c.last_id {
+                c.last_id = last.id;
+            }
+        }
+        self.status = format!("{n} from Slack");
+        self.update_notes();
+    }
+
+    /// Conversations the user is a member of that no archive holds.
+    fn merge_conversations(&mut self, list: Vec<Value>) {
+        let me = self.corpus.me.clone();
+        let my_handle = me.as_deref().and_then(|m| self.corpus.user_name(m));
+        let mut added = 0;
+        for ch in list {
+            let Some(id) = ch.get("id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            if self.corpus.conv_by_channel(&id).is_some() {
+                continue;
+            }
+            let s = |k: &str| ch.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            let b = |k: &str| ch.get(k).and_then(Value::as_bool).unwrap_or(false);
+            let raw = s("name");
+            let (kind, name) = if b("is_im") {
+                let u = s("user");
+                let n = self.corpus.user_name(&u).unwrap_or_else(|| u.clone());
+                (
+                    Kind::Im,
+                    if Some(u.as_str()) == me.as_deref() {
+                        "@me (self)".to_string()
+                    } else {
+                        format!("@{n}")
+                    },
+                )
+            } else if b("is_mpim") {
+                let stripped = raw.trim_start_matches("mpdm-");
+                let stripped = stripped
+                    .rsplit_once('-')
+                    .map(|(a, _)| a)
+                    .unwrap_or(stripped);
+                let mut names: Vec<&str> = stripped.split("--").collect();
+                names.retain(|n| Some(*n) != my_handle.as_deref());
+                (Kind::Mpim, format!("@{}", names.join(",")))
+            } else if b("is_private") {
+                (Kind::Private, format!("#{raw}"))
+            } else {
+                (Kind::Channel, format!("#{raw}"))
+            };
+            let created = ch.get("created").and_then(Value::as_i64).unwrap_or(0) * 1_000_000;
+            self.corpus.convs.push(Conv {
+                archive: 0,
+                id: id.clone(),
+                name,
+                kind,
+                archived: false,
+                msgs: 0,
+                mine: 0,
+                score: 0.0,
+                first_id: created,
+                last_id: created,
+                live_only: true,
+                unread: false,
+                mentions: 0,
+            });
+            if !raw.is_empty() {
+                self.corpus.channel_names.entry(id).or_insert(raw);
+            }
+            added += 1;
+        }
+        if added > 0 {
+            self.apply_filter();
+            self.status = format!(
+                "{}; {added} conversations only on Slack, shown dim",
+                self.status
+            );
+        }
+    }
+
+    /// Unread markers from `client.counts`, and last activity for
+    /// conversations no archive holds.
+    fn apply_counts(&mut self, v: &Value) {
+        let mut changed = false;
+        for key in ["channels", "ims", "mpims"] {
+            for c in v.get(key).and_then(Value::as_array).into_iter().flatten() {
+                let Some(id) = c.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(idx) = self.corpus.conv_by_channel(id) else {
+                    continue;
+                };
+                let conv = &mut self.corpus.convs[idx];
+                conv.unread = c
+                    .get("has_unreads")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                conv.mentions = c.get("mention_count").and_then(Value::as_i64).unwrap_or(0);
+                if let Some(latest) = c.get("latest").and_then(Value::as_str).and_then(ts_to_id) {
+                    if latest > conv.last_id {
+                        conv.last_id = latest;
+                    }
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.apply_filter();
+        }
     }
 
     fn refresh_conv_stats(&mut self, idx: usize) {
@@ -843,6 +1181,10 @@ impl App {
             self.status = "a fetch is already running".to_string();
             return;
         }
+        if !self.slackdump {
+            self.status = "archiving a conversation needs slackdump on PATH".to_string();
+            return;
+        }
         self.job = Some(live::archive_new(&self.corpus.root, spec, 90));
     }
 
@@ -855,6 +1197,7 @@ impl App {
                     usize::MAX,
                     self.corpus.me.as_deref(),
                     self.corpus.half_life_days,
+                    None,
                 )
                 .unwrap_or_default()
                 .first()
@@ -911,6 +1254,58 @@ impl App {
     /// Advance the spinner and collect a finished job.
     pub fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+        // The quiet slot: sign-in, the conversation list, counts, tails.
+        if let Some(outcome) = self.bg.as_ref().and_then(|j| j.poll()) {
+            let job = self.bg.take().expect("polled");
+            match outcome {
+                Ok(Done::Auth(client, who)) => {
+                    self.api = Some(client.clone());
+                    self.status = format!("signed in as {who}");
+                    self.bg = Some(live::api_conversations(client));
+                }
+                Ok(Done::Conversations(list)) => {
+                    self.merge_conversations(list);
+                    if let Some(c) = self.api.clone() {
+                        self.bg = Some(live::api_counts(c));
+                    }
+                }
+                Ok(Done::Counts(v)) => {
+                    self.apply_counts(&v);
+                    self.last_counts = Instant::now();
+                }
+                Ok(Done::Messages(msgs)) => {
+                    if let JobKind::Tail { conv } = job.kind {
+                        self.append_tail(conv, msgs, true);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.status = match job.kind {
+                        JobKind::Auth => format!("not signed in: {e}"),
+                        _ => e,
+                    };
+                }
+            }
+        }
+        if let Some(c) = self.api.clone() {
+            if self.bg.is_none() && self.poll_every.as_secs() > 0 {
+                if self.last_poll.elapsed() >= self.poll_every {
+                    self.last_poll = Instant::now();
+                    if let Some(o) = self.open.as_ref() {
+                        let since = o.list.msgs.last().map(|m| m.id).unwrap_or(0);
+                        if !o.has_newer && since > 0 {
+                            let idx = o.conv;
+                            let cid = self.corpus.convs[idx].id.clone();
+                            self.bg = Some(live::api_tail(c.clone(), idx, cid, since, true));
+                        }
+                    }
+                } else if self.last_counts.elapsed() >= self.poll_every * 2 {
+                    self.last_counts = Instant::now();
+                    self.bg = Some(live::api_counts(c));
+                }
+            }
+        }
+        // The user's slot.
         let Some(outcome) = self.job.as_ref().and_then(|j| j.poll()) else {
             return;
         };
@@ -918,9 +1313,8 @@ impl App {
         let done = match outcome {
             Ok(d) => d,
             Err(e) => {
-                self.status = format!("slackdump: {e}");
+                self.status = format!("Slack: {e}");
                 if let JobKind::Search { query } = &job.kind {
-                    // The view stops saying "searching"; the cached hits stay.
                     if let Some(View::Search {
                         query: q,
                         live_pending,
@@ -952,8 +1346,18 @@ impl App {
                     self.status = "thread fetched into the cache".to_string();
                 }
             }
+            (JobKind::Thread { root, focus, .. }, Done::ThreadMsgs(msgs)) => {
+                if matches!(self.stack.last(), Some(View::Thread { root: r, .. }) if *r == root) {
+                    self.apply_thread_msgs(msgs, root, focus, "Slack");
+                } else {
+                    self.status = "thread fetched into the cache".to_string();
+                }
+            }
             (JobKind::Search { query }, Done::Search(dir)) => self.merge_live_search(&query, &dir),
+            (JobKind::Search { query }, Done::SearchHits(hits)) => self.merge_hits(&query, hits),
             (JobKind::ArchiveNew { spec }, Done::Archived(dir)) => self.finish_archive(&dir, &spec),
+            (JobKind::Tail { conv }, Done::Messages(msgs)) => self.append_tail(conv, msgs, false),
+            (JobKind::Older { conv }, Done::Messages(msgs)) => self.prepend_older(conv, msgs),
             _ => {}
         }
     }
@@ -1039,16 +1443,25 @@ impl App {
         let a = &self.corpus.archives[conv.archive];
         match self.stack.last() {
             Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
-            Some(View::Thread { list, live, .. }) => {
+            Some(View::Thread {
+                list, live, place, ..
+            }) => {
                 let n = list.len().saturating_sub(1);
                 let place = match (live, list.msgs.first()) {
+                    _ if place.is_some() => place.clone().unwrap_or_default(),
                     (Some(a), Some(m)) => a
                         .channel_name(&m.channel_id)
                         .map(|c| format!("#{c}"))
                         .unwrap_or_else(|| conv.name.clone()),
                     _ => conv.name.clone(),
                 };
-                let from = if live.is_some() { " · from Slack" } else { "" };
+                let from = if live.is_some()
+                    || list.msgs.first().is_some_and(|m| m.channel_name.is_some())
+                {
+                    " · from Slack"
+                } else {
+                    ""
+                };
                 if n == 0 {
                     format!("message in {place} · no replies{from}")
                 } else {
@@ -1079,6 +1492,12 @@ impl App {
                     if *capped { " (capped)" } else { "" }
                 )
             }
+            None if o.api_only => format!(
+                "{} · {} · {} loaded · live from Slack, not cached",
+                conv.name,
+                conv.kind.label(),
+                o.list.len()
+            ),
             None => {
                 let span = format!(
                     "{} → {}",
@@ -1149,11 +1568,13 @@ impl App {
         match (k.code, ctrl) {
             (KeyCode::Char('j'), false) | (KeyCode::Down, _) => *scroll = (*scroll + 1).min(max),
             (KeyCode::Char('k'), false) | (KeyCode::Up, _) => *scroll = scroll.saturating_sub(1),
-            (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
-                *scroll = (*scroll + height / 2).min(max)
+            (KeyCode::Char('d'), true) => *scroll = (*scroll + height / 2).min(max),
+            (KeyCode::Char('u'), true) => *scroll = scroll.saturating_sub(height / 2),
+            (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => {
+                *scroll = (*scroll + height).min(max)
             }
-            (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
-                *scroll = scroll.saturating_sub(height / 2)
+            (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => {
+                *scroll = scroll.saturating_sub(height)
             }
             (KeyCode::Char('g'), false) | (KeyCode::Home, _) => *scroll = 0,
             (KeyCode::Char('G'), false) | (KeyCode::End, _) => *scroll = max,
@@ -1179,11 +1600,13 @@ impl App {
             }
             (KeyCode::Char('g'), false) | (KeyCode::Home, _) => self.conv_cursor = 0,
             (KeyCode::Char('G'), false) | (KeyCode::End, _) => self.conv_cursor = last,
-            (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
-                self.conv_cursor = (self.conv_cursor + 10).min(last)
+            (KeyCode::Char('d'), true) => self.conv_cursor = (self.conv_cursor + 10).min(last),
+            (KeyCode::Char('u'), true) => self.conv_cursor = self.conv_cursor.saturating_sub(10),
+            (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => {
+                self.conv_cursor = (self.conv_cursor + 20).min(last)
             }
-            (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
-                self.conv_cursor = self.conv_cursor.saturating_sub(10)
+            (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => {
+                self.conv_cursor = self.conv_cursor.saturating_sub(20)
             }
             (KeyCode::Enter, _) | (KeyCode::Char('l'), false) | (KeyCode::Right, _) => {
                 if let Some(&idx) = self.filtered.get(self.conv_cursor) {
@@ -1273,14 +1696,24 @@ impl App {
                     l.cursor = l.len().saturating_sub(1);
                 }
             }
-            (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
+            (KeyCode::Char('d'), true) => {
                 if let Some(l) = self.active_list_mut() {
                     l.move_lines(height / 2);
                 }
             }
-            (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
+            (KeyCode::Char('u'), true) => {
                 if let Some(l) = self.active_list_mut() {
                     l.move_lines(-(height / 2));
+                }
+            }
+            (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => {
+                if let Some(l) = self.active_list_mut() {
+                    l.move_lines(height - 1);
+                }
+            }
+            (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => {
+                if let Some(l) = self.active_list_mut() {
+                    l.move_lines(-(height - 1));
                 }
             }
             (KeyCode::Enter, _) | (KeyCode::Char('l'), false) | (KeyCode::Right, _) => {

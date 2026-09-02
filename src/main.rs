@@ -1,7 +1,9 @@
 //! slack-tui: read the local slackdump archives in the terminal.
 
+mod api;
 mod app;
 mod archive;
+mod auth;
 mod live;
 mod render;
 mod ui;
@@ -43,10 +45,18 @@ flags
   --width W       with --dump: wrap width (default 100)
   --half-life D   days after which one of your messages counts half in the
                   activity order (default 30)
-  --no-live       never go to Slack: cache only (also when slackdump is absent)
+  --no-live       never go to Slack: cache only
+  --poll SECS     re-check the open conversation and unread counts this often
+                  when signed in (default 60, 0 = never)
+  --auth-check    sign in through the desktop app and print who you are
   --help          this text
 
 environment
+  SLACK_APP_DIR        the Slack desktop app's profile (default: the snap and
+                       classic locations under $HOME, then under /home/*)
+  SLACK_TOKEN,
+  SLACK_COOKIE         a session token and its d cookie, instead of the app
+                       (the minted pair is cached in ~/.config/slack-tui/auth.json)
   SLACKDUMP            the slackdump binary (default: slackdump on PATH)
   SLACKDUMP_LOCK       lock file shared with the hourly refresh
                        (default /var/lock/slackdump-sync.lock)
@@ -63,10 +73,13 @@ keys (also ? inside)
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet
 
-When the cache cannot answer, slackdump goes to Slack in the background:
-a thread whose replies are not archived is fetched into the cache, `/`
-searches the whole workspace after the cached hits, R resumes the open
-archive, a archives a new conversation into the root. Nothing is ever
+When the cache cannot answer, Slack is asked in the background. Signed in
+through the desktop app's session (nothing to copy; SLACK_TOKEN and
+SLACK_COOKIE override), the Web API serves threads, search, the newest
+messages, every conversation you are a member of, and unread markers; a
+thread lands in the cache, the open conversation is re-checked every
+--poll seconds. Without a sign-in, slackdump does the same more slowly,
+and `a` still archives a new conversation into the root. Nothing is ever
 written to Slack.
 
 exit codes
@@ -90,6 +103,8 @@ struct Opts {
     width: usize,
     half_life: f64,
     no_live: bool,
+    auth_check: bool,
+    poll: u64,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -105,6 +120,8 @@ fn parse_args() -> Result<Opts, String> {
         width: 100,
         half_life: 30.0,
         no_live: false,
+        auth_check: false,
+        poll: 60,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -125,6 +142,12 @@ fn parse_args() -> Result<Opts, String> {
                     .map_err(|_| "--limit wants a number".to_string())?
             }
             "--no-live" => opts.no_live = true,
+            "--auth-check" => opts.auth_check = true,
+            "--poll" => {
+                opts.poll = value("--poll")?
+                    .parse()
+                    .map_err(|_| "--poll wants seconds".to_string())?
+            }
             "--half-life" => {
                 opts.half_life = value("--half-life")?
                     .parse()
@@ -145,6 +168,24 @@ fn parse_args() -> Result<Opts, String> {
 
 fn main() {
     std::process::exit(run());
+}
+
+/// Timing breadcrumbs appended to `$SLACK_TUI_TRACE` when it is set.
+pub fn trace(what: &str) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("SLACK_TUI_TRACE") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let _ = writeln!(f, "{now:.3} {what}");
+        }
+    }
 }
 
 /// Print, and treat a closed pipe (`| head`) as a normal end.
@@ -169,14 +210,6 @@ fn run() -> i32 {
             return 2;
         }
     };
-    let corpus = match Corpus::open(&opts.root, opts.half_life) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("slack-tui: {e}");
-            return 1;
-        }
-    };
-    let live_enabled = !opts.no_live && live::available();
     // Own variable first: XDG_CACHE_HOME also moves slackdump's credential
     // store, so it cannot serve as a test knob.
     let cache_dir = std::env::var_os("SLACK_TUI_CACHE")
@@ -189,6 +222,58 @@ fn run() -> i32 {
                 .join("slack-tui")
                 .join("live")
         });
+    let corpus = match Corpus::open(
+        &opts.root,
+        opts.half_life,
+        Some(cache_dir.join("stats.json")),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("slack-tui: {e}");
+            return 1;
+        }
+    };
+    if opts.auth_check {
+        let scratch = std::env::temp_dir().join("slack-tui");
+        let agent = api::agent();
+        let auth = match auth::from_env() {
+            Some(a) => a,
+            None => match auth::from_desktop(&agent, &corpus.workspace_url, &scratch) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("slack-tui: {e}");
+                    return 1;
+                }
+            },
+        };
+        println!("credentials: {}", auth.source);
+        let client = api::Client::new(auth);
+        match client.auth_test() {
+            Ok((uid, user, team)) => println!("auth.test: ok, user {user} ({uid}), team {team}"),
+            Err(e) => {
+                eprintln!("slack-tui: {e}");
+                return 1;
+            }
+        }
+        match client.counts() {
+            Ok(v) => {
+                let unread = ["channels", "ims", "mpims"]
+                    .iter()
+                    .flat_map(|k| v.get(*k).and_then(|a| a.as_array()).into_iter().flatten())
+                    .filter(|c| {
+                        c.get("has_unreads")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false)
+                    })
+                    .count();
+                println!("client.counts: ok, {unread} conversations with unreads");
+            }
+            Err(e) => println!("client.counts: {e} (unread markers will be off)"),
+        }
+        return 0;
+    }
+    let live_enabled = !opts.no_live;
+    let slackdump_ok = live_enabled && live::slackdump_available();
     let lock = std::env::var_os("SLACKDUMP_LOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/lock/slackdump-sync.lock"));
@@ -197,8 +282,10 @@ fn run() -> i32 {
         opts.tz,
         opts.half_life,
         live_enabled,
+        slackdump_ok,
         cache_dir,
         lock,
+        opts.poll,
     );
     if opts.list {
         let mut text = String::new();
@@ -260,19 +347,31 @@ fn tui(app: &mut App) -> std::io::Result<()> {
         app.focus = Focus::Convs;
     }
     let result = loop {
+        let t0 = std::time::Instant::now();
         if let Err(e) = terminal.draw(|frame| ui::draw(frame, app)) {
             break Err(e);
         }
+        if t0.elapsed().as_millis() > 50 {
+            trace(&format!("draw {} ms", t0.elapsed().as_millis()));
+        }
         match event::poll(Duration::from_millis(250)) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => app.on_key(k),
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                    let t = std::time::Instant::now();
+                    app.on_key(k);
+                    trace(&format!("key {:?} {} ms", k.code, t.elapsed().as_millis()));
+                }
                 Ok(_) => {}
                 Err(e) => break Err(e),
             },
             Ok(false) => {}
             Err(e) => break Err(e),
         }
+        let t = std::time::Instant::now();
         app.tick();
+        if t.elapsed().as_millis() > 50 {
+            trace(&format!("tick {} ms", t.elapsed().as_millis()));
+        }
         if app.quit {
             break Ok(());
         }

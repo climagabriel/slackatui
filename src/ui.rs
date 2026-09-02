@@ -62,10 +62,15 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             if c.archived {
                 name.push('†');
             }
+            if c.unread {
+                name.insert_str(0, "● ");
+            }
             let name = clip(&name, room);
             let pad = room.saturating_sub(name.width());
             let name_style = if Some(i) == open_idx {
                 Style::new().add_modifier(Modifier::BOLD)
+            } else if c.live_only {
+                Style::new().add_modifier(Modifier::DIM)
             } else {
                 Style::new()
             };
@@ -239,6 +244,7 @@ const HELP: &[(&str, &str)] = &[
         "move; k at the top of the channel loads older messages",
     ),
     ("Ctrl-d / Ctrl-u", "half a page"),
+    ("Ctrl-f / Ctrl-b, PgDn / PgUp", "a full page"),
     ("g / G", "oldest / newest message of the channel"),
     ("h / l, Tab", "conversations pane / messages pane"),
     (
@@ -273,7 +279,7 @@ const HELP: &[(&str, &str)] = &[
 ];
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let w = 84.min(area.width.saturating_sub(2));
+    let w = 96.min(area.width.saturating_sub(2));
     let h = (HELP.len() as u16 + 4).min(area.height.saturating_sub(2));
     let rect = Rect {
         x: (area.width - w) / 2,
@@ -285,7 +291,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let mut lines = Vec::new();
     for (k, v) in HELP {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {k:<16} "), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("  {k:<28} "), Style::new().fg(Color::Cyan)),
             Span::raw(*v),
         ]));
     }

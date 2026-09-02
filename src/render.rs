@@ -155,6 +155,8 @@ pub struct Sty {
     pub mention: bool,
     pub quote: bool,
     pub dim: bool,
+    /// The archive owner: their name and mentions of them stand out.
+    pub me: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +195,9 @@ fn style_of(s: Sty) -> Style {
     let mut st = Style::new();
     if s.mention {
         st = st.fg(Color::Cyan);
+    }
+    if s.me {
+        st = st.fg(Color::LightYellow);
     }
     if s.link {
         st = st.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
@@ -349,7 +354,8 @@ fn angle(inner: &str, base: Sty, ctx: &Ctx) -> Option<Vec<Seg>> {
     };
     if let Some(uid) = head.strip_prefix('@') {
         let name = label.map(unescape).unwrap_or_else(|| ctx.user(uid));
-        return Some(vec![Seg::new(format!("@{name}"), m)]);
+        let me = ctx.corpus.me.as_deref() == Some(uid);
+        return Some(vec![Seg::new(format!("@{name}"), Sty { me, ..m })]);
     }
     if let Some(cid) = head.strip_prefix('#') {
         let name = label.map(unescape).unwrap_or_else(|| ctx.channel(cid));
@@ -620,7 +626,13 @@ fn section(el: &Value, ctx: &Ctx, base: Sty, out: &mut Vec<Seg>) {
                     out.push(Seg::new(url, l));
                 }
             }
-            "user" => out.push(Seg::new(format!("@{}", ctx.user(s("user_id"))), mention)),
+            "user" => {
+                let me = ctx.corpus.me.as_deref() == Some(s("user_id"));
+                out.push(Seg::new(
+                    format!("@{}", ctx.user(s("user_id"))),
+                    Sty { me, ..mention },
+                ));
+            }
             "usergroup" => {
                 let id = s("usergroup_id");
                 out.push(Seg::new(
@@ -1013,7 +1025,15 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Vec<L
             dim,
         ));
     }
-    spans[2] = Span::styled(author, Style::new().add_modifier(Modifier::BOLD));
+    let is_me = m.user.is_some() && m.user.as_deref() == ctx.corpus.me.as_deref();
+    let author_style = Style::new()
+        .fg(if is_me {
+            Color::LightYellow
+        } else {
+            Color::LightBlue
+        })
+        .add_modifier(Modifier::BOLD);
+    spans[2] = Span::styled(author, author_style);
     lines.push(Line::from(spans));
     lines.extend(wrap(&body(m, ctx), width, "  "));
     for f in m.files() {
