@@ -1,0 +1,32 @@
+#!/bin/sh
+# maturity: low; issues-found: 0
+# slack-tui - front door for libexec/slack-tui, a Rust crate. Builds it on
+# first use into the user's cache and execs the binary; rebuilds when the
+# source changes (checksum), so a plugin update takes effect on the next run.
+# The build never lands beside the source: a plugin install is read-only and
+# replaced wholesale on update.
+#
+#   slack-tui --help        the tool's own help
+#   SLACK_TUI_REBUILD=1     force a rebuild
+#
+# Needs cargo (https://rustup.rs) and a C compiler for the bundled SQLite.
+set -eu
+here=$(cd "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
+src="$here/../libexec/slack-tui"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/slack-tui"
+bin="$cache/bin/slack-tui"
+stamp="$cache/source.sha256"
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "slack-tui: cargo not found; install a Rust toolchain from https://rustup.rs" >&2
+    exit 2
+fi
+sum=$(cat "$src/Cargo.toml" "$src/Cargo.lock" "$src"/src/*.rs | sha256sum | cut -d ' ' -f 1)
+if [ ! -x "$bin" ] || [ "${SLACK_TUI_REBUILD:-0}" = 1 ] || [ "$(cat "$stamp" 2>/dev/null || true)" != "$sum" ]; then
+    echo "slack-tui: building (first run, or the source changed)..." >&2
+    mkdir -p "$cache/bin"
+    cargo build --release --locked --quiet --manifest-path "$src/Cargo.toml" --target-dir "$cache/target"
+    cp "$cache/target/release/slack-tui" "$bin"
+    printf '%s\n' "$sum" > "$stamp"
+fi
+exec "$bin" "$@"
