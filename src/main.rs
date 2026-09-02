@@ -27,11 +27,15 @@ Opens every slackdump.sqlite under <root>/full/ and <root>/dms/ read-only
 the conversations on the left, the messages of the selected one on the
 right. Enter on a message opens its thread; Esc goes back.
 
+Conversations are ordered by your own activity: the ones you wrote the
+most messages in come first (s cycles to name, recent, size). Your user
+id comes from the DM archive, or from SLACK_SELF_USER_ID.
+
 flags
   --root DIR      archive root (default $SLACKDUMPS, then /srv/slackdumps)
   --channel NAME  open this conversation at once (#team-alpha, @someone, or the id)
   --local         show times in local time instead of UTC
-  --list          print the conversations and exit, no terminal UI
+  --list          print the conversations (with your message count) and exit
   --dump NAME     print the newest messages of one conversation as text and exit
   --limit N       with --dump: how many top-level messages (default 100)
   --width W       with --dump: wrap width (default 100)
@@ -39,8 +43,9 @@ flags
 
 environment
   SLACKDUMPS           archive root when --root is not given
-  SLACK_SELF_USER_ID   your own user id, to name direct messages by the
-                       other party (derived from the DM archive otherwise)
+  SLACK_SELF_USER_ID   your own user id: names direct messages by the other
+                       party and counts your messages per conversation
+                       (derived from the DM archive otherwise)
 
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
@@ -145,12 +150,17 @@ fn run() -> i32 {
     let mut app = App::new(corpus, opts.tz);
     if opts.list {
         let mut text = String::new();
+        text.push_str(&format!(
+            "{:<48} {:>6} {:>8}  {:<10} → {:<10}  {}\n",
+            "CONVERSATION", "MINE", "MSGS", "FIRST", "LAST", "ARCHIVE"
+        ));
         for &i in &app.filtered {
             let c = app.conv(i);
             let a = &app.corpus.archives[c.archive];
             text.push_str(&format!(
-                "{:<48} {:>8}  {} → {}  {}\n",
+                "{:<48} {:>6} {:>8}  {} → {}  {}\n",
                 c.name,
+                c.mine,
                 c.msgs,
                 app.tz.fmt(c.first_id / 1_000_000, "%Y-%m-%d"),
                 app.tz.fmt(c.last_id / 1_000_000, "%Y-%m-%d"),

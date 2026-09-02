@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Focus, Mode, PromptKind, View};
+use crate::app::{App, Focus, Mode, PromptKind, Sort, View};
 use crate::render::{self, Ctx};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -54,7 +54,13 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&i| {
             let c = app.conv(i);
-            let count = human_count(c.msgs);
+            // The number that ordered the list: the owner's messages under
+            // "my activity", the conversation's total otherwise.
+            let count = human_count(if app.sort == Sort::Mine {
+                c.mine
+            } else {
+                c.msgs
+            });
             let room = width.saturating_sub(count.len() + 1);
             let mut name = c.name.clone();
             if c.archived {
@@ -238,7 +244,10 @@ const HELP: &[(&str, &str)] = &[
         "r",
         "reload the conversation (the archive refreshes hourly)",
     ),
-    ("s", "sort conversations: name, recent, size"),
+    (
+        "s",
+        "sort conversations: my activity (messages you wrote), name, recent, size",
+    ),
     ("q, Ctrl-c", "quit"),
 ];
 

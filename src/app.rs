@@ -15,6 +15,8 @@ pub enum Focus {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sort {
+    /// Where the archive's owner wrote the most, first.
+    Mine,
     Name,
     Recent,
     Size,
@@ -23,6 +25,7 @@ pub enum Sort {
 impl Sort {
     pub fn label(self) -> &'static str {
         match self {
+            Sort::Mine => "my activity",
             Sort::Name => "name",
             Sort::Recent => "recent",
             Sort::Size => "size",
@@ -30,9 +33,10 @@ impl Sort {
     }
     fn next(self) -> Sort {
         match self {
+            Sort::Mine => Sort::Name,
             Sort::Name => Sort::Recent,
             Sort::Recent => Sort::Size,
-            Sort::Size => Sort::Name,
+            Sort::Size => Sort::Mine,
         }
     }
 }
@@ -257,7 +261,7 @@ impl App {
             corpus,
             tz,
             focus: Focus::Convs,
-            sort: Sort::Name,
+            sort: Sort::Mine,
             filter: String::new(),
             filtered: Vec::new(),
             conv_cursor: 0,
@@ -310,6 +314,13 @@ impl App {
                         convs[b].name.to_lowercase(),
                         convs[b].archive,
                     ))
+            }),
+            Sort::Mine => idx.sort_by(|&a, &b| {
+                (convs[b].mine, convs[b].msgs, convs[b].last_id).cmp(&(
+                    convs[a].mine,
+                    convs[a].msgs,
+                    convs[a].last_id,
+                ))
             }),
             Sort::Recent => idx.sort_by(|&a, &b| convs[b].last_id.cmp(&convs[a].last_id)),
             Sort::Size => idx.sort_by(|&a, &b| convs[b].msgs.cmp(&convs[a].msgs)),
@@ -662,7 +673,7 @@ impl App {
 
     pub fn hints(&self) -> &'static str {
         match (self.focus, self.stack.last()) {
-            (Focus::Convs, _) => "j/k move  Enter open  / filter  s sort  Tab messages  ? help  q quit",
+            (Focus::Convs, _) => "j/k move  Enter open  / filter  s sort (my activity, name, recent, size)  Tab messages  ? help  q quit",
             (_, Some(View::Raw { .. })) => "j/k scroll  Esc back  q quit",
             (_, Some(View::Thread { .. })) => "j/k move  Enter raw  o show in channel  / search  Esc back  q quit",
             (_, Some(View::Search { .. })) => "j/k move  Enter thread  o show in channel  Esc back  q quit",
@@ -779,6 +790,10 @@ impl App {
                 self.sort = self.sort.next();
                 self.apply_filter();
                 self.status = format!("sorted by {}", self.sort.label());
+                if self.sort == Sort::Mine && self.corpus.me.is_none() {
+                    self.status =
+                        "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
+                }
             }
             _ => {}
         }
