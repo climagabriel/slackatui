@@ -398,6 +398,14 @@ impl Corpus {
         self.users.get(uid).map(|u| u.name.clone())
     }
 
+    /// The id behind a handle, for `@name` in an outgoing message.
+    pub fn user_id(&self, handle: &str) -> Option<String> {
+        self.users
+            .iter()
+            .find(|(_, u)| u.name.eq_ignore_ascii_case(handle))
+            .map(|(id, _)| id.clone())
+    }
+
     pub fn user_is_bot(&self, uid: &str) -> bool {
         self.users.get(uid).is_some_and(|u| u.is_bot)
     }

@@ -246,6 +246,22 @@ impl MsgList {
     }
 }
 
+/// An unsent message and where it was meant to go.
+pub struct Draft {
+    pub cid: String,
+    pub thread: Option<i64>,
+    pub text: String,
+}
+
+/// Where `c` sends: a conversation, and a thread in it when replying.
+pub struct Compose {
+    pub conv: usize,
+    pub cid: String,
+    pub thread: Option<i64>,
+    /// What the prompt says it is writing to.
+    pub label: String,
+}
+
 pub struct Open {
     pub conv: usize,
     pub list: MsgList,
@@ -307,6 +323,7 @@ pub enum PromptKind {
     Search,
     Date,
     Archive,
+    Compose,
 }
 
 pub enum Mode {
@@ -367,6 +384,11 @@ pub struct App {
     pub highlight_cached: bool,
     /// `U`: unread conversations at the top of the list.
     pub unreads_first: bool,
+    /// The target of the open compose prompt.
+    pub compose: Option<Compose>,
+    /// A message typed and not sent: Esc keeps it for the next `c` on the
+    /// same target, so it cannot go to another conversation by reflex.
+    pub draft: Option<Draft>,
     /// Bumped by every mark; a counts result from before it is stale.
     pub counts_gen: u64,
 }
@@ -417,6 +439,8 @@ impl App {
             file_job: None,
             highlight_cached: false,
             unreads_first: true,
+            compose: None,
+            draft: None,
             counts_gen: 0,
         };
         app.apply_filter();
@@ -439,6 +463,150 @@ impl App {
         } else {
             format!("conversations by {}", self.sort_label())
         };
+    }
+
+    /// Where `c` writes: the open thread replies in that thread, a search or
+    /// threads hit replies in the hit's thread, a timeline posts to its
+    /// conversation, the list posts to the highlighted conversation.
+    fn compose_target(&self) -> Result<Compose, String> {
+        let known = |cid: &str| -> Result<usize, String> {
+            self.corpus
+                .conv_by_channel(cid)
+                .ok_or_else(|| format!("{cid} is not a conversation this tool knows"))
+        };
+        match self.stack.last() {
+            Some(View::Thread { root, list, .. }) => {
+                let cid = match list.msgs.first() {
+                    Some(m) => m.channel_id.clone(),
+                    None => self
+                        .open
+                        .as_ref()
+                        .map(|o| self.corpus.convs[o.conv].id.clone())
+                        .ok_or("no conversation")?,
+                };
+                let conv = known(&cid)?;
+                let name = self.corpus.convs[conv].name.clone();
+                Ok(Compose {
+                    conv,
+                    cid,
+                    thread: Some(*root),
+                    label: format!("reply in this thread in {name}"),
+                })
+            }
+            Some(View::Search { .. }) | Some(View::Threads { .. }) => {
+                let m = self.selected().ok_or("no message selected")?;
+                let conv = known(&m.channel_id)?;
+                let name = self.corpus.convs[conv].name.clone();
+                let who = m
+                    .user
+                    .as_deref()
+                    .and_then(|u| self.corpus.user_name(u))
+                    .unwrap_or_else(|| "?".to_string());
+                Ok(Compose {
+                    conv,
+                    cid: m.channel_id.clone(),
+                    thread: Some(m.parent_id.unwrap_or(m.id)),
+                    label: format!("reply in {who}'s thread in {name}"),
+                })
+            }
+            Some(View::Raw { .. }) | Some(View::Image { .. }) => {
+                Err("close this view first".to_string())
+            }
+            None => {
+                let conv = match (self.focus, self.open.as_ref()) {
+                    (Focus::Msgs, Some(o)) => o.conv,
+                    _ => *self
+                        .filtered
+                        .get(self.conv_cursor)
+                        .ok_or("nothing highlighted")?,
+                };
+                let c = &self.corpus.convs[conv];
+                Ok(Compose {
+                    conv,
+                    cid: c.id.clone(),
+                    thread: None,
+                    label: format!("message to {}", c.name),
+                })
+            }
+        }
+    }
+
+    /// `c`: the compose prompt, with the unsent draft if one was kept.
+    fn compose(&mut self) {
+        if self.api.is_none() {
+            self.status = "sending needs the Slack sign-in".to_string();
+            return;
+        }
+        match self.compose_target() {
+            Ok(t) => {
+                let buf = match &self.draft {
+                    Some(d) if d.cid == t.cid && d.thread == t.thread => d.text.clone(),
+                    _ => String::new(),
+                };
+                self.compose = Some(t);
+                self.mode = Mode::Prompt {
+                    kind: PromptKind::Compose,
+                    buf,
+                    previous: String::new(),
+                };
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// The typed text, remembered with the target the prompt was opened for.
+    /// An emptied prompt drops its own draft and leaves another target's alone.
+    fn keep_draft(&mut self, text: String) {
+        let Some(t) = self.compose.as_ref() else {
+            return;
+        };
+        let same = |d: &Draft| d.cid == t.cid && d.thread == t.thread;
+        if text.trim().is_empty() {
+            if self.draft.as_ref().is_some_and(same) {
+                self.draft = None;
+            }
+            return;
+        }
+        self.draft = Some(Draft {
+            cid: t.cid.clone(),
+            thread: t.thread,
+            text,
+        });
+    }
+
+    /// Enter in the compose prompt. The draft stays until Slack confirms, so
+    /// a failed send is not lost.
+    fn send_message(&mut self, text: String) {
+        let Some(t) = self.compose.take() else {
+            return;
+        };
+        if text.trim().is_empty() {
+            self.status = "nothing to send".to_string();
+            return;
+        }
+        let Some(c) = self.api.clone() else {
+            self.compose = Some(t);
+            self.keep_draft(text);
+            self.status = "sending needs the Slack sign-in".to_string();
+            return;
+        };
+        if self.job.is_some() {
+            self.compose = Some(t);
+            self.keep_draft(text);
+            self.status = "a fetch is already running; press c again in a moment".to_string();
+            return;
+        }
+        let wire = self.link_mentions(text.trim());
+        self.draft = Some(Draft {
+            cid: t.cid.clone(),
+            thread: t.thread,
+            text,
+        });
+        self.job = Some(live::api_send(c, t.conv, t.cid, t.thread, wire));
+    }
+
+    fn link_mentions(&self, text: &str) -> String {
+        link_mentions(text, |h| self.corpus.user_id(h))
     }
 
     pub fn sort_label(&self) -> String {
@@ -1836,6 +2004,31 @@ impl App {
                 self.mark_all_dirty();
                 self.status = format!("{name} {what}");
             }
+            (JobKind::Send { conv, thread }, Done::Sent(msg)) => {
+                let msg = *msg;
+                self.draft = None;
+                let name = self.corpus.convs[conv].name.clone();
+                let c = &mut self.corpus.convs[conv];
+                if msg.id > c.last_id {
+                    c.last_id = msg.id;
+                }
+                match thread {
+                    Some(root) => {
+                        if let Some(View::Thread { root: r, list, .. }) = self.stack.last_mut() {
+                            if *r == root && !list.msgs.iter().any(|m| m.id == msg.id) {
+                                list.msgs.push(msg);
+                                list.cursor = list.len() - 1;
+                                list.mark_dirty();
+                            }
+                        }
+                        self.status = format!("reply sent in {name}");
+                    }
+                    None => {
+                        self.append_tail(conv, vec![msg], true);
+                        self.status = format!("sent to {name}");
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2166,6 +2359,7 @@ impl App {
                 self.highlight_cached = !self.highlight_cached;
             }
             (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
+            (KeyCode::Char('c'), false) => self.compose(),
             (KeyCode::Char('m'), false) => self.mark_read(),
             (KeyCode::Char('M'), false) => self.mark_unread(),
             (KeyCode::Char('s'), false) => {
@@ -2303,6 +2497,7 @@ impl App {
                 self.highlight_cached = !self.highlight_cached;
             }
             (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
+            (KeyCode::Char('c'), false) => self.compose(),
             (KeyCode::Char('i'), false) => self.open_images(),
             (KeyCode::Char('m'), false) => self.mark_read(),
             (KeyCode::Char('M'), false) => self.mark_unread(),
@@ -2345,12 +2540,16 @@ impl App {
         let kind = *kind;
         match k.code {
             KeyCode::Esc => {
+                let typed = buf.clone();
                 if kind == PromptKind::Filter {
                     self.filter = previous.clone();
                     self.mode = Mode::Normal;
                     self.apply_filter();
                 } else {
                     self.mode = Mode::Normal;
+                }
+                if kind == PromptKind::Compose {
+                    self.keep_draft(typed);
                 }
             }
             KeyCode::Enter => {
@@ -2364,6 +2563,7 @@ impl App {
                     PromptKind::Search => self.run_search(&text),
                     PromptKind::Date => self.goto_date(&text),
                     PromptKind::Archive => self.archive_new(&text),
+                    PromptKind::Compose => self.send_message(text),
                 }
             }
             KeyCode::Backspace => {
@@ -2385,6 +2585,34 @@ impl App {
     }
 }
 
+/// `@handle` becomes a real mention when `user_id` knows the handle;
+/// anything else, `@channel` and `@here` included, stays literal text.
+fn link_mentions(text: &str, user_id: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, word) in text.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let is_tail = |ch: char| ch.is_ascii_punctuation() && !matches!(ch, '.' | '-' | '_' | '@');
+        let (core, tail) = match word.find(is_tail) {
+            Some(p) => word.split_at(p),
+            None => (word, ""),
+        };
+        let handle = core.strip_prefix('@').map(|h| h.trim_end_matches('.'));
+        match handle.and_then(&user_id) {
+            Some(id) => {
+                out.push_str(&format!("<@{id}>"));
+                if core.ends_with('.') {
+                    out.push('.');
+                }
+                out.push_str(tail);
+            }
+            None => out.push_str(word),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2398,6 +2626,20 @@ mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn mentions_link_known_handles_only() {
+        let users = |h: &str| (h == "gabriel.clima").then(|| "U1".to_string());
+        assert_eq!(
+            link_mentions("hi @gabriel.clima, see @nobody and @gabriel.clima.", users),
+            "hi <@U1>, see @nobody and <@U1>."
+        );
+        assert_eq!(
+            link_mentions("@channel @here (@gabriel.clima)", users),
+            "@channel @here (@gabriel.clima)"
+        );
+        assert_eq!(link_mentions("", users), "");
     }
 
     #[test]

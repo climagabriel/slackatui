@@ -328,6 +328,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             PromptKind::Search => "search this conversation",
             PromptKind::Date => "go to date (YYYY-MM-DD)",
             PromptKind::Archive => "archive a conversation from Slack, last 90 days (URL or id)",
+            PromptKind::Compose => app
+                .compose
+                .as_ref()
+                .map(|c| c.label.as_str())
+                .unwrap_or("message"),
         };
         let line = Line::from(vec![
             Span::styled(format!(" {label}: "), Style::new().fg(Color::Cyan)),
@@ -398,6 +403,10 @@ const HELP: &[(&str, &str)] = &[
     ("I", "inline image thumbnails on/off"),
     ("C", "highlight cached conversations in light green on/off"),
     ("U", "unread conversations on top on/off"),
+    (
+        "c",
+        "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Enter sends, Esc keeps the draft",
+    ),
     (
         "m",
         "mark read: the highlighted conversation, or the open one at its newest message",

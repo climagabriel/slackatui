@@ -225,8 +225,67 @@ impl Client {
             .map(|_| ())
     }
 
+    /// Post `text` to `cid`, into the thread `thread_ts` when given; the
+    /// message as Slack stored it comes back.
+    pub fn post_message(
+        &self,
+        cid: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut params = vec![("channel", cid), ("text", text)];
+        if let Some(t) = thread_ts {
+            params.push(("thread_ts", t));
+        }
+        let v = self.call("chat.postMessage", &params)?;
+        v.get("message")
+            .cloned()
+            .ok_or_else(|| "chat.postMessage: no message in the answer".to_string())
+    }
+
+    /// Delete one of your own messages.
+    pub fn delete_message(&self, cid: &str, ts: &str) -> Result<(), String> {
+        self.call("chat.delete", &[("channel", cid), ("ts", ts)])
+            .map(|_| ())
+    }
+
     /// Unread state per conversation, as the web client fetches it.
     pub fn counts(&self) -> Result<Value, String> {
         self.call("client.counts", &[("thread_counts_by_channel", "false")])
+    }
+}
+
+/// `https://x.slack.com/archives/C123/p1788423554556689` -> (C123, 1788423554.556689).
+pub fn parse_permalink(link: &str) -> Option<(String, String)> {
+    let rest = link.split("/archives/").nth(1)?;
+    let mut it = rest.split('/');
+    let cid = it.next()?.to_string();
+    let p = it.next()?.split(['?', '#']).next()?.strip_prefix('p')?;
+    if p.len() < 11 || !p.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (secs, micros) = p.split_at(p.len() - 6);
+    Some((cid, format!("{secs}.{micros}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_permalink;
+
+    #[test]
+    fn permalinks_split_into_channel_and_timestamp() {
+        assert_eq!(
+            parse_permalink("https://myorg.slack.com/archives/C0EXAMPLE01/p1788423810534599"),
+            Some(("C0EXAMPLE01".to_string(), "1788423810.534599".to_string()))
+        );
+        assert_eq!(
+            parse_permalink("https://myorg.slack.com/archives/D0EXAMPLE02/p1788423562398749?thread_ts=1788423554.556689&cid=D0EXAMPLE02"),
+            Some(("D0EXAMPLE02".to_string(), "1788423562.398749".to_string()))
+        );
+        assert_eq!(
+            parse_permalink("https://myorg.slack.com/archives/C1/p12"),
+            None
+        );
+        assert_eq!(parse_permalink("https://example.com/x"), None);
     }
 }

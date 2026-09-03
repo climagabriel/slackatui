@@ -56,6 +56,8 @@ flags
                   or iTerm2 protocol, half-blocks when it has none. halfblocks:
                   no query. Under tmux or screen the query's responses can eat
                   the first key, so there it runs only when asked for.
+  --delete-message URL
+                  delete your own message at that permalink (debug)
   --fetch-file URL OUT
                   download one Slack file with the signed-in session (debug)
   --help          this text
@@ -96,8 +98,8 @@ SLACK_COOKIE override), the Web API serves threads, search, the newest
 messages, every conversation you are a member of, and unread markers; a
 thread lands in the cache, the open conversation is re-checked every
 --poll seconds. Without a sign-in, slackdump does the same more slowly,
-and `a` still archives a new conversation into the root. The only writes
-to Slack are m and M, which move your own read marker.
+and `a` still archives a new conversation into the root. Writes to Slack:
+m and M move your own read marker; c composes a message, Enter sends it.
 
 exit codes
   0  ok        1  no archive, or the conversation was not found
@@ -126,6 +128,7 @@ struct Opts {
     /// None: query unless a multiplexer is in the way.
     image_protocol: Option<bool>,
     fetch_file: Option<(String, String)>,
+    delete_message: Option<String>,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -146,6 +149,7 @@ fn parse_args() -> Result<Opts, String> {
         no_images: false,
         image_protocol: None,
         fetch_file: None,
+        delete_message: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -185,6 +189,9 @@ fn parse_args() -> Result<Opts, String> {
                 let url = value("--fetch-file")?;
                 let out = value("--fetch-file")?;
                 opts.fetch_file = Some((url, out));
+            }
+            "--delete-message" => {
+                opts.delete_message = Some(value("--delete-message")?);
             }
             "--poll" => {
                 opts.poll = value("--poll")?
@@ -276,7 +283,7 @@ fn run() -> i32 {
             return 1;
         }
     };
-    if opts.auth_check || opts.fetch_file.is_some() {
+    if opts.auth_check || opts.fetch_file.is_some() || opts.delete_message.is_some() {
         let scratch = std::env::temp_dir().join("slack-tui");
         let agent = api::agent();
         let auth = match auth::from_env() {
@@ -290,6 +297,23 @@ fn run() -> i32 {
             },
         };
         println!("credentials: {}", auth.source);
+        if let Some(link) = &opts.delete_message {
+            let Some((cid, ts)) = api::parse_permalink(link) else {
+                eprintln!("slack-tui: not a message permalink: {link}");
+                return 2;
+            };
+            let client = api::Client::new(auth);
+            return match client.delete_message(&cid, &ts) {
+                Ok(()) => {
+                    println!("deleted {cid} {ts}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("slack-tui: {e}");
+                    1
+                }
+            };
+        }
         if let Some((url, out)) = &opts.fetch_file {
             let client = api::Client::new(auth);
             return match client.download(url) {

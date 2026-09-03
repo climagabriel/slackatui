@@ -39,6 +39,8 @@ pub enum JobKind {
     File { id: String },
     /// The read marker of `conv` moved to message `id`.
     Mark { conv: usize, id: i64 },
+    /// A message posted to `conv`, into the thread rooted at `thread` when given.
+    Send { conv: usize, thread: Option<i64> },
 }
 
 pub enum Done {
@@ -54,6 +56,7 @@ pub enum Done {
     Counts(Value),
     File(PathBuf),
     Marked,
+    Sent(Box<Msg>),
 }
 
 pub struct Job {
@@ -274,6 +277,26 @@ pub fn api_mark(client: Arc<Client>, conv: usize, cid: String, id: i64) -> Job {
         move || {
             client.mark(&cid, &id_to_ts(id))?;
             Ok(Done::Marked)
+        },
+    )
+}
+
+pub fn api_send(
+    client: Arc<Client>,
+    conv: usize,
+    cid: String,
+    thread: Option<i64>,
+    text: String,
+) -> Job {
+    spawn(
+        JobKind::Send { conv, thread },
+        "sending".to_string(),
+        move || {
+            let ts = thread.map(id_to_ts);
+            let data = client.post_message(&cid, &text, ts.as_deref())?;
+            Msg::from_api(cid, data)
+                .map(|m| Done::Sent(Box::new(m)))
+                .ok_or_else(|| "sent, but Slack's answer carried no timestamp".to_string())
         },
     )
 }
