@@ -1460,10 +1460,20 @@ impl App {
             live: None,
             place,
         });
+        // Slack has the thread's newest replies; the archive's copy is only
+        // what the last archive run saw, and its reply count is that old too.
+        // So a sign-in always re-asks, and the caches answer only without one.
+        if let Some(c) = self.api.clone() {
+            if self.job.is_some() {
+                self.status = "a fetch is already running".to_string();
+                return;
+            }
+            self.job = Some(live::api_thread(c, &self.cache_dir, cid, root, focus));
+            return;
+        }
         if complete {
             return;
         }
-        // The cache answers first, in either format; Slack only when it cannot.
         if let Some(msgs) = live::cached_thread(&self.cache_dir, &cid, root) {
             self.apply_thread_msgs(msgs, root, focus, "the cache");
             return;
@@ -1477,9 +1487,7 @@ impl App {
             self.status = "a fetch is already running".to_string();
             return;
         }
-        if let Some(c) = self.api.clone() {
-            self.job = Some(live::api_thread(c, &self.cache_dir, cid, root, focus));
-        } else if self.slackdump && self.live {
+        if self.slackdump && self.live {
             self.job = Some(live::fetch_thread(
                 &self.cache_dir,
                 &self.corpus.workspace_url,
@@ -1494,6 +1502,34 @@ impl App {
                 format!("{have} of {wanted} replies archived; not signed in")
             };
         }
+    }
+
+    /// Replies Slack has beyond the open thread, appended in place. The
+    /// cursor and the scroll stay where the reader left them.
+    fn extend_thread(&mut self, msgs: Vec<Msg>, root: i64) {
+        let Some(View::Thread { root: r, list, .. }) = self.stack.last_mut() else {
+            return;
+        };
+        if *r != root {
+            return;
+        }
+        let known: HashSet<i64> = list.msgs.iter().map(|m| m.id).collect();
+        let fresh: Vec<Msg> = msgs
+            .into_iter()
+            .filter(|m| !known.contains(&m.id))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let n = fresh.len();
+        let at_end = list.cursor + 1 >= list.len();
+        list.msgs.extend(fresh);
+        list.msgs.sort_by_key(|m| m.id);
+        if at_end {
+            list.cursor = list.len() - 1;
+        }
+        list.mark_dirty();
+        self.status = format!("{n} new in this thread");
     }
 
     /// Show a thread fetched from Slack (or its JSON cache), replacing the
@@ -1739,6 +1775,27 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        if let Some(View::Thread { root, list, .. }) = self.stack.last() {
+            let root = *root;
+            let focus = list.selected().map(|m| m.id).unwrap_or(root);
+            let cid = match list.msgs.first() {
+                Some(m) => m.channel_id.clone(),
+                None => match self.open.as_ref() {
+                    Some(o) => self.corpus.convs[o.conv].id.clone(),
+                    None => return,
+                },
+            };
+            if self.job.is_some() {
+                self.status = "a fetch is already running".to_string();
+                return;
+            }
+            if let Some(c) = self.api.clone() {
+                self.job = Some(live::api_thread(c, &self.cache_dir, cid, root, focus));
+            } else {
+                self.status = "refreshing a thread needs the Slack sign-in".to_string();
+            }
+            return;
+        }
         let Some(o) = self.open.as_ref() else {
             return;
         };
@@ -2408,6 +2465,11 @@ impl App {
                     self.last_counts = Instant::now();
                 }
                 Ok(Done::MutedChannels(ids)) => self.take_muted(ids),
+                Ok(Done::ThreadMsgs(msgs)) => {
+                    if let JobKind::Thread { root, .. } = job.kind {
+                        self.extend_thread(msgs, root);
+                    }
+                }
                 Ok(Done::EmojiList(names)) => self.take_emoji_list(names),
                 Ok(Done::Messages(msgs)) => {
                     if let JobKind::Tail { conv } = job.kind {
@@ -2431,7 +2493,32 @@ impl App {
             if self.bg.is_none() && self.poll_every.as_secs() > 0 {
                 if self.last_poll.elapsed() >= self.poll_every {
                     self.last_poll = Instant::now();
-                    if let Some(o) = self.open.as_ref() {
+                    // An open thread is what the reader is looking at; the
+                    // timeline behind it waits for the next tick.
+                    let open_thread = match self.stack.last() {
+                        Some(View::Thread { root, list, .. }) => list
+                            .msgs
+                            .first()
+                            .map(|m| m.channel_id.clone())
+                            .or_else(|| {
+                                self.open
+                                    .as_ref()
+                                    .map(|o| self.corpus.convs[o.conv].id.clone())
+                            })
+                            .map(|cid| {
+                                (cid, *root, list.selected().map(|m| m.id).unwrap_or(*root))
+                            }),
+                        _ => None,
+                    };
+                    if let Some((cid, root, focus)) = open_thread {
+                        self.bg = Some(live::api_thread(
+                            c.clone(),
+                            &self.cache_dir,
+                            cid,
+                            root,
+                            focus,
+                        ));
+                    } else if let Some(o) = self.open.as_ref() {
                         let since = o.list.msgs.last().map(|m| m.id).unwrap_or(0);
                         if !o.has_newer && since > 0 {
                             let idx = o.conv;
