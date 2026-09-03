@@ -269,6 +269,26 @@ impl Client {
             .map(|_| ())
     }
 
+    /// Channel ids muted in Slack itself, from the notification preferences.
+    pub fn muted_channels(&self) -> Result<Vec<String>, String> {
+        let v = self.call("users.prefs.get", &[])?;
+        let raw = v
+            .pointer("/prefs/all_notifications_prefs")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+        let prefs: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+        Ok(prefs
+            .pointer("/channels")
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, v)| v.get("muted").and_then(Value::as_bool).unwrap_or(false))
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// The workspace's custom emoji names.
     pub fn emoji_list(&self) -> Result<Vec<String>, String> {
         let v = self.call("emoji.list", &[])?;

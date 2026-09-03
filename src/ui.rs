@@ -57,7 +57,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = inner.width as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
     let open_idx = app.open.as_ref().map(|o| o.conv);
-    let items: Vec<ListItem> = app
+    let items: Vec<Line> = app
         .filtered
         .iter()
         .map(|&i| {
@@ -74,7 +74,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             if c.archived {
                 name.push('†');
             }
-            if c.unread && !c.muted {
+            if c.unread {
                 // The marker carries the mention count; the name itself lights up.
                 name.insert_str(
                     0,
@@ -87,7 +87,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             let name = clip(&name, room);
             let pad = room.saturating_sub(name.width());
-            let mut name_style = if c.unread && !c.muted {
+            let mut name_style = if c.unread {
                 Style::new()
                     .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD)
@@ -101,19 +101,27 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             if Some(i) == open_idx {
                 name_style = name_style.add_modifier(Modifier::BOLD);
             }
-            ListItem::new(Line::from(vec![
+            Line::from(vec![
                 Span::styled(name, name_style),
                 Span::raw(" ".repeat(pad + 1)),
                 Span::styled(count, dim),
-            ]))
+            ])
         })
         .collect();
-    let highlight = if focused {
-        Style::new().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-    };
-    let list = List::new(items).block(block).highlight_style(highlight);
+    // The cursor's row is rewritten black on white rather than styled through
+    // `highlight_style`: a span carries its own colour, which would win.
+    let items: Vec<ListItem> = items
+        .into_iter()
+        .enumerate()
+        .map(|(k, line)| {
+            ListItem::new(if k == app.conv_cursor {
+                on_cursor(line, focused)
+            } else {
+                line
+            })
+        })
+        .collect();
+    let list = List::new(items).block(block);
     let mut state = ListState::default().with_selected(if app.filtered.is_empty() {
         None
     } else {
@@ -231,7 +239,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         spans.extend(fl.line.spans.iter().cloned());
         let mut line = Line::from(spans);
         if selected && header_line == Some(i) {
-            line.style = Style::new().add_modifier(Modifier::REVERSED);
+            line = on_cursor(line, focused);
         }
         shown.push(line);
     }
@@ -319,7 +327,7 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
         for (k, &i) in matches.iter().enumerate().skip(first).take(rows) {
             let (name, glyph) = &app.emoji_table[i];
             let style = if k == *cursor {
-                Style::new().add_modifier(Modifier::REVERSED)
+                Style::new().bg(Color::White).fg(Color::Black)
             } else {
                 Style::new()
             };
@@ -330,6 +338,25 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The cursor's row: black on white where the pane has the focus, black on
+/// grey where it does not, with each span's own colour dropped so the text
+/// stays readable. Bold, italic and underline survive. A row is rewritten
+/// rather than styled from outside because a span's own colour would win.
+fn on_cursor(line: Line<'_>, focused: bool) -> Line<'_> {
+    let keep = Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED;
+    let bg = if focused { Color::White } else { Color::Gray };
+    let spans: Vec<Span> = line
+        .spans
+        .into_iter()
+        .map(|s| {
+            let m = s.style.add_modifier & keep;
+            let style = Style::new().bg(bg).fg(Color::Black).add_modifier(m);
+            Span::styled(s.content, style)
+        })
+        .collect();
+    Line::from(spans)
 }
 
 /// An editor's rows, the first behind `prefix`, the cursor cell reversed.
@@ -481,7 +508,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "/",
-        "a command, each taking an optional #name: find|search TEXT filters the list or searches the open conversation; leave; mute|unmute (never shown as unread); cache start|stop|wipe (archive it, pause its hourly refresh, delete its archive)",
+        "a command, each taking an optional #name: find|search TEXT filters the list or searches the open conversation; leave; mute|unmute (kept at the end of the list; Slack's own muted channels count too); cache start|stop|wipe (archive it, pause its hourly refresh, delete its archive)",
     ),
     (
         "o",

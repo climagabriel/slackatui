@@ -406,9 +406,14 @@ pub struct App {
     pub react: Option<ReactTarget>,
     /// (name, glyph) for the picker: Unicode emoji, then the workspace's custom ones as `:name:`.
     pub emoji_table: Vec<(String, String)>,
-    /// Muted conversation ids, from `<cache>/muted.json`.
+    /// Muted conversation ids: `<cache>/muted.json` plus the channels muted
+    /// in Slack itself, fetched once per run.
     pub muted: HashSet<String>,
+    /// Muted in Slack, so `/unmute` says where to undo it.
+    pub muted_in_slack: HashSet<String>,
     pub muted_loaded: bool,
+    /// Slack's muted set still to fetch.
+    pub muted_pending: bool,
     /// A message typed and not sent: Esc keeps it for the next `c` on the
     /// same target, so it cannot go to another conversation by reflex.
     pub draft: Option<Draft>,
@@ -466,7 +471,9 @@ impl App {
             react: None,
             emoji_table: Vec::new(),
             muted: HashSet::new(),
+            muted_in_slack: HashSet::new(),
             muted_loaded: false,
+            muted_pending: false,
             draft: None,
             counts_gen: 0,
         };
@@ -754,6 +761,25 @@ impl App {
         }
     }
 
+    /// Slack's own muted channels join the local set for this run.
+    fn take_muted(&mut self, ids: Vec<String>) {
+        self.muted_in_slack = ids.iter().cloned().collect();
+        self.muted.extend(ids);
+        self.apply_filter();
+        self.mark_all_dirty();
+    }
+
+    /// The workspace's custom emoji, cached for the next run.
+    fn take_emoji_list(&mut self, names: Vec<String>) {
+        if let Ok(t) = serde_json::to_string(&names) {
+            let _ = std::fs::create_dir_all(&self.cache_dir);
+            let _ = std::fs::write(self.cache_dir.join("emoji.json"), t);
+        }
+        if !self.emoji_table.is_empty() {
+            self.add_custom_emoji(names);
+        }
+    }
+
     /// The muted set follows `<cache>/muted.json`; the flags on the
     /// conversations follow the set, so merged-in conversations get theirs.
     fn sync_muted(&mut self) {
@@ -784,12 +810,16 @@ impl App {
             let c = &self.corpus.convs[idx];
             (c.id.clone(), c.name.clone())
         };
+        let in_slack = self.muted_in_slack.contains(&id);
         if on {
             self.muted.insert(id);
+        } else if in_slack {
+            self.status = format!("{cname} is muted in Slack itself; unmute it there");
+            return;
         } else {
             self.muted.remove(&id);
         }
-        let mut ids: Vec<&String> = self.muted.iter().collect();
+        let mut ids: Vec<&String> = self.muted.difference(&self.muted_in_slack).collect();
         ids.sort();
         let _ = std::fs::create_dir_all(&self.cache_dir);
         let saved = serde_json::to_string(&ids)
@@ -798,7 +828,7 @@ impl App {
                 std::fs::write(self.cache_dir.join("muted.json"), t).map_err(|e| e.to_string())
             });
         self.status = match saved {
-            Ok(()) if on => format!("{cname} muted: never shown as unread"),
+            Ok(()) if on => format!("{cname} muted: always at the end of the list"),
             Ok(()) => format!("{cname} unmuted"),
             Err(e) => format!("{cname}: {e}"),
         };
@@ -1154,14 +1184,15 @@ impl App {
             Sort::Size => idx.sort_by(|&a, &b| convs[b].msgs.cmp(&convs[a].msgs)),
         }
         // Unread conversations first, in the same order among themselves;
-        // a typed filter still puts the closer name matches above. A muted
-        // conversation never counts as unread here.
+        // a typed filter still puts the closer name matches above.
         if self.unreads_first {
-            idx.sort_by_key(|&i| !convs[i].unread || convs[i].muted);
+            idx.sort_by_key(|&i| !convs[i].unread);
         }
         if !needle.is_empty() {
             idx.sort_by_key(|&i| rank(&convs[i].name).unwrap_or(2));
         }
+        // Muted conversations keep their unread colour but sink to the end.
+        idx.sort_by_key(|&i| convs[i].muted);
         // Keep the highlighted conversation highlighted across a re-sort.
         let current = self.filtered.get(self.conv_cursor).copied();
         self.filtered = idx;
@@ -2366,6 +2397,7 @@ impl App {
                     self.merge_conversations(list);
                     if let Some(c) = self.api.clone() {
                         self.bg = Some(live::api_counts(c, self.counts_gen));
+                        self.muted_pending = true;
                     }
                 }
                 Ok(Done::Counts(v)) => {
@@ -2375,6 +2407,8 @@ impl App {
                     }
                     self.last_counts = Instant::now();
                 }
+                Ok(Done::MutedChannels(ids)) => self.take_muted(ids),
+                Ok(Done::EmojiList(names)) => self.take_emoji_list(names),
                 Ok(Done::Messages(msgs)) => {
                     if let JobKind::Tail { conv } = job.kind {
                         self.append_tail(conv, msgs, true);
@@ -2390,6 +2424,10 @@ impl App {
             }
         }
         if let Some(c) = self.api.clone() {
+            if self.muted_pending && self.bg.is_none() {
+                self.muted_pending = false;
+                self.bg = Some(live::api_muted_channels(c.clone()));
+            }
             if self.bg.is_none() && self.poll_every.as_secs() > 0 {
                 if self.last_poll.elapsed() >= self.poll_every {
                     self.last_poll = Instant::now();
@@ -2506,16 +2544,6 @@ impl App {
                         self.append_tail(conv, vec![msg], true);
                         self.status = format!("sent to {name}");
                     }
-                }
-            }
-            (JobKind::EmojiList, Done::EmojiList(names)) => {
-                let path = self.cache_dir.join("emoji.json");
-                if let Ok(t) = serde_json::to_string(&names) {
-                    let _ = std::fs::create_dir_all(&self.cache_dir);
-                    let _ = std::fs::write(path, t);
-                }
-                if !self.emoji_table.is_empty() {
-                    self.add_custom_emoji(names);
                 }
             }
             (JobKind::Leave { conv }, Done::Left) => {

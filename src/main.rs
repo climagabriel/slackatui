@@ -105,7 +105,8 @@ and `a` still archives a new conversation into the root. Writes to Slack:
 m and M move your own read marker; c composes a message, Enter sends it;
 e toggles your reaction on the selected message; /leave leaves a channel.
 /cache start archives a conversation; /cache stop pauses its hourly refresh;
-/cache wipe deletes its archive; /mute and /unmute are local to this tool.
+/cache wipe deletes its archive; /mute and /unmute keep a conversation at the
+end of the list, on top of the channels muted in Slack itself.
 
 exit codes
   0  ok        1  no archive, or the conversation was not found

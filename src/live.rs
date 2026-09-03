@@ -47,6 +47,8 @@ pub enum JobKind {
     Leave { conv: usize },
     /// The workspace's custom emoji names, for the reaction picker.
     EmojiList,
+    /// The channels muted in Slack itself.
+    MutedChannels,
 }
 
 pub enum Done {
@@ -66,6 +68,7 @@ pub enum Done {
     Reacted,
     Left,
     EmojiList(Vec<String>),
+    MutedChannels(Vec<String>),
 }
 
 pub struct Job {
@@ -334,6 +337,12 @@ pub fn api_leave(client: Arc<Client>, conv: usize, cid: String) -> Job {
 pub fn api_emoji_list(client: Arc<Client>) -> Job {
     spawn(JobKind::EmojiList, String::new(), move || {
         Ok(Done::EmojiList(client.emoji_list()?))
+    })
+}
+
+pub fn api_muted_channels(client: Arc<Client>) -> Job {
+    spawn(JobKind::MutedChannels, String::new(), move || {
+        Ok(Done::MutedChannels(client.muted_channels()?))
     })
 }
 
