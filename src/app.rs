@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::api::Client;
 use crate::archive::{ts_to_id, Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
+use crate::complete;
 use crate::edit::Editor;
 use crate::live::{self, Done, Job, JobKind};
 use crate::palette::{Palette, Role, ROLES};
@@ -376,6 +377,9 @@ pub struct App {
     pub quit: bool,
     /// Inner height of the messages pane at the last draw.
     pub msgs_height: usize,
+    /// First conversation row drawn, kept across frames so the cursor moves
+    /// inside the pane instead of the pane moving under it.
+    pub conv_offset: usize,
     /// Days after which one of the owner's messages counts half, in the
     /// activity order.
     pub half_life_days: f64,
@@ -405,7 +409,8 @@ pub struct App {
     /// Encoded inline thumbnails, by file id, with the cell size they were made for.
     pub inline: HashMap<String, (u16, u16, Protocol)>,
     pub file_job: Option<Job>,
-    /// `C`: cached conversations in the palette's cached color.
+    /// `/cache highlight on|off`: cached conversations in the palette's
+    /// cached color.
     pub highlight_cached: bool,
     /// `U`: unread conversations at the top of the list.
     pub unreads_first: bool,
@@ -485,6 +490,7 @@ impl App {
             images: HashMap::new(),
             inline: HashMap::new(),
             file_job: None,
+            conv_offset: 0,
             highlight_cached: false,
             unreads_first: true,
             compose: None,
@@ -617,9 +623,11 @@ impl App {
                     self.apply_filter();
                 }
                 if !line.trim().is_empty() {
+                    let names: Vec<&str> = complete::COMMANDS.iter().map(|c| c.name).collect();
                     self.status = format!(
-                        "unknown command: {}; commands: colorpalette; find|search TEXT; leave, mute, unmute, cache start|stop|wipe with an optional #name",
-                        line.split_whitespace().next().unwrap_or("")
+                        "unknown command: {}; Tab completes, and the commands are {}",
+                        line.split_whitespace().next().unwrap_or(""),
+                        names.join(", ")
                     );
                 }
             }
@@ -782,6 +790,20 @@ impl App {
 
     /// The conversation a command acts on: the named one, else the open
     /// one, else the highlighted one.
+    /// Conversation names for completion, each once, in list order.
+    pub fn conv_names(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.filtered
+            .iter()
+            .copied()
+            .chain(0..self.corpus.convs.len())
+            .filter_map(|i| {
+                let name = self.corpus.convs.get(i)?.name.clone();
+                seen.insert(name.to_lowercase()).then_some(name)
+            })
+            .collect()
+    }
+
     fn target_conv(&self, name: &str) -> Result<usize, String> {
         if !name.is_empty() {
             return self
@@ -849,6 +871,23 @@ impl App {
     /// hourly refresh with a `.paused` marker the refresh script honours,
     /// or delete its archive.
     fn cache_cmd(&mut self, op: &str, name: &str) {
+        if op == "highlight" {
+            self.highlight_cached = match name.trim().to_lowercase().as_str() {
+                "on" => true,
+                "off" => false,
+                "" => !self.highlight_cached,
+                other => {
+                    self.status = format!("/cache highlight takes on or off, not {other:?}");
+                    return;
+                }
+            };
+            self.status = if self.highlight_cached {
+                "cached conversations in the palette's cached color".to_string()
+            } else {
+                "cached conversations no longer colored".to_string()
+            };
+            return;
+        }
         let idx = match self.target_conv(name) {
             Ok(i) => i,
             Err(e) => {
@@ -1348,6 +1387,8 @@ impl App {
             .and_then(|c| self.filtered.iter().position(|&i| i == c))
             .unwrap_or(0)
             .min(self.filtered.len().saturating_sub(1));
+        // A shorter list must not leave the pane scrolled past its cursor.
+        self.conv_offset = self.conv_offset.min(self.conv_cursor);
     }
 
     // ------------------------------------------------------------- loading
@@ -3165,9 +3206,6 @@ impl App {
             (KeyCode::Esc, _) => self.go_home(),
             (KeyCode::Char('a'), false) => self.prompt_archive(),
             (KeyCode::Char('T'), false) => self.open_my_threads(),
-            (KeyCode::Char('C'), false) => {
-                self.highlight_cached = !self.highlight_cached;
-            }
             (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
             (KeyCode::Char('c'), false) => self.compose(),
             (KeyCode::Char('e'), false) => self.react(),
@@ -3298,9 +3336,6 @@ impl App {
             (KeyCode::Char('R'), false) => self.refresh(),
             (KeyCode::Char('a'), false) => self.prompt_archive(),
             (KeyCode::Char('T'), false) => self.open_my_threads(),
-            (KeyCode::Char('C'), false) => {
-                self.highlight_cached = !self.highlight_cached;
-            }
             (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
             (KeyCode::Char('c'), false) => self.compose(),
             (KeyCode::Char('e'), false) => self.react(),
@@ -3370,6 +3405,15 @@ impl App {
                     PromptKind::PaletteColor => self.set_palette_color(&text),
                 }
             }
+            KeyCode::Tab if kind == PromptKind::Command => {
+                let line = buf.text.clone();
+                if let Some(done) = complete::apply(&line, &self.conv_names()) {
+                    if let Mode::Prompt { buf, .. } = &mut self.mode {
+                        *buf = Editor::with(done.clone());
+                    }
+                    self.filter_live(&done);
+                }
+            }
             _ => {
                 if buf.key(k, kind == PromptKind::Compose) {
                     let live = buf.text.clone();
@@ -3389,7 +3433,7 @@ enum Command {
     Find(String),
     /// `leave [#name]`.
     Leave(String),
-    /// `cache start|stop|wipe [#name]`.
+    /// `cache start|stop|wipe [#name]`, and `cache highlight [on|off]`.
     Cache(String, String),
     /// `mute [#name]` (true) and `unmute [#name]` (false).
     Mute(bool, String),
@@ -3415,7 +3459,7 @@ fn parse_command(line: &str) -> Option<Command> {
                 Some((o, n)) => (o, n.trim()),
                 None => (rest, ""),
             };
-            matches!(op, "start" | "stop" | "wipe")
+            matches!(op, "start" | "stop" | "wipe" | "highlight")
                 .then(|| Command::Cache(op.to_string(), name.to_string()))
         }
         _ => None,

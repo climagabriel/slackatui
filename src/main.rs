@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod archive;
 mod auth;
+mod complete;
 mod edit;
 mod live;
 mod palette;
@@ -86,11 +87,12 @@ environment
 
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
-  Enter thread, Esc back, / a command (colorpalette, find, search, leave),
+  Enter thread, Esc back, / a command (Tab completes: colorpalette, find,
+  search, leave, mute, unmute, cache),
   d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
-  i view a message's images, I inline thumbnails on/off, C highlight cached,
+  i view a message's images, I inline thumbnails on/off,
   m mark read, M mark unread from the cursor, H the key guide,
   Esc in the list closes the conversation
 
@@ -109,8 +111,9 @@ and `a` still archives a new conversation into the root. Writes to Slack:
 m and M move your own read marker; c composes a message, Enter sends it;
 e toggles your reaction on the selected message; /leave leaves a channel.
 /cache start archives a conversation; /cache stop pauses its hourly refresh;
-/cache wipe deletes its archive; /mute and /unmute keep a conversation at the
-end of the list, on top of the channels muted in Slack itself.
+/cache wipe deletes its archive; /cache highlight on|off colors the cached
+conversations in the list; /mute and /unmute keep a conversation at the end of
+the list, on top of the channels muted in Slack itself.
 
 exit codes
   0  ok        1  no archive, or the conversation was not found

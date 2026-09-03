@@ -9,6 +9,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, ImageState, Mode, PromptKind, Sort, View};
+use crate::complete;
 use crate::palette::{Palette, Role, ROLES};
 use crate::render::{self, Ctx};
 use ratatui_image::{Image, StatefulImage};
@@ -24,6 +25,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_convs(frame, app, left);
     draw_msgs(frame, app, right);
     draw_status(frame, app, status);
+    draw_suggestions(frame, app, main);
     if app.help {
         draw_help(frame, area, &app.palette);
     }
@@ -127,12 +129,18 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let list = List::new(items).block(block);
-    let mut state = ListState::default().with_selected(if app.filtered.is_empty() {
-        None
-    } else {
-        Some(app.conv_cursor)
-    });
+    // The offset carries over from the last frame: rebuilt at zero, ratatui
+    // would rescroll to the minimum that shows the cursor, pinning it to the
+    // bottom row and moving the whole pane on every step upward.
+    let mut state = ListState::default()
+        .with_offset(app.conv_offset.min(app.filtered.len().saturating_sub(1)))
+        .with_selected(if app.filtered.is_empty() {
+            None
+        } else {
+            Some(app.conv_cursor)
+        });
     frame.render_stateful_widget(list, area, &mut state);
+    app.conv_offset = state.offset();
 }
 
 fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -510,6 +518,67 @@ fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
     }
 }
 
+/// The commands, cache operations or conversation names the open command
+/// line can still become, above the prompt.
+fn draw_suggestions(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::Prompt {
+        kind: PromptKind::Command,
+        buf,
+        ..
+    } = &app.mode
+    else {
+        return;
+    };
+    let found = complete::complete(&buf.text, &app.conv_names());
+    if found.items.is_empty() || area.height < 4 {
+        return;
+    }
+    let room = (area.height as usize).saturating_sub(3).min(8);
+    let more = found.items.len().saturating_sub(room);
+    let shown = &found.items[..room.min(found.items.len())];
+    let column = shown.iter().map(|i| i.text.width()).max().unwrap_or(0);
+    let mut lines: Vec<Line> = shown
+        .iter()
+        .map(|i| {
+            let mut spans = vec![Span::styled(
+                i.text.clone(),
+                Style::new().fg(app.palette.get(Role::Accent)),
+            )];
+            if !i.help.is_empty() {
+                spans.push(Span::styled(
+                    format!("{} {}", " ".repeat(column - i.text.width()), i.help),
+                    Style::new().add_modifier(Modifier::DIM),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    if more > 0 {
+        lines.push(Line::styled(
+            format!("… {more} more"),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (widest + 2).min(area.width);
+    let h = lines.len() as u16 + 2;
+    let rect = Rect {
+        x: area.x,
+        y: area.bottom().saturating_sub(h),
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Tab ")
+                .border_style(border(true, &app.palette)),
+        ),
+        rect,
+    );
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dim = Style::new().add_modifier(Modifier::DIM);
     // One line: a prompt when one is open; else the clock, a running job,
@@ -584,7 +653,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "/",
-        "a command: colorpalette edits UI colors (h/l cycles, e types a name or #rrggbb, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name",
+        "a command, Tab completes it and its argument: colorpalette edits UI colors (h/l cycles, e types a name or #rrggbb, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
     ),
     (
         "o",
@@ -597,7 +666,6 @@ const HELP: &[(&str, &str)] = &[
         "the selected message's images, full pane; j/k between them",
     ),
     ("I", "inline image thumbnails on/off"),
-    ("C", "highlight cached conversations in the palette color on/off"),
     ("U", "unread conversations on top on/off"),
     (
         "c",
