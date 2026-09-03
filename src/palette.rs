@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use ratatui::style::Color;
 use serde_json::{Map, Value};
 
-pub const ROLE_COUNT: usize = 14;
+pub const ROLE_COUNT: usize = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Role {
+    Background,
     Accent,
     InactiveAccent,
     OwnUsername,
@@ -27,6 +28,7 @@ pub enum Role {
 }
 
 pub const ROLES: [Role; ROLE_COUNT] = [
+    Role::Background,
     Role::Accent,
     Role::InactiveAccent,
     Role::OwnUsername,
@@ -46,6 +48,7 @@ pub const ROLES: [Role; ROLE_COUNT] = [
 impl Role {
     pub fn label(self) -> &'static str {
         match self {
+            Role::Background => "background",
             Role::Accent => "accent / focus",
             Role::InactiveAccent => "inactive focus",
             Role::OwnUsername => "my username",
@@ -65,6 +68,7 @@ impl Role {
 
     fn key(self) -> &'static str {
         match self {
+            Role::Background => "background",
             Role::Accent => "accent",
             Role::InactiveAccent => "inactive_accent",
             Role::OwnUsername => "own_username",
@@ -84,6 +88,8 @@ impl Role {
 
     pub fn default_color(self) -> Color {
         match self {
+            // The terminal's own background, until a palette paints one.
+            Role::Background => Color::Reset,
             Role::Accent | Role::Mention => Color::Cyan,
             Role::InactiveAccent => Color::DarkGray,
             Role::OwnUsername => Color::LightMagenta,
@@ -118,6 +124,49 @@ pub const COLORS: [(&str, Color); 16] = [
     ("light cyan", Color::LightCyan),
 ];
 
+/// A named set of colors, applied over the defaults.
+pub struct Preset {
+    pub name: &'static str,
+    pub help: &'static str,
+    pub colors: &'static [(Role, Color)],
+}
+
+const VINTAGE_TERRACOTTA: Color = Color::Rgb(0xaa, 0x59, 0x53);
+const VINTAGE_AMBER: Color = Color::Rgb(0xd3, 0x9b, 0x49);
+const VINTAGE_SAND: Color = Color::Rgb(0xe9, 0xd9, 0x9f);
+const VINTAGE_OLIVE: Color = Color::Rgb(0x82, 0x83, 0x69);
+const VINTAGE_SLATE: Color = Color::Rgb(0x4b, 0x63, 0x69);
+const VINTAGE_BLACK: Color = Color::Rgb(0x16, 0x16, 0x16);
+
+pub const PRESETS: &[Preset] = &[
+    Preset {
+        name: "default",
+        help: "the sixteen terminal colors, on the terminal's own background",
+        colors: &[],
+    },
+    Preset {
+        name: "vintage",
+        help: "terracotta, amber, sand, olive and slate on jet black",
+        colors: &[
+            (Role::Background, VINTAGE_BLACK),
+            (Role::Accent, VINTAGE_AMBER),
+            (Role::InactiveAccent, VINTAGE_SLATE),
+            (Role::OwnUsername, VINTAGE_TERRACOTTA),
+            (Role::OtherUsername, VINTAGE_OLIVE),
+            (Role::Unread, VINTAGE_SAND),
+            (Role::Cached, VINTAGE_OLIVE),
+            (Role::Mention, VINTAGE_AMBER),
+            (Role::Link, VINTAGE_SLATE),
+            (Role::Code, VINTAGE_SAND),
+            (Role::ThreadInfo, VINTAGE_OLIVE),
+            (Role::Status, VINTAGE_AMBER),
+            (Role::SelectionText, VINTAGE_BLACK),
+            (Role::SelectionBackground, VINTAGE_SAND),
+            (Role::InactiveSelectionBackground, VINTAGE_OLIVE),
+        ],
+    },
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Palette {
     colors: [Color; ROLE_COUNT],
@@ -134,6 +183,17 @@ impl Default for Palette {
 }
 
 impl Palette {
+    /// The palette a preset names, or None when no preset has that name.
+    pub fn preset(name: &str) -> Option<Palette> {
+        let wanted = name.trim().to_lowercase();
+        let preset = PRESETS.iter().find(|p| p.name == wanted)?;
+        let mut palette = Palette::default();
+        for (role, color) in preset.colors {
+            palette.set(*role, *color);
+        }
+        Some(palette)
+    }
+
     pub fn get(&self, role: Role) -> Color {
         self.colors[role as usize]
     }
@@ -221,6 +281,9 @@ impl Palette {
 }
 
 pub fn color_name(color: Color) -> String {
+    if color == Color::Reset {
+        return TERMINAL_DEFAULT.to_string();
+    }
     if let Some(name) = COLORS
         .iter()
         .find_map(|(name, value)| (*value == color).then_some(*name))
@@ -233,7 +296,11 @@ pub fn color_name(color: Color) -> String {
     }
 }
 
-/// A color name, or `#rgb` / `#rrggbb`.
+/// The name of the terminal's own color, which `d` puts back under the
+/// background role and which no palette file may lose.
+pub const TERMINAL_DEFAULT: &str = "terminal";
+
+/// A color name, `terminal`, or `#rgb` / `#rrggbb`.
 pub fn parse_color(name: &str) -> Option<Color> {
     let text = name.trim();
     if let Some(hex) = text.strip_prefix('#') {
@@ -252,6 +319,9 @@ pub fn parse_color(name: &str) -> Option<Color> {
         };
     }
     let normalized = text.to_lowercase().replace(['-', '_'], " ");
+    if normalized == TERMINAL_DEFAULT {
+        return Some(Color::Reset);
+    }
     COLORS
         .iter()
         .find_map(|(known, color)| (*known == normalized).then_some(*color))
@@ -305,12 +375,33 @@ mod tests {
         assert_eq!(parse_color("#gg0000"), None);
         assert_eq!(color_name(Color::Rgb(255, 136, 0)), "#ff8800");
         assert_eq!(color_name(Color::LightBlue), "light blue");
+        assert_eq!(color_name(Color::Reset), "terminal");
+        assert_eq!(parse_color("Terminal"), Some(Color::Reset));
 
         let path = temporary_file("hex");
         let mut palette = Palette::default();
         palette.set(Role::OwnUsername, Color::Rgb(1, 2, 3));
         palette.save(Some(&path)).unwrap();
         assert_eq!(Palette::load(Some(&path)).unwrap(), palette);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn the_vintage_preset_paints_every_role() {
+        let vintage = Palette::preset("Vintage ").expect("a preset named vintage");
+        assert_eq!(vintage.get(Role::Background), VINTAGE_BLACK);
+        assert_eq!(vintage.get(Role::Accent), VINTAGE_AMBER);
+        assert_ne!(vintage, Palette::default());
+        for role in ROLES {
+            assert_ne!(vintage.get(role), Color::Reset, "{}", role.label());
+        }
+        assert_eq!(Palette::preset("default"), Some(Palette::default()));
+        assert_eq!(Palette::preset("sepia"), None);
+
+        // A preset survives the round trip through the file.
+        let path = temporary_file("preset");
+        vintage.save(Some(&path)).unwrap();
+        assert_eq!(Palette::load(Some(&path)).unwrap(), vintage);
         std::fs::remove_file(path).unwrap();
     }
 

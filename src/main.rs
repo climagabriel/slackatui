@@ -78,7 +78,8 @@ environment
                        (default /var/lock/slackdump-sync.lock)
   SLACK_TUI_CACHE      where fetched threads live
                        (default $XDG_CACHE_HOME/slack-tui/live, i.e. ~/.cache/...)
-  SLACK_TUI_PALETTE    where /colorpalette saves UI colors (default
+  SLACK_TUI_PALETTE    where /colorpalette saves UI colors, the vintage
+                       palette included (default
                        $XDG_CONFIG_HOME/slack-tui/palette.json, or ~/.config/...)
   SLACKDUMPS           archive root when --root is not given
   SLACK_SELF_USER_ID   your own user id: names direct messages by the other
@@ -112,7 +113,9 @@ m and M move your own read marker; c composes a message, Enter sends it;
 e toggles your reaction on the selected message; /leave leaves a channel.
 /cache start archives a conversation; /cache stop pauses its hourly refresh;
 /cache wipe deletes its archive; /cache highlight on|off colors the cached
-conversations in the list; /mute and /unmute keep a conversation at the end of
+conversations in the list; /colorpalette vintage opens the editor over the
+vintage palette (terracotta, amber, sand, olive and slate on jet black), and
+/colorpalette default over the terminal's own sixteen colors; /mute and /unmute keep a conversation at the end of
 the list, on top of the channels muted in Slack itself.
 
 exit codes

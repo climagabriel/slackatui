@@ -2,7 +2,7 @@
 //! status lines below, a help overlay on demand.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -16,6 +16,11 @@ use ratatui_image::{Image, StatefulImage};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    // Painted first: widgets that set no background of their own keep it.
+    let background = app.palette.get(Role::Background);
+    if background != Color::Reset {
+        frame.render_widget(Block::default().style(Style::new().bg(background)), area);
+    }
     let rows = app.prompt_rows();
     let [main, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(rows)]).areas(area);
@@ -28,6 +33,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_suggestions(frame, app, main);
     if app.help {
         draw_help(frame, area, &app.palette);
+    }
+}
+
+/// The palette's background, or nothing when the terminal keeps its own.
+fn background_style(palette: &Palette) -> Style {
+    match palette.get(Role::Background) {
+        Color::Reset => Style::new(),
+        color => Style::new().bg(color),
     }
 }
 
@@ -570,11 +583,13 @@ fn draw_suggestions(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .title(" Tab ")
-                .border_style(border(true, &app.palette)),
-        ),
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .title(" Tab ")
+                    .border_style(border(true, &app.palette)),
+            )
+            .style(background_style(&app.palette)),
         rect,
     );
 }
@@ -653,7 +668,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "/",
-        "a command, Tab completes it and its argument: colorpalette edits UI colors (h/l cycles, e types a name or #rrggbb, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
+        "a command, Tab completes it and its argument: colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
     ),
     (
         "o",
@@ -740,7 +755,12 @@ fn draw_help(frame: &mut Frame, area: Rect, palette: &Palette) {
     let block = Block::bordered()
         .title(" keys ")
         .border_style(Style::new().fg(palette.get(Role::Accent)));
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), rect);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(background_style(palette)),
+        rect,
+    );
 }
 
 pub fn human_count(n: i64) -> String {

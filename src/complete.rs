@@ -44,8 +44,8 @@ pub const COMMANDS: &[Cmd] = &[
     },
     Cmd {
         name: "colorpalette",
-        args: "",
-        help: "edit and persist the UI colors",
+        args: "[name]",
+        help: "edit and persist the UI colors, from a named palette when given",
     },
 ];
 
@@ -115,6 +115,15 @@ pub fn complete(line: &str, convs: &[String]) -> Completion {
                 help: help.to_string(),
             })
             .collect(),
+        (1, Some(w)) if matches!(w.as_str(), "colorpalette" | "palette" | "colors") => {
+            crate::palette::PRESETS
+                .iter()
+                .map(|p| Item {
+                    text: p.name.to_string(),
+                    help: p.help.to_string(),
+                })
+                .collect()
+        }
         (1, Some(w)) if matches!(w.as_str(), "leave" | "mute" | "unmute") => conv_items(convs),
         (2, Some(w)) if w == "cache" && words.get(1) == Some(&"highlight") => HIGHLIGHT_ARGS
             .iter()
@@ -277,6 +286,14 @@ mod tests {
         assert_eq!(
             apply("/cache highlight o", &convs()).as_deref(),
             Some("/cache highlight on")
+        );
+    }
+
+    #[test]
+    fn the_named_palettes_complete() {
+        assert_eq!(
+            apply("/colorpalette v", &convs()).as_deref(),
+            Some("/colorpalette vintage")
         );
     }
 

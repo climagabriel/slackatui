@@ -16,6 +16,7 @@ use crate::archive::{ts_to_id, Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CA
 use crate::complete;
 use crate::edit::Editor;
 use crate::live::{self, Done, Job, JobKind};
+use crate::palette::PRESETS;
 use crate::palette::{Palette, Role, ROLES};
 use crate::render::{self, Ctx, ImageSlot, Tz};
 use image::DynamicImage;
@@ -653,14 +654,32 @@ impl App {
                 self.restore_filter(filter_before);
                 self.mute_cmd(on, &name);
             }
-            Some(Command::ColorPalette) => {
+            Some(Command::ColorPalette(preset)) => {
                 self.restore_filter(filter_before);
-                self.open_color_palette();
+                self.open_color_palette(&preset);
             }
         }
     }
 
-    fn open_color_palette(&mut self) {
+    /// `/colorpalette [name]`: the editor, over a named palette when one is
+    /// given. Esc puts back the colors it opened with.
+    fn open_color_palette(&mut self, preset: &str) {
+        let applied = if preset.trim().is_empty() {
+            None
+        } else {
+            match Palette::preset(preset) {
+                Some(palette) => Some(palette),
+                None => {
+                    let names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+                    self.status = format!(
+                        "no palette named {}; the palettes are {}",
+                        preset.trim(),
+                        names.join(", ")
+                    );
+                    return;
+                }
+            }
+        };
         let return_focus = self.focus;
         self.stack.push(View::ColorPalette {
             cursor: 0,
@@ -668,9 +687,19 @@ impl App {
             return_focus,
         });
         self.focus = Focus::Msgs;
-        self.status =
-            "j/k a role; h/l a color; e types one (name or #rrggbb); d resets it, D resets all; Enter saves; Esc cancels"
-                .to_string();
+        let status = match applied {
+            Some(palette) => {
+                self.palette = palette;
+                self.mark_all_dirty();
+                format!(
+                    "{} applied; Enter saves it, Esc puts the old colors back",
+                    preset.trim().to_lowercase()
+                )
+            }
+            None => "j/k a role; h/l a color; e types one (name or #rrggbb); d resets it, D resets all; Enter saves; Esc cancels"
+                .to_string(),
+        };
+        self.status = status;
     }
 
     /// `e` in the palette: a color typed as a name or as `#rrggbb`.
@@ -3437,8 +3466,9 @@ enum Command {
     Cache(String, String),
     /// `mute [#name]` (true) and `unmute [#name]` (false).
     Mute(bool, String),
-    /// `colorpalette`: edit and persist the semantic UI colors.
-    ColorPalette,
+    /// `colorpalette [name]`: edit and persist the semantic UI colors,
+    /// starting from a named palette when one is given.
+    ColorPalette(String),
 }
 
 /// `find x`, `search x`, `leave`, `leave #name`; a leading slash is ignored.
@@ -3453,7 +3483,7 @@ fn parse_command(line: &str) -> Option<Command> {
         "leave" => Some(Command::Leave(rest.to_string())),
         "mute" => Some(Command::Mute(true, rest.to_string())),
         "unmute" => Some(Command::Mute(false, rest.to_string())),
-        "colorpalette" | "palette" | "colors" if rest.is_empty() => Some(Command::ColorPalette),
+        "colorpalette" | "palette" | "colors" => Some(Command::ColorPalette(rest.to_string())),
         "cache" => {
             let (op, name) = match rest.split_once(char::is_whitespace) {
                 Some((o, n)) => (o, n.trim()),
@@ -3614,9 +3644,18 @@ mod tests {
             parse_command("unmute"),
             Some(Command::Mute(false, String::new()))
         );
-        assert_eq!(parse_command("/colorpalette"), Some(Command::ColorPalette));
-        assert_eq!(parse_command("colors"), Some(Command::ColorPalette));
-        assert_eq!(parse_command("colorpalette extra"), None);
+        assert_eq!(
+            parse_command("/colorpalette"),
+            Some(Command::ColorPalette(String::new()))
+        );
+        assert_eq!(
+            parse_command("colors"),
+            Some(Command::ColorPalette(String::new()))
+        );
+        assert_eq!(
+            parse_command("colorpalette vintage"),
+            Some(Command::ColorPalette("vintage".into()))
+        );
         assert_eq!(parse_command(""), None);
     }
 
