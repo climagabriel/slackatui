@@ -57,6 +57,8 @@ flags
                   or iTerm2 protocol, half-blocks when it has none. halfblocks:
                   no query. Under tmux or screen the query's responses can eat
                   the first key, so there it runs only when asked for.
+  --call 'METHOD k=v ...'
+                  one Web API call with the signed-in session, JSON out (debug)
   --delete-message URL
                   delete your own message at that permalink (debug)
   --fetch-file URL OUT
@@ -133,6 +135,7 @@ struct Opts {
     image_protocol: Option<bool>,
     fetch_file: Option<(String, String)>,
     delete_message: Option<String>,
+    call: Option<String>,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -154,6 +157,7 @@ fn parse_args() -> Result<Opts, String> {
         image_protocol: None,
         fetch_file: None,
         delete_message: None,
+        call: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -196,6 +200,9 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--delete-message" => {
                 opts.delete_message = Some(value("--delete-message")?);
+            }
+            "--call" => {
+                opts.call = Some(value("--call")?);
             }
             "--poll" => {
                 opts.poll = value("--poll")?
@@ -287,7 +294,11 @@ fn run() -> i32 {
             return 1;
         }
     };
-    if opts.auth_check || opts.fetch_file.is_some() || opts.delete_message.is_some() {
+    if opts.auth_check
+        || opts.fetch_file.is_some()
+        || opts.delete_message.is_some()
+        || opts.call.is_some()
+    {
         let scratch = std::env::temp_dir().join("slack-tui");
         let agent = api::agent();
         let auth = match auth::from_env() {
@@ -300,7 +311,35 @@ fn run() -> i32 {
                 }
             },
         };
-        println!("credentials: {}", auth.source);
+        eprintln!("credentials: {}", auth.source);
+        if let Some(spec) = &opts.call {
+            let mut words = spec.split_whitespace();
+            let Some(method) = words.next() else {
+                eprintln!("slack-tui: --call needs a method name");
+                return 2;
+            };
+            let params: Vec<(String, String)> = words
+                .filter_map(|w| {
+                    w.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect();
+            let refs: Vec<(&str, &str)> = params
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let client = api::Client::new(auth);
+            return match client.call(method, &refs) {
+                Ok(v) => {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("slack-tui: {e}");
+                    1
+                }
+            };
+        }
         if let Some(link) = &opts.delete_message {
             let Some((cid, ts)) = api::parse_permalink(link) else {
                 eprintln!("slack-tui: not a message permalink: {link}");
