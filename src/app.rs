@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::api::Client;
 use crate::archive::{ts_to_id, Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
+use crate::edit::Editor;
 use crate::live::{self, Done, Job, JobKind};
 use crate::render::{self, Ctx, ImageSlot, Tz};
 use image::DynamicImage;
@@ -303,6 +304,14 @@ pub enum View {
     },
     /// Roots of the threads the owner wrote in, across every archive.
     Threads { list: MsgList },
+    /// The reaction picker: a searchable emoji list over the messages pane.
+    Emoji {
+        target: ReactTarget,
+        query: Editor,
+        cursor: usize,
+        /// Indices into the emoji table that match the query.
+        matches: Vec<usize>,
+    },
     /// One message's images, full pane, one at a time.
     Image {
         files: Vec<crate::archive::FileInfo>,
@@ -326,19 +335,18 @@ pub enum ImageState {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PromptKind {
-    Filter,
-    Search,
+    /// `/`: `find`/`search TEXT` or `leave [#name]`.
+    Command,
     Date,
     Archive,
     Compose,
-    React,
 }
 
 pub enum Mode {
     Normal,
     Prompt {
         kind: PromptKind,
-        buf: String,
+        buf: Editor,
         previous: String,
     },
 }
@@ -394,8 +402,13 @@ pub struct App {
     pub unreads_first: bool,
     /// The target of the open compose prompt.
     pub compose: Option<Compose>,
-    /// The target of the open reaction prompt.
+    /// The target of a reaction being sent.
     pub react: Option<ReactTarget>,
+    /// (name, glyph) for the picker: Unicode emoji, then the workspace's custom ones as `:name:`.
+    pub emoji_table: Vec<(String, String)>,
+    /// Muted conversation ids, from `<cache>/muted.json`.
+    pub muted: HashSet<String>,
+    pub muted_loaded: bool,
     /// A message typed and not sent: Esc keeps it for the next `c` on the
     /// same target, so it cannot go to another conversation by reflex.
     pub draft: Option<Draft>,
@@ -451,6 +464,9 @@ impl App {
             unreads_first: true,
             compose: None,
             react: None,
+            emoji_table: Vec::new(),
+            muted: HashSet::new(),
+            muted_loaded: false,
             draft: None,
             counts_gen: 0,
         };
@@ -520,7 +536,7 @@ impl App {
                     label: format!("reply in {who}'s thread in {name}"),
                 })
             }
-            Some(View::Raw { .. }) | Some(View::Image { .. }) => {
+            Some(View::Raw { .. }) | Some(View::Image { .. }) | Some(View::Emoji { .. }) => {
                 Err("close this view first".to_string())
             }
             None => {
@@ -542,6 +558,254 @@ impl App {
         }
     }
 
+    /// `/`: an empty command prompt; `find` alone clears the list filter.
+    fn open_command(&mut self) {
+        self.mode = Mode::Prompt {
+            kind: PromptKind::Command,
+            buf: Editor::default(),
+            previous: self.filter.clone(),
+        };
+    }
+
+    /// The list follows a `find`/`search` command as it is typed.
+    fn filter_live(&mut self, line: &str) {
+        if self.focus != Focus::Convs {
+            return;
+        }
+        if let Some(Command::Find(text)) = parse_command(line) {
+            self.filter = text;
+            self.apply_filter();
+        }
+    }
+
+    /// Enter in the command prompt.
+    fn run_command(&mut self, line: &str, filter_before: &str) {
+        match parse_command(line) {
+            None => {
+                if self.focus == Focus::Convs {
+                    self.filter = filter_before.to_string();
+                    self.apply_filter();
+                }
+                if !line.trim().is_empty() {
+                    self.status = format!(
+                        "unknown command: {}; commands: find|search TEXT, leave, mute, unmute, cache start|stop|wipe, each with an optional #name",
+                        line.split_whitespace().next().unwrap_or("")
+                    );
+                }
+            }
+            Some(Command::Find(text)) => {
+                if self.focus == Focus::Convs {
+                    self.filter = text;
+                    self.apply_filter();
+                } else if text.is_empty() {
+                    self.status = "search what?".to_string();
+                } else {
+                    self.run_search(&text);
+                }
+            }
+            Some(Command::Leave(name)) => {
+                self.restore_filter(filter_before);
+                self.leave_conv(&name);
+            }
+            Some(Command::Cache(op, name)) => {
+                self.restore_filter(filter_before);
+                self.cache_cmd(&op, &name);
+            }
+            Some(Command::Mute(on, name)) => {
+                self.restore_filter(filter_before);
+                self.mute_cmd(on, &name);
+            }
+        }
+    }
+
+    fn restore_filter(&mut self, before: &str) {
+        if self.focus == Focus::Convs && self.filter != before {
+            self.filter = before.to_string();
+            self.apply_filter();
+        }
+    }
+
+    /// The conversation a command acts on: the named one, else the open
+    /// one, else the highlighted one.
+    fn target_conv(&self, name: &str) -> Result<usize, String> {
+        if !name.is_empty() {
+            return self
+                .corpus
+                .conv_by_name(name)
+                .ok_or_else(|| format!("no conversation named {name}"));
+        }
+        match (self.focus, self.open.as_ref()) {
+            (Focus::Msgs, Some(o)) => Ok(o.conv),
+            _ => self
+                .filtered
+                .get(self.conv_cursor)
+                .copied()
+                .ok_or_else(|| "nothing highlighted".to_string()),
+        }
+    }
+
+    /// `/leave [#name]`. A direct message has no membership to give up.
+    fn leave_conv(&mut self, name: &str) {
+        let Some(c) = self.api.clone() else {
+            self.status = "leaving needs the Slack sign-in".to_string();
+            return;
+        };
+        let idx = match self.target_conv(name) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let conv = &self.corpus.convs[idx];
+        if conv.kind == Kind::Im {
+            self.status = format!("{} is a direct message; nothing to leave", conv.name);
+            return;
+        }
+        if conv.left {
+            self.status = format!("{} was already left", conv.name);
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "a fetch is already running; try again in a moment".to_string();
+            return;
+        }
+        self.job = Some(live::api_leave(c, idx, conv.id.clone()));
+    }
+
+    /// The archive directory behind a conversation, and whether other
+    /// conversations share it (the multi-channel archive).
+    fn archive_dir(&self, idx: usize) -> Option<(PathBuf, bool)> {
+        let c = &self.corpus.convs[idx];
+        if c.live_only {
+            return None;
+        }
+        let shared = self
+            .corpus
+            .convs
+            .iter()
+            .filter(|x| !x.live_only && x.archive == c.archive)
+            .count()
+            > 1;
+        Some((self.corpus.archives[c.archive].dir.clone(), shared))
+    }
+
+    /// `/cache start|stop|wipe [#name]`: archive a conversation, pause its
+    /// hourly refresh with a `.paused` marker the refresh script honours,
+    /// or delete its archive.
+    fn cache_cmd(&mut self, op: &str, name: &str) {
+        let idx = match self.target_conv(name) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let cname = self.corpus.convs[idx].name.clone();
+        match (op, self.archive_dir(idx)) {
+            ("start", None) => {
+                let id = self.corpus.convs[idx].id.clone();
+                self.archive_new(&id);
+            }
+            ("start", Some((dir, _))) => {
+                let marker = dir.join(".paused");
+                if marker.exists() {
+                    self.status = match std::fs::remove_file(&marker) {
+                        Ok(()) => format!("{cname}: hourly refresh resumed"),
+                        Err(e) => format!("{cname}: {e}"),
+                    };
+                } else {
+                    self.status = format!("{cname} is cached and refreshed hourly already");
+                }
+            }
+            ("stop", None) | ("wipe", None) => self.status = format!("{cname} is not cached"),
+            (_, Some((_, true))) => {
+                self.status = format!(
+                    "{cname} lives in the shared multi-channel archive; stop and wipe apply to a conversation with its own archive"
+                );
+            }
+            ("stop", Some((dir, false))) => {
+                self.status =
+                    match std::fs::write(dir.join(".paused"), b"paused by slack-tui /cache stop\n")
+                    {
+                        Ok(()) => {
+                            format!("{cname}: hourly refresh paused; the archive stays readable")
+                        }
+                        Err(e) => format!("{cname}: {e}"),
+                    };
+            }
+            ("wipe", Some((dir, false))) => {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    self.status = format!("{cname}: {e}");
+                    return;
+                }
+                if self.open.as_ref().map(|o| o.conv) == Some(idx) {
+                    self.open = None;
+                    self.stack.clear();
+                }
+                let c = &mut self.corpus.convs[idx];
+                c.live_only = true;
+                c.msgs = 0;
+                self.apply_filter();
+                self.mark_all_dirty();
+                self.status = format!("{cname}: archive deleted; it is live-only now");
+            }
+            _ => {}
+        }
+    }
+
+    /// The muted set follows `<cache>/muted.json`; the flags on the
+    /// conversations follow the set, so merged-in conversations get theirs.
+    fn sync_muted(&mut self) {
+        if !self.muted_loaded {
+            self.muted_loaded = true;
+            if let Some(ids) = std::fs::read_to_string(self.cache_dir.join("muted.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+            {
+                self.muted = ids.into_iter().collect();
+            }
+        }
+        for c in self.corpus.convs.iter_mut() {
+            c.muted = self.muted.contains(&c.id);
+        }
+    }
+
+    /// `/mute [#name]` and `/unmute [#name]`: never, or again, shown as unread.
+    fn mute_cmd(&mut self, on: bool, name: &str) {
+        let idx = match self.target_conv(name) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let (id, cname) = {
+            let c = &self.corpus.convs[idx];
+            (c.id.clone(), c.name.clone())
+        };
+        if on {
+            self.muted.insert(id);
+        } else {
+            self.muted.remove(&id);
+        }
+        let mut ids: Vec<&String> = self.muted.iter().collect();
+        ids.sort();
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+        let saved = serde_json::to_string(&ids)
+            .map_err(|e| e.to_string())
+            .and_then(|t| {
+                std::fs::write(self.cache_dir.join("muted.json"), t).map_err(|e| e.to_string())
+            });
+        self.status = match saved {
+            Ok(()) if on => format!("{cname} muted: never shown as unread"),
+            Ok(()) => format!("{cname} unmuted"),
+            Err(e) => format!("{cname}: {e}"),
+        };
+        self.apply_filter();
+        self.mark_all_dirty();
+    }
+
     /// Every message list on screen: the open timeline and the stacked views.
     fn lists_mut(&mut self) -> Vec<&mut MsgList> {
         let mut out: Vec<&mut MsgList> = Vec::new();
@@ -559,7 +823,7 @@ impl App {
         out
     }
 
-    /// `e`: a reaction prompt for the selected message.
+    /// `e`: the reaction picker for the selected message.
     fn react(&mut self) {
         if self.api.is_none() {
             self.status = "reacting needs the Slack sign-in".to_string();
@@ -574,18 +838,139 @@ impl App {
             .as_deref()
             .and_then(|u| self.corpus.user_name(u))
             .unwrap_or_else(|| "?".to_string());
-        self.react = Some(ReactTarget {
+        let target = ReactTarget {
             cid: m.channel_id.clone(),
             id: m.id,
-            label: format!(
-                "react to {who}'s message (name, :name: or the emoji; yours again removes it)"
-            ),
-        });
-        self.mode = Mode::Prompt {
-            kind: PromptKind::React,
-            buf: String::new(),
-            previous: String::new(),
+            label: format!("react to {who}'s message"),
         };
+        self.build_emoji_table();
+        let matches = (0..self.emoji_table.len()).collect();
+        self.stack.push(View::Emoji {
+            target,
+            query: Editor::default(),
+            cursor: 0,
+            matches,
+        });
+    }
+
+    /// Unicode emoji from the `emojis` crate, then the workspace's custom
+    /// names from the cache file; the file is fetched once when missing.
+    fn build_emoji_table(&mut self) {
+        if !self.emoji_table.is_empty() {
+            return;
+        }
+        for e in emojis::iter() {
+            if let Some(sc) = e.shortcode() {
+                self.emoji_table
+                    .push((sc.to_string(), e.as_str().to_string()));
+            }
+        }
+        let path = self.cache_dir.join("emoji.json");
+        match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+        {
+            Some(names) => self.add_custom_emoji(names),
+            None => {
+                if let (Some(c), true) = (self.api.clone(), self.bg.is_none()) {
+                    self.bg = Some(live::api_emoji_list(c));
+                }
+            }
+        }
+    }
+
+    fn add_custom_emoji(&mut self, names: Vec<String>) {
+        let known: HashSet<String> = self.emoji_table.iter().map(|(n, _)| n.clone()).collect();
+        let mut names: Vec<String> = names.into_iter().filter(|n| !known.contains(n)).collect();
+        names.sort();
+        for n in names {
+            let glyph = format!(":{n}:");
+            self.emoji_table.push((n, glyph));
+        }
+        self.emoji_filter();
+    }
+
+    /// The picker's matches for its query: names starting with it first,
+    /// then names containing it, table order within each group.
+    fn emoji_filter(&mut self) {
+        let table = &self.emoji_table;
+        let Some(View::Emoji {
+            query,
+            cursor,
+            matches,
+            ..
+        }) = self.stack.last_mut()
+        else {
+            return;
+        };
+        let q = query.text.trim().trim_matches(':').to_lowercase();
+        if q.is_empty() {
+            *matches = (0..table.len()).collect();
+        } else {
+            let mut starts = Vec::new();
+            let mut contains = Vec::new();
+            for (i, (name, _)) in table.iter().enumerate() {
+                if name.starts_with(&q) {
+                    starts.push(i);
+                } else if name.contains(&q) {
+                    contains.push(i);
+                }
+            }
+            starts.extend(contains);
+            *matches = starts;
+        }
+        *cursor = 0;
+    }
+
+    fn on_emoji_key(&mut self, k: KeyEvent, ctrl: bool) {
+        let table_len = self.emoji_table.len();
+        let Some(View::Emoji {
+            query,
+            cursor,
+            matches,
+            ..
+        }) = self.stack.last_mut()
+        else {
+            return;
+        };
+        match (k.code, ctrl) {
+            (KeyCode::Char('c'), true) => self.quit = true,
+            (KeyCode::Esc, _) => {
+                self.stack.pop();
+            }
+            (KeyCode::Enter, _) => {
+                let picked_index = matches.get(*cursor).copied().filter(|&i| i < table_len);
+                let typed = query.text.trim().trim_matches(':').to_string();
+                let Some(View::Emoji { target, .. }) = self.stack.pop() else {
+                    return;
+                };
+                let picked = match picked_index {
+                    Some(i) => self.emoji_table[i].0.clone(),
+                    None => typed,
+                };
+                if picked.is_empty() {
+                    self.status = "no reaction picked".to_string();
+                    return;
+                }
+                self.react = Some(target);
+                self.send_reaction(&picked);
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('p'), true) => {
+                *cursor = cursor.saturating_sub(1);
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('n'), true) => {
+                if *cursor + 1 < matches.len() {
+                    *cursor += 1;
+                }
+            }
+            (KeyCode::PageUp, _) => *cursor = cursor.saturating_sub(10),
+            (KeyCode::PageDown, _) => *cursor = (*cursor + 10).min(matches.len().saturating_sub(1)),
+            _ => {
+                if query.key(k, false) {
+                    self.emoji_filter();
+                }
+            }
+        }
     }
 
     /// Enter in the reaction prompt: add the reaction, or remove it when it
@@ -632,7 +1017,7 @@ impl App {
                 self.compose = Some(t);
                 self.mode = Mode::Prompt {
                     kind: PromptKind::Compose,
-                    buf,
+                    buf: Editor::with(buf),
                     previous: String::new(),
                 };
             }
@@ -711,6 +1096,7 @@ impl App {
     }
 
     pub fn apply_filter(&mut self) {
+        self.sync_muted();
         let needle = self.filter.trim_start_matches(['#', '@']).to_lowercase();
         // Substring first, then the characters in order anywhere in the name.
         let rank = |name: &str| -> Option<u8> {
@@ -764,9 +1150,10 @@ impl App {
             Sort::Size => idx.sort_by(|&a, &b| convs[b].msgs.cmp(&convs[a].msgs)),
         }
         // Unread conversations first, in the same order among themselves;
-        // a typed filter still puts the closer name matches above.
+        // a typed filter still puts the closer name matches above. A muted
+        // conversation never counts as unread here.
         if self.unreads_first {
-            idx.sort_by_key(|&i| !convs[i].unread);
+            idx.sort_by_key(|&i| !convs[i].unread || convs[i].muted);
         }
         if !needle.is_empty() {
             idx.sort_by_key(|&i| rank(&convs[i].name).unwrap_or(2));
@@ -1479,6 +1866,8 @@ impl App {
                 first_id: created,
                 last_id: 0,
                 live_only: true,
+                left: false,
+                muted: false,
                 unread: false,
                 mentions: 0,
                 last_read: 0,
@@ -1853,7 +2242,7 @@ impl App {
             .unwrap_or_default();
         self.mode = Mode::Prompt {
             kind: PromptKind::Archive,
-            buf: prefill.clone(),
+            buf: Editor::with(prefill.clone()),
             previous: prefill,
         };
     }
@@ -2115,6 +2504,26 @@ impl App {
                     }
                 }
             }
+            (JobKind::EmojiList, Done::EmojiList(names)) => {
+                let path = self.cache_dir.join("emoji.json");
+                if let Ok(t) = serde_json::to_string(&names) {
+                    let _ = std::fs::create_dir_all(&self.cache_dir);
+                    let _ = std::fs::write(path, t);
+                }
+                if !self.emoji_table.is_empty() {
+                    self.add_custom_emoji(names);
+                }
+            }
+            (JobKind::Leave { conv }, Done::Left) => {
+                let c = &mut self.corpus.convs[conv];
+                c.left = true;
+                c.unread = false;
+                c.mentions = 0;
+                let name = c.name.clone();
+                self.apply_filter();
+                self.mark_all_dirty();
+                self.status = format!("left {name}");
+            }
             (JobKind::React { id, name, add }, Done::Reacted) => {
                 let me = self.corpus.me.clone().unwrap_or_default();
                 let mut touched = 0;
@@ -2178,12 +2587,12 @@ impl App {
     // ---------------------------------------------------------------- views
 
     pub fn active_list(&self) -> Option<&MsgList> {
-        match self
-            .stack
-            .iter()
-            .rev()
-            .find(|v| !matches!(v, View::Raw { .. } | View::Image { .. }))
-        {
+        match self.stack.iter().rev().find(|v| {
+            !matches!(
+                v,
+                View::Raw { .. } | View::Image { .. } | View::Emoji { .. }
+            )
+        }) {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
             | Some(View::Threads { list }) => Some(list),
@@ -2192,12 +2601,12 @@ impl App {
     }
 
     pub fn active_list_mut(&mut self) -> Option<&mut MsgList> {
-        match self
-            .stack
-            .iter_mut()
-            .rev()
-            .find(|v| !matches!(v, View::Raw { .. } | View::Image { .. }))
-        {
+        match self.stack.iter_mut().rev().find(|v| {
+            !matches!(
+                v,
+                View::Raw { .. } | View::Image { .. } | View::Emoji { .. }
+            )
+        }) {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
             | Some(View::Threads { list }) => Some(list),
@@ -2211,6 +2620,14 @@ impl App {
 
     pub fn selected(&self) -> Option<&Msg> {
         self.active_list().and_then(|l| l.selected())
+    }
+
+    /// Rows the bottom line needs: one, or the lines of an open prompt.
+    pub fn prompt_rows(&self) -> u16 {
+        match &self.mode {
+            Mode::Prompt { buf, .. } => (buf.text.matches('\n').count() as u16 + 1).min(8),
+            Mode::Normal => 1,
+        }
     }
 
     /// Title of the messages pane.
@@ -2235,6 +2652,13 @@ impl App {
                         .as_ref()
                         .map(|p| format!("{:?}", p.protocol_type()).to_lowercase())
                         .unwrap_or_default()
+                )
+            }
+            Some(View::Emoji { matches, .. }) => {
+                format!(
+                    "pick a reaction · {} matching · {}",
+                    matches.len(),
+                    conv.name
                 )
             }
             Some(View::Threads { list }) => format!(
@@ -2326,6 +2750,10 @@ impl App {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(View::Emoji { .. }) = self.stack.last() {
+            self.on_emoji_key(k, ctrl);
+            return;
+        }
         match (k.code, ctrl) {
             (KeyCode::Char('c'), true) | (KeyCode::Char('q'), false) => {
                 self.quit = true;
@@ -2449,13 +2877,7 @@ impl App {
                     self.focus = Focus::Msgs;
                 }
             }
-            (KeyCode::Char('/'), false) => {
-                self.mode = Mode::Prompt {
-                    kind: PromptKind::Filter,
-                    buf: self.filter.clone(),
-                    previous: self.filter.clone(),
-                };
-            }
+            (KeyCode::Char('/'), false) => self.open_command(),
             (KeyCode::Esc, _) => self.go_home(),
             (KeyCode::Char('a'), false) => self.prompt_archive(),
             (KeyCode::Char('T'), false) => self.open_my_threads(),
@@ -2580,17 +3002,11 @@ impl App {
                     }
                 }
             }
-            (KeyCode::Char('/'), false) => {
-                self.mode = Mode::Prompt {
-                    kind: PromptKind::Search,
-                    buf: String::new(),
-                    previous: String::new(),
-                };
-            }
+            (KeyCode::Char('/'), false) => self.open_command(),
             (KeyCode::Char('d'), false) => {
                 self.mode = Mode::Prompt {
                     kind: PromptKind::Date,
-                    buf: String::new(),
+                    buf: Editor::default(),
                     previous: String::new(),
                 };
             }
@@ -2646,8 +3062,8 @@ impl App {
         let kind = *kind;
         match k.code {
             KeyCode::Esc => {
-                let typed = buf.clone();
-                if kind == PromptKind::Filter {
+                let typed = buf.text.clone();
+                if kind == PromptKind::Command && self.focus == Focus::Convs {
                     self.filter = previous.clone();
                     self.mode = Mode::Normal;
                     self.apply_filter();
@@ -2659,36 +3075,62 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                let text = buf.clone();
+                let text = buf.text.clone();
+                let before = previous.clone();
                 self.mode = Mode::Normal;
                 match kind {
-                    PromptKind::Filter => {
-                        self.filter = text;
-                        self.apply_filter();
-                    }
-                    PromptKind::Search => self.run_search(&text),
+                    PromptKind::Command => self.run_command(&text, &before),
                     PromptKind::Date => self.goto_date(&text),
                     PromptKind::Archive => self.archive_new(&text),
                     PromptKind::Compose => self.send_message(text),
-                    PromptKind::React => self.send_reaction(&text),
                 }
             }
-            KeyCode::Backspace => {
-                buf.pop();
-                if kind == PromptKind::Filter {
-                    self.filter = buf.clone();
-                    self.apply_filter();
+            _ => {
+                if buf.key(k, kind == PromptKind::Compose) {
+                    let live = buf.text.clone();
+                    if kind == PromptKind::Command {
+                        self.filter_live(&live);
+                    }
                 }
             }
-            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                buf.push(c);
-                if kind == PromptKind::Filter {
-                    self.filter = buf.clone();
-                    self.apply_filter();
-                }
-            }
-            _ => {}
         }
+    }
+}
+
+/// What a `/` line asks for.
+#[derive(Debug, PartialEq)]
+enum Command {
+    /// `find TEXT` and `search TEXT`: filter the list, or search the open conversation.
+    Find(String),
+    /// `leave [#name]`.
+    Leave(String),
+    /// `cache start|stop|wipe [#name]`.
+    Cache(String, String),
+    /// `mute [#name]` (true) and `unmute [#name]` (false).
+    Mute(bool, String),
+}
+
+/// `find x`, `search x`, `leave`, `leave #name`; a leading slash is ignored.
+fn parse_command(line: &str) -> Option<Command> {
+    let line = line.trim().trim_start_matches('/').trim_start();
+    let (word, rest) = match line.split_once(char::is_whitespace) {
+        Some((w, r)) => (w, r.trim()),
+        None => (line, ""),
+    };
+    match word.to_lowercase().as_str() {
+        "find" | "search" | "f" | "s" => Some(Command::Find(rest.to_string())),
+        "leave" => Some(Command::Leave(rest.to_string())),
+        "mute" => Some(Command::Mute(true, rest.to_string())),
+        "unmute" => Some(Command::Mute(false, rest.to_string())),
+        "cache" => {
+            let (op, name) = match rest.split_once(char::is_whitespace) {
+                Some((o, n)) => (o, n.trim()),
+                None => (rest, ""),
+            };
+            matches!(op, "start" | "stop" | "wipe")
+                .then(|| Command::Cache(op.to_string(), name.to_string()))
+        }
+        _ => None,
     }
 }
 
@@ -2815,6 +3257,32 @@ mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn slash_lines_parse_into_commands() {
+        assert_eq!(
+            parse_command("find team nginx"),
+            Some(Command::Find("team nginx".into()))
+        );
+        assert_eq!(parse_command("/Search x"), Some(Command::Find("x".into())));
+        assert_eq!(parse_command("find"), Some(Command::Find(String::new())));
+        assert_eq!(
+            parse_command("leave #kudos-to-you"),
+            Some(Command::Leave("#kudos-to-you".into()))
+        );
+        assert_eq!(parse_command("leave"), Some(Command::Leave(String::new())));
+        assert_eq!(parse_command("leav #x"), None);
+        assert_eq!(
+            parse_command("cache stop #x"),
+            Some(Command::Cache("stop".into(), "#x".into()))
+        );
+        assert_eq!(parse_command("cache purge"), None);
+        assert_eq!(
+            parse_command("unmute"),
+            Some(Command::Mute(false, String::new()))
+        );
+        assert_eq!(parse_command(""), None);
     }
 
     #[test]

@@ -263,6 +263,21 @@ impl Client {
         .map(|_| ())
     }
 
+    /// Leave a channel or group DM.
+    pub fn leave(&self, cid: &str) -> Result<(), String> {
+        self.call("conversations.leave", &[("channel", cid)])
+            .map(|_| ())
+    }
+
+    /// The workspace's custom emoji names.
+    pub fn emoji_list(&self) -> Result<Vec<String>, String> {
+        let v = self.call("emoji.list", &[])?;
+        Ok(v.get("emoji")
+            .and_then(Value::as_object)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
     /// Unread state per conversation, as the web client fetches it.
     pub fn counts(&self) -> Result<Value, String> {
         self.call("client.counts", &[("thread_counts_by_channel", "false")])

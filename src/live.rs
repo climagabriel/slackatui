@@ -43,6 +43,10 @@ pub enum JobKind {
     Send { conv: usize, thread: Option<i64> },
     /// Your reaction `name` added to or removed from message `id`.
     React { id: i64, name: String, add: bool },
+    /// Membership of `conv` given up.
+    Leave { conv: usize },
+    /// The workspace's custom emoji names, for the reaction picker.
+    EmojiList,
 }
 
 pub enum Done {
@@ -60,6 +64,8 @@ pub enum Done {
     Marked,
     Sent(Box<Msg>),
     Reacted,
+    Left,
+    EmojiList(Vec<String>),
 }
 
 pub struct Job {
@@ -315,6 +321,19 @@ pub fn api_react(client: Arc<Client>, cid: String, id: i64, name: String, add: b
     spawn(JobKind::React { id, name, add }, label, move || {
         client.react(&cid, &id_to_ts(id), &n, add)?;
         Ok(Done::Reacted)
+    })
+}
+
+pub fn api_leave(client: Arc<Client>, conv: usize, cid: String) -> Job {
+    spawn(JobKind::Leave { conv }, "leaving".to_string(), move || {
+        client.leave(&cid)?;
+        Ok(Done::Left)
+    })
+}
+
+pub fn api_emoji_list(client: Arc<Client>) -> Job {
+    spawn(JobKind::EmojiList, String::new(), move || {
+        Ok(Done::EmojiList(client.emoji_list()?))
     })
 }
 

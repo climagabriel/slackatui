@@ -68,6 +68,10 @@ pub struct Conv {
     pub last_id: i64,
     /// Known from Slack only: a member conversation no archive holds.
     pub live_only: bool,
+    /// `/leave` succeeded: no longer a member, the archive stays readable.
+    pub left: bool,
+    /// `/mute`: never shown as unread. Local, kept in the cache directory.
+    pub muted: bool,
     pub unread: bool,
     pub mentions: i64,
     /// Slack's read marker for the owner, as a message id; 0 when unknown.
@@ -415,6 +419,17 @@ impl Corpus {
         self.convs.iter().position(|c| c.id == cid)
     }
 
+    /// A conversation by display name, `#kudos` or `kudos`, case-insensitive.
+    pub fn conv_by_name(&self, name: &str) -> Option<usize> {
+        let want = name.trim().trim_start_matches(['#', '@']).to_lowercase();
+        if want.is_empty() {
+            return None;
+        }
+        self.convs
+            .iter()
+            .position(|c| c.name.trim_start_matches(['#', '@']).to_lowercase() == want)
+    }
+
     #[cfg(test)]
     pub fn stub(channels: &[(&str, &str)]) -> Corpus {
         Corpus {
@@ -743,6 +758,8 @@ impl Archive {
                 first_id: st.first,
                 last_id: st.last,
                 live_only: false,
+                left: false,
+                muted: false,
                 unread: false,
                 mentions: 0,
                 last_read: 0,

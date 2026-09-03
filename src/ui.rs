@@ -14,7 +14,9 @@ use ratatui_image::{Image, StatefulImage};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let rows = app.prompt_rows();
+    let [main, status] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(rows)]).areas(area);
     let conv_w = (area.width / 4).clamp(22, 40);
     let [left, right] =
         Layout::horizontal([Constraint::Length(conv_w), Constraint::Min(20)]).areas(main);
@@ -72,7 +74,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             if c.archived {
                 name.push('†');
             }
-            if c.unread {
+            if c.unread && !c.muted {
                 // The marker carries the mention count; the name itself lights up.
                 name.insert_str(
                     0,
@@ -85,13 +87,13 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             let name = clip(&name, room);
             let pad = room.saturating_sub(name.width());
-            let mut name_style = if c.unread {
+            let mut name_style = if c.unread && !c.muted {
                 Style::new()
                     .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD)
             } else if app.highlight_cached && !c.live_only {
                 Style::new().fg(Color::LightGreen)
-            } else if c.live_only {
+            } else if c.live_only || c.left {
                 Style::new().add_modifier(Modifier::DIM)
             } else {
                 Style::new()
@@ -133,6 +135,10 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     if inner.width < 4 || inner.height == 0 {
         return;
     }
+    if let Some(View::Emoji { .. }) = app.stack.last() {
+        draw_emoji_picker(frame, app, inner);
+        return;
+    }
     if let Some(View::Image { .. }) = app.stack.last() {
         draw_image_view(frame, app, inner);
         return;
@@ -150,10 +156,12 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     let image_font = app.image_font();
     // The read marker applies to the conversation's own timeline only.
     let last_read = match (
-        app.stack
-            .iter()
-            .rev()
-            .find(|v| !matches!(v, View::Raw { .. } | View::Image { .. })),
+        app.stack.iter().rev().find(|v| {
+            !matches!(
+                v,
+                View::Raw { .. } | View::Image { .. } | View::Emoji { .. }
+            )
+        }),
         app.open.as_ref(),
     ) {
         (None, Some(o)) => Some(app.corpus.convs[o.conv].last_read).filter(|v| *v > 0),
@@ -273,6 +281,88 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// The full-pane viewer: the original file, fitted to the pane.
+/// The reaction picker: the query on the first row, matches below it, the
+/// cursor row reversed. With no match, Enter sends the query as typed.
+fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
+    let Some(View::Emoji {
+        target,
+        query,
+        cursor,
+        matches,
+    }) = app.stack.last()
+    else {
+        return;
+    };
+    let mut lines: Vec<Line> = editor_lines(
+        query,
+        Span::styled(
+            format!(" {} with: ", target.label),
+            Style::new().fg(Color::Cyan),
+        ),
+    );
+    let rows = inner.height.saturating_sub(1) as usize;
+    if matches.is_empty() {
+        let q = query.text.trim().trim_matches(':');
+        let hint = if q.is_empty() {
+            "  type to search; Enter sends the name as typed".to_string()
+        } else {
+            format!("  no match; Enter sends :{q}: as typed")
+        };
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::new().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        let first = cursor
+            .saturating_sub(rows / 2)
+            .min(matches.len().saturating_sub(rows));
+        for (k, &i) in matches.iter().enumerate().skip(first).take(rows) {
+            let (name, glyph) = &app.emoji_table[i];
+            let style = if k == *cursor {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {glyph:<4} {name}"),
+                style,
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// An editor's rows, the first behind `prefix`, the cursor cell reversed.
+fn editor_lines(ed: &crate::edit::Editor, prefix: Span<'static>) -> Vec<Line<'static>> {
+    let cursor = Style::new().add_modifier(Modifier::REVERSED);
+    let mut out = Vec::new();
+    for (i, (text, at)) in ed.rows().into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if i == 0 {
+            spans.push(prefix.clone());
+        } else {
+            spans.push(Span::raw("   "));
+        }
+        match at {
+            Some(p) => {
+                let (before, rest) = text.split_at(p);
+                let mut it = rest.chars();
+                let under = it
+                    .next()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| " ".to_string());
+                let after: String = it.collect();
+                spans.push(Span::raw(before.to_string()));
+                spans.push(Span::styled(under, cursor));
+                spans.push(Span::raw(after));
+            }
+            None => spans.push(Span::raw(text)),
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
 fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
     let Some(View::Image { files, index, .. }) = app.stack.last() else {
         return;
@@ -324,8 +414,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // the last status, and the selected message's permalink. H lists the keys.
     if let Mode::Prompt { kind, buf, .. } = &app.mode {
         let label = match kind {
-            PromptKind::Filter => "filter conversations",
-            PromptKind::Search => "search this conversation",
+            PromptKind::Command => "",
             PromptKind::Date => "go to date (YYYY-MM-DD)",
             PromptKind::Archive => "archive a conversation from Slack, last 90 days (URL or id)",
             PromptKind::Compose => app
@@ -333,18 +422,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .as_ref()
                 .map(|c| c.label.as_str())
                 .unwrap_or("message"),
-            PromptKind::React => app
-                .react
-                .as_ref()
-                .map(|r| r.label.as_str())
-                .unwrap_or("react with"),
         };
-        let line = Line::from(vec![
-            Span::styled(format!(" {label}: "), Style::new().fg(Color::Cyan)),
-            Span::raw(buf.clone()),
-            Span::styled("▏", Style::new().fg(Color::Cyan)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        let prefix = Span::styled(
+            if label.is_empty() {
+                " /".to_string()
+            } else {
+                format!(" {label}: ")
+            },
+            Style::new().fg(Color::Cyan),
+        );
+        let lines = editor_lines(buf, prefix);
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
     let mut spans = vec![Span::styled(format!(" {} ", app.tz.label()), dim)];
@@ -393,7 +481,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "/",
-        "conversations: filter by name; messages: search the channel",
+        "a command, each taking an optional #name: find|search TEXT filters the list or searches the open conversation; leave; mute|unmute (never shown as unread); cache start|stop|wipe (archive it, pause its hourly refresh, delete its archive)",
     ),
     (
         "o",
@@ -414,7 +502,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "e",
-        "react to the selected message: an emoji name, :name: or the emoji itself; the same name again removes yours",
+        "react to the selected message: a picker opens; type to search, Up/Down or Ctrl-n/Ctrl-p to move, Enter reacts (the name as typed when nothing matches); your own reaction again removes it",
     ),
     (
         "m",
@@ -441,6 +529,10 @@ const HELP: &[(&str, &str)] = &[
         "sort conversations: my activity (messages you wrote), name, recent, size",
     ),
     ("q, Ctrl-c", "quit"),
+    (
+        "in a prompt",
+        "Ctrl-a/e line start/end, Ctrl-b/f and Alt-b/f by char and word, Ctrl-k/u kill to line end/start, Ctrl-w and Alt-d kill a word, Ctrl-y yank, Ctrl-d delete under the cursor; Ctrl-j a newline in a message",
+    ),
 ];
 
 const HELP_NOTE: &str = "The unread part of a conversation starts at the highlighted day divider; the list marks unread conversations with ● and the mention count.";

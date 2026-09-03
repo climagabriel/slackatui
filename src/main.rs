@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod archive;
 mod auth;
+mod edit;
 mod live;
 mod render;
 mod ui;
@@ -80,7 +81,7 @@ environment
 
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
-  Enter thread, Esc back, / filter or search, d go to date, v raw JSON,
+  Enter thread, Esc back, / a command (find, search, leave), d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
   i view a message's images, I inline thumbnails on/off, C highlight cached,
@@ -100,7 +101,9 @@ thread lands in the cache, the open conversation is re-checked every
 --poll seconds. Without a sign-in, slackdump does the same more slowly,
 and `a` still archives a new conversation into the root. Writes to Slack:
 m and M move your own read marker; c composes a message, Enter sends it;
-e toggles your reaction on the selected message.
+e toggles your reaction on the selected message; /leave leaves a channel.
+/cache start archives a conversation; /cache stop pauses its hourly refresh;
+/cache wipe deletes its archive; /mute and /unmute are local to this tool.
 
 exit codes
   0  ok        1  no archive, or the conversation was not found
