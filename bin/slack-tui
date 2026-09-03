@@ -1,5 +1,5 @@
 #!/bin/sh
-# maturity: low; issues-found: 0
+# maturity: low; issues-found: 1
 # slack-tui - front door for libexec/slack-tui, a Rust crate. Builds it on
 # first use into the user's cache and execs the binary; rebuilds when the
 # source changes (checksum), so a plugin update takes effect on the next run.
@@ -26,7 +26,10 @@ if [ ! -x "$bin" ] || [ "${SLACK_TUI_REBUILD:-0}" = 1 ] || [ "$(cat "$stamp" 2>/
     echo "slack-tui: building (first run, or the source changed)..." >&2
     mkdir -p "$cache/bin"
     cargo build --release --locked --quiet --manifest-path "$src/Cargo.toml" --target-dir "$cache/target"
-    cp "$cache/target/release/slack-tui" "$bin"
+    # A running instance keeps the old file busy; a rename replaces the entry
+    # under it instead of failing with "Text file busy".
+    cp "$cache/target/release/slack-tui" "$bin.new.$$"
+    mv -f "$bin.new.$$" "$bin"
     printf '%s\n' "$sum" > "$stamp"
 fi
 exec "$bin" "$@"
