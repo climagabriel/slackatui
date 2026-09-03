@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, ImageState, Mode, PromptKind, Sort, View};
 use crate::complete;
-use crate::keys::DEFAULTS;
+use crate::keys::{Action, DEFAULTS};
 use crate::palette::{Palette, Role, ROLES};
 use crate::render::{self, Ctx};
 use ratatui_image::{Image, StatefulImage};
@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status(frame, app, status);
     draw_suggestions(frame, app, main);
     if app.help {
-        draw_help(frame, area, &app.palette);
+        draw_help(frame, area, app);
     }
 }
 
@@ -706,73 +706,85 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-const HELP: &[(&str, &str)] = &[
-    (
-        "j / k, ↓ / ↑",
-        "move; k at the top of the channel loads older messages",
+/// The guide's rows, in order: an action shows the keys bound to it now, a
+/// literal row the keys that view holds fixed.
+enum HelpRow {
+    Bound(Action, &'static str),
+    Fixed(&'static str, &'static str),
+}
+
+const HELP: &[HelpRow] = &[
+    HelpRow::Bound(
+        Action::Down,
+        "move; at the top of the channel, moving up loads older messages",
     ),
-    ("Ctrl-d / Ctrl-u", "half a page"),
-    ("Ctrl-f / Ctrl-b, PgDn / PgUp", "a full page"),
-    ("g / G", "oldest / newest message of the channel"),
-    ("h / l, Tab", "conversations pane / messages pane"),
-    (
-        "Enter, l",
-        "the selected message's thread; inside a thread, its raw JSON",
+    HelpRow::Bound(Action::Up, "move up"),
+    HelpRow::Bound(Action::HalfPageDown, "half a page down"),
+    HelpRow::Bound(Action::HalfPageUp, "half a page up"),
+    HelpRow::Bound(Action::PageDown, "a full page down"),
+    HelpRow::Bound(Action::PageUp, "a full page up"),
+    HelpRow::Bound(Action::First, "oldest message of the channel, top of the list"),
+    HelpRow::Bound(Action::Last, "newest message of the channel, end of the list"),
+    HelpRow::Bound(Action::OtherPane, "the other pane"),
+    HelpRow::Bound(
+        Action::Open,
+        "open: the conversation, the selected message's thread, and inside a thread its raw JSON",
     ),
-    (
-        "Esc, h",
+    HelpRow::Bound(
+        Action::Back,
         "back: close the thread, search or raw view; then the pane",
     ),
-    (
-        "/",
-        "a command, Tab completes it and its argument: keys rebinds what the keys below do (this guide shows the defaults); colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
+    HelpRow::Bound(
+        Action::Close,
+        "in the list, drop the filter and then close the conversation: the home view",
     ),
-    (
-        "o",
+    HelpRow::Bound(
+        Action::Command,
+        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
+    ),
+    HelpRow::Bound(Action::Keys, "rebind these keys (also /keys)"),
+    HelpRow::Bound(
+        Action::ShowInChannel,
         "from a search hit or a thread: show the message in the channel",
     ),
-    ("d", "go to a date (YYYY-MM-DD)"),
-    ("T", "threads you took part in, newest reply first"),
-    (
-        "i",
+    HelpRow::Bound(Action::GoToDate, "go to a date (YYYY-MM-DD)"),
+    HelpRow::Bound(Action::MyThreads, "threads you took part in, newest reply first"),
+    HelpRow::Bound(
+        Action::Images,
         "the selected message's images, full pane; j/k between them",
     ),
-    ("I", "inline image thumbnails on/off"),
-    ("U", "unread conversations on top on/off"),
-    (
-        "c",
+    HelpRow::Bound(Action::InlineImages, "inline image thumbnails on/off"),
+    HelpRow::Bound(Action::UnreadsFirst, "unread conversations on top on/off"),
+    HelpRow::Bound(
+        Action::Compose,
         "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Enter sends, Esc keeps the draft",
     ),
-    (
-        "e",
+    HelpRow::Bound(
+        Action::React,
         "react to the selected message: a picker opens; type to search, Up/Down or Ctrl-n/Ctrl-p to move, Enter reacts (the name as typed when nothing matches); your own reaction again removes it",
     ),
-    (
-        "m",
+    HelpRow::Bound(
+        Action::MarkRead,
         "mark read: the highlighted conversation, or the open one at its newest message",
     ),
-    (
-        "M",
+    HelpRow::Bound(
+        Action::MarkUnread,
         "mark unread from the message under the cursor (the highlighted conversation in the list)",
     ),
-    (
-        "Esc in the list",
-        "drop the filter, then close the conversation: the home view",
-    ),
-    ("?, H", "this guide"),
-    ("v", "raw JSON of the selected message"),
-    ("r", "reload the conversation from the archive"),
-    (
-        "R",
+    HelpRow::Bound(Action::Help, "this guide"),
+    HelpRow::Bound(Action::RawJson, "raw JSON of the selected message"),
+    HelpRow::Bound(Action::Reload, "reload the conversation from the archive"),
+    HelpRow::Bound(
+        Action::Refresh,
         "refresh the conversation from Slack now (a slackdump resume)",
     ),
-    ("a", "archive a conversation not cached yet (URL or id)"),
-    (
-        "s",
+    HelpRow::Bound(Action::Archive, "archive a conversation not cached yet (URL or id)"),
+    HelpRow::Bound(
+        Action::Sort,
         "sort conversations: my activity (messages you wrote), name, recent, size",
     ),
-    ("q, Ctrl-c", "quit"),
-    (
+    HelpRow::Bound(Action::Quit, "quit"),
+    HelpRow::Fixed(
         "in a prompt",
         "Ctrl-a/e line start/end, Ctrl-b/f and Alt-b/f by char and word, Ctrl-k/u kill to line end/start, Ctrl-w and Alt-d kill a word, Ctrl-y yank, Ctrl-d delete under the cursor; Ctrl-j a newline in a message",
     ),
@@ -780,7 +792,8 @@ const HELP: &[(&str, &str)] = &[
 
 const HELP_NOTE: &str = "The unread part of a conversation starts at the highlighted day divider; the list marks unread conversations with ● and the mention count.";
 
-fn draw_help(frame: &mut Frame, area: Rect, palette: &Palette) {
+fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
+    let palette = &app.palette;
     let w = 96.min(area.width.saturating_sub(2));
     let h = (HELP.len() as u16 + 4).min(area.height.saturating_sub(2));
     let rect = Rect {
@@ -791,13 +804,17 @@ fn draw_help(frame: &mut Frame, area: Rect, palette: &Palette) {
     };
     frame.render_widget(Clear, rect);
     let mut lines = Vec::new();
-    for (k, v) in HELP {
+    for row in HELP {
+        let (keys, text) = match row {
+            HelpRow::Bound(action, text) => (app.keymap.text(*action), *text),
+            HelpRow::Fixed(keys, text) => (keys.to_string(), *text),
+        };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {k:<28} "),
+                format!("  {keys:<28} "),
                 Style::new().fg(palette.get(Role::Accent)),
             ),
-            Span::raw(*v),
+            Span::raw(text),
         ]));
     }
     lines.push(Line::from(""));
