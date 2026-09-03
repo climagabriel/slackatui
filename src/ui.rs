@@ -37,7 +37,16 @@ fn border(focused: bool) -> Style {
 fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Convs;
     let title = if app.filter.is_empty() {
-        format!(" {} · by {} ", app.filtered.len(), app.sort_label())
+        format!(
+            " {} · {}by {} ",
+            app.filtered.len(),
+            if app.unreads_first {
+                "unread first · "
+            } else {
+                ""
+            },
+            app.sort_label()
+        )
     } else {
         format!(" {} · '{}' ", app.filtered.len(), app.filter)
     };
@@ -388,6 +397,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("I", "inline image thumbnails on/off"),
     ("C", "highlight cached conversations in light green on/off"),
+    ("U", "unread conversations on top on/off"),
     (
         "m",
         "mark read: the highlighted conversation, or the open one at its newest message",

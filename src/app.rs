@@ -365,6 +365,8 @@ pub struct App {
     pub file_job: Option<Job>,
     /// `C`: cached conversations in light green.
     pub highlight_cached: bool,
+    /// `U`: unread conversations at the top of the list.
+    pub unreads_first: bool,
     /// Bumped by every mark; a counts result from before it is stale.
     pub counts_gen: u64,
 }
@@ -414,6 +416,7 @@ impl App {
             inline: HashMap::new(),
             file_job: None,
             highlight_cached: false,
+            unreads_first: true,
             counts_gen: 0,
         };
         app.apply_filter();
@@ -427,6 +430,17 @@ impl App {
     }
 
     /// The sort as the title names it.
+    /// `U`: unread conversations on top, or the plain sort order.
+    fn toggle_unreads_first(&mut self) {
+        self.unreads_first = !self.unreads_first;
+        self.apply_filter();
+        self.status = if self.unreads_first {
+            "unread conversations first".to_string()
+        } else {
+            format!("conversations by {}", self.sort_label())
+        };
+    }
+
     pub fn sort_label(&self) -> String {
         match self.sort {
             Sort::Mine => format!("my activity ({:.0}d half-life)", self.half_life_days),
@@ -494,6 +508,11 @@ impl App {
             }),
             Sort::Recent => idx.sort_by(|&a, &b| convs[b].last_id.cmp(&convs[a].last_id)),
             Sort::Size => idx.sort_by(|&a, &b| convs[b].msgs.cmp(&convs[a].msgs)),
+        }
+        // Unread conversations first, in the same order among themselves;
+        // a typed filter still puts the closer name matches above.
+        if self.unreads_first {
+            idx.sort_by_key(|&i| !convs[i].unread);
         }
         if !needle.is_empty() {
             idx.sort_by_key(|&i| rank(&convs[i].name).unwrap_or(2));
@@ -1808,7 +1827,12 @@ impl App {
                 } else {
                     "marked read"
                 };
+                let at = self.conv_cursor;
                 self.apply_filter();
+                if self.focus == Focus::Convs && self.unreads_first {
+                    // Triage from the list: the cursor stays put, on the next unread.
+                    self.conv_cursor = at.min(self.filtered.len().saturating_sub(1));
+                }
                 self.mark_all_dirty();
                 self.status = format!("{name} {what}");
             }
@@ -2141,6 +2165,7 @@ impl App {
             (KeyCode::Char('C'), false) => {
                 self.highlight_cached = !self.highlight_cached;
             }
+            (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
             (KeyCode::Char('m'), false) => self.mark_read(),
             (KeyCode::Char('M'), false) => self.mark_unread(),
             (KeyCode::Char('s'), false) => {
@@ -2277,6 +2302,7 @@ impl App {
             (KeyCode::Char('C'), false) => {
                 self.highlight_cached = !self.highlight_cached;
             }
+            (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
             (KeyCode::Char('i'), false) => self.open_images(),
             (KeyCode::Char('m'), false) => self.mark_read(),
             (KeyCode::Char('M'), false) => self.mark_unread(),

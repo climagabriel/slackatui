@@ -52,9 +52,10 @@ flags
   --auth-check    sign in through the desktop app and print who you are
   --no-images     no inline thumbnails and no image viewer
   --image-protocol MODE
-                  half-blocks (default) or query: ask the terminal for a
-                  native kitty/Sixel/iTerm2 protocol (may eat the first key on
-                  a terminal without escape-sequence passthrough)
+                  query (default): ask the terminal for a native kitty, Sixel
+                  or iTerm2 protocol, half-blocks when it has none. halfblocks:
+                  no query. Under tmux or screen the query's responses can eat
+                  the first key, so there it runs only when asked for.
   --fetch-file URL OUT
                   download one Slack file with the signed-in session (debug)
   --help          this text
@@ -122,7 +123,8 @@ struct Opts {
     auth_check: bool,
     poll: u64,
     no_images: bool,
-    query_protocol: bool,
+    /// None: query unless a multiplexer is in the way.
+    image_protocol: Option<bool>,
     fetch_file: Option<(String, String)>,
 }
 
@@ -142,7 +144,7 @@ fn parse_args() -> Result<Opts, String> {
         auth_check: false,
         poll: 60,
         no_images: false,
-        query_protocol: false,
+        image_protocol: None,
         fetch_file: None,
     };
     let mut args = std::env::args().skip(1);
@@ -168,12 +170,13 @@ fn parse_args() -> Result<Opts, String> {
             "--no-images" => opts.no_images = true,
             "--image-protocol" => {
                 let v = value("--image-protocol")?;
-                opts.query_protocol = match v.as_str() {
-                    "query" | "auto" => true,
-                    "halfblocks" => false,
+                opts.image_protocol = match v.as_str() {
+                    "query" => Some(true),
+                    "halfblocks" => Some(false),
+                    "auto" => None,
                     other => {
                         return Err(format!(
-                            "--image-protocol: {other} is not halfblocks or query"
+                            "--image-protocol: {other} is not query, halfblocks or auto"
                         ))
                     }
                 };
@@ -410,7 +413,7 @@ fn run() -> i32 {
             return emit(&text);
         }
     }
-    match tui(&mut app, opts.no_images, opts.query_protocol) {
+    match tui(&mut app, opts.no_images, opts.image_protocol) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("slack-tui: {e}");
@@ -419,16 +422,26 @@ fn run() -> i32 {
     }
 }
 
-fn tui(app: &mut App, no_images: bool, query_protocol: bool) -> std::io::Result<()> {
+/// tmux and screen answer the capability query themselves; the responses
+/// reached the key reader there and swallowed the first keypress.
+fn under_multiplexer() -> bool {
+    std::env::var_os("TMUX").is_some()
+        || std::env::var_os("STY").is_some()
+        || std::env::var("TERM")
+            .map(|t| t.starts_with("screen") || t.starts_with("tmux"))
+            .unwrap_or(false)
+}
+
+fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
     if !no_images {
-        // Half-blocks by default: they work in every terminal and need no
-        // capability query. --image-protocol query asks the terminal which of
-        // kitty/Sixel/iTerm2 it speaks, for a terminal that has one; that query
-        // prints escape sequences whose responses come back as input, so on a
-        // terminal without passthrough it can swallow the first keypress. The
-        // query drains its own responses here before the loop reads a real key.
-        app.picker = Some(if query_protocol {
+        // The capability query asks which of kitty/Sixel/iTerm2 the terminal
+        // speaks and falls back to half-blocks; its responses come back as
+        // input, so the loop drains them before reading a real key. Under a
+        // multiplexer the drain was not enough, so there the query runs only
+        // on request.
+        let query = image_protocol.unwrap_or_else(|| !under_multiplexer());
+        app.picker = Some(if query {
             let p = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
             let cap = std::time::Instant::now() + Duration::from_millis(1000);
             while event::poll(Duration::from_millis(100)).unwrap_or(false) {
