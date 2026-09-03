@@ -99,7 +99,8 @@ messages, every conversation you are a member of, and unread markers; a
 thread lands in the cache, the open conversation is re-checked every
 --poll seconds. Without a sign-in, slackdump does the same more slowly,
 and `a` still archives a new conversation into the root. Writes to Slack:
-m and M move your own read marker; c composes a message, Enter sends it.
+m and M move your own read marker; c composes a message, Enter sends it;
+e toggles your reaction on the selected message.
 
 exit codes
   0  ok        1  no archive, or the conversation was not found

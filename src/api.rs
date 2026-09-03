@@ -249,6 +249,20 @@ impl Client {
             .map(|_| ())
     }
 
+    /// Add or remove your reaction `name` on the message `ts` in `cid`.
+    pub fn react(&self, cid: &str, ts: &str, name: &str, add: bool) -> Result<(), String> {
+        let method = if add {
+            "reactions.add"
+        } else {
+            "reactions.remove"
+        };
+        self.call(
+            method,
+            &[("channel", cid), ("timestamp", ts), ("name", name)],
+        )
+        .map(|_| ())
+    }
+
     /// Unread state per conversation, as the web client fetches it.
     pub fn counts(&self) -> Result<Value, String> {
         self.call("client.counts", &[("thread_counts_by_channel", "false")])

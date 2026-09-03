@@ -333,6 +333,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .as_ref()
                 .map(|c| c.label.as_str())
                 .unwrap_or("message"),
+            PromptKind::React => app
+                .react
+                .as_ref()
+                .map(|r| r.label.as_str())
+                .unwrap_or("react with"),
         };
         let line = Line::from(vec![
             Span::styled(format!(" {label}: "), Style::new().fg(Color::Cyan)),
@@ -406,6 +411,10 @@ const HELP: &[(&str, &str)] = &[
     (
         "c",
         "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Enter sends, Esc keeps the draft",
+    ),
+    (
+        "e",
+        "react to the selected message: an emoji name, :name: or the emoji itself; the same name again removes yours",
     ),
     (
         "m",

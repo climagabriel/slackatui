@@ -41,6 +41,8 @@ pub enum JobKind {
     Mark { conv: usize, id: i64 },
     /// A message posted to `conv`, into the thread rooted at `thread` when given.
     Send { conv: usize, thread: Option<i64> },
+    /// Your reaction `name` added to or removed from message `id`.
+    React { id: i64, name: String, add: bool },
 }
 
 pub enum Done {
@@ -57,6 +59,7 @@ pub enum Done {
     File(PathBuf),
     Marked,
     Sent(Box<Msg>),
+    Reacted,
 }
 
 pub struct Job {
@@ -299,6 +302,20 @@ pub fn api_send(
                 .ok_or_else(|| "sent, but Slack's answer carried no timestamp".to_string())
         },
     )
+}
+
+pub fn api_react(client: Arc<Client>, cid: String, id: i64, name: String, add: bool) -> Job {
+    let label = if add {
+        "reacting"
+    } else {
+        "removing the reaction"
+    }
+    .to_string();
+    let n = name.clone();
+    spawn(JobKind::React { id, name, add }, label, move || {
+        client.react(&cid, &id_to_ts(id), &n, add)?;
+        Ok(Done::Reacted)
+    })
 }
 
 pub fn api_counts(client: Arc<Client>, gen: u64) -> Job {

@@ -253,6 +253,13 @@ pub struct Draft {
     pub text: String,
 }
 
+/// The message `e` reacts to.
+pub struct ReactTarget {
+    pub cid: String,
+    pub id: i64,
+    pub label: String,
+}
+
 /// Where `c` sends: a conversation, and a thread in it when replying.
 pub struct Compose {
     pub conv: usize,
@@ -324,6 +331,7 @@ pub enum PromptKind {
     Date,
     Archive,
     Compose,
+    React,
 }
 
 pub enum Mode {
@@ -386,6 +394,8 @@ pub struct App {
     pub unreads_first: bool,
     /// The target of the open compose prompt.
     pub compose: Option<Compose>,
+    /// The target of the open reaction prompt.
+    pub react: Option<ReactTarget>,
     /// A message typed and not sent: Esc keeps it for the next `c` on the
     /// same target, so it cannot go to another conversation by reflex.
     pub draft: Option<Draft>,
@@ -440,6 +450,7 @@ impl App {
             highlight_cached: false,
             unreads_first: true,
             compose: None,
+            react: None,
             draft: None,
             counts_gen: 0,
         };
@@ -529,6 +540,81 @@ impl App {
                 })
             }
         }
+    }
+
+    /// Every message list on screen: the open timeline and the stacked views.
+    fn lists_mut(&mut self) -> Vec<&mut MsgList> {
+        let mut out: Vec<&mut MsgList> = Vec::new();
+        if let Some(o) = self.open.as_mut() {
+            out.push(&mut o.list);
+        }
+        for v in self.stack.iter_mut() {
+            match v {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } => {
+                    out.push(list)
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `e`: a reaction prompt for the selected message.
+    fn react(&mut self) {
+        if self.api.is_none() {
+            self.status = "reacting needs the Slack sign-in".to_string();
+            return;
+        }
+        let Some(m) = self.selected() else {
+            self.status = "no message selected".to_string();
+            return;
+        };
+        let who = m
+            .user
+            .as_deref()
+            .and_then(|u| self.corpus.user_name(u))
+            .unwrap_or_else(|| "?".to_string());
+        self.react = Some(ReactTarget {
+            cid: m.channel_id.clone(),
+            id: m.id,
+            label: format!(
+                "react to {who}'s message (name, :name: or the emoji; yours again removes it)"
+            ),
+        });
+        self.mode = Mode::Prompt {
+            kind: PromptKind::React,
+            buf: String::new(),
+            previous: String::new(),
+        };
+    }
+
+    /// Enter in the reaction prompt: add the reaction, or remove it when it
+    /// is already yours.
+    fn send_reaction(&mut self, text: &str) {
+        let Some(t) = self.react.take() else {
+            return;
+        };
+        let Some(name) = reaction_name(text) else {
+            self.status = "no reaction name".to_string();
+            return;
+        };
+        let Some(c) = self.api.clone() else {
+            self.status = "reacting needs the Slack sign-in".to_string();
+            return;
+        };
+        if self.job.is_some() {
+            self.status = "a fetch is already running; press e again in a moment".to_string();
+            return;
+        }
+        let me = self.corpus.me.clone().unwrap_or_default();
+        let mine = self
+            .lists_mut()
+            .iter()
+            .flat_map(|l| l.msgs.iter())
+            .find(|m| m.id == t.id)
+            .map(|m| has_reaction(&m.data, &name, &me))
+            .unwrap_or(false);
+        self.job = Some(live::api_react(c, t.cid, t.id, name, !mine));
     }
 
     /// `c`: the compose prompt, with the unsent draft if one was kept.
@@ -2029,6 +2115,24 @@ impl App {
                     }
                 }
             }
+            (JobKind::React { id, name, add }, Done::Reacted) => {
+                let me = self.corpus.me.clone().unwrap_or_default();
+                let mut touched = 0;
+                for list in self.lists_mut() {
+                    for m in list.msgs.iter_mut().filter(|m| m.id == id) {
+                        patch_reaction(&mut m.data, &name, &me, add);
+                        touched += 1;
+                    }
+                    if touched > 0 {
+                        list.mark_dirty();
+                    }
+                }
+                self.status = if add {
+                    format!("reacted :{name}:")
+                } else {
+                    format!("reaction :{name}: removed")
+                };
+            }
             _ => {}
         }
     }
@@ -2360,6 +2464,7 @@ impl App {
             }
             (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
             (KeyCode::Char('c'), false) => self.compose(),
+            (KeyCode::Char('e'), false) => self.react(),
             (KeyCode::Char('m'), false) => self.mark_read(),
             (KeyCode::Char('M'), false) => self.mark_unread(),
             (KeyCode::Char('s'), false) => {
@@ -2498,6 +2603,7 @@ impl App {
             }
             (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
             (KeyCode::Char('c'), false) => self.compose(),
+            (KeyCode::Char('e'), false) => self.react(),
             (KeyCode::Char('i'), false) => self.open_images(),
             (KeyCode::Char('m'), false) => self.mark_read(),
             (KeyCode::Char('M'), false) => self.mark_unread(),
@@ -2564,6 +2670,7 @@ impl App {
                     PromptKind::Date => self.goto_date(&text),
                     PromptKind::Archive => self.archive_new(&text),
                     PromptKind::Compose => self.send_message(text),
+                    PromptKind::React => self.send_reaction(&text),
                 }
             }
             KeyCode::Backspace => {
@@ -2582,6 +2689,88 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+/// A typed reaction as Slack names it: `eyes`, `:eyes:` or the emoji itself.
+fn reaction_name(text: &str) -> Option<String> {
+    let s = text.trim().trim_matches(':').trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.is_ascii() {
+        return Some(s.to_lowercase());
+    }
+    emojis::get(s)
+        .and_then(|e| e.shortcode())
+        .map(str::to_string)
+}
+
+/// Whether `me` already reacted with `name` on a message.
+fn has_reaction(data: &Value, name: &str, me: &str) -> bool {
+    data.get("reactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("name").and_then(Value::as_str) == Some(name))
+        .any(|r| {
+            r.get("users")
+                .and_then(Value::as_array)
+                .map(|u| u.iter().any(|x| x.as_str() == Some(me)))
+                .unwrap_or(false)
+        })
+}
+
+/// The message JSON after your reaction `name` was added or removed, as
+/// Slack would report it.
+fn patch_reaction(data: &mut Value, name: &str, me: &str, add: bool) {
+    let obj = match data.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    let rs = obj
+        .entry("reactions")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(rs) = rs.as_array_mut() else {
+        return;
+    };
+    let at = rs
+        .iter()
+        .position(|r| r.get("name").and_then(Value::as_str) == Some(name));
+    match (at, add) {
+        (None, true) => rs.push(serde_json::json!({"name": name, "users": [me], "count": 1})),
+        (None, false) => {}
+        (Some(i), add) => {
+            let r = &mut rs[i];
+            let mut users: Vec<String> = r
+                .get("users")
+                .and_then(Value::as_array)
+                .map(|u| {
+                    u.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let had = users.iter().any(|u| u == me);
+            if add && !had {
+                users.push(me.to_string());
+            } else if !add && had {
+                users.retain(|u| u != me);
+            } else {
+                return;
+            }
+            let count =
+                r.get("count").and_then(Value::as_i64).unwrap_or(0) + if add { 1 } else { -1 };
+            if count <= 0 {
+                rs.remove(i);
+            } else {
+                r["users"] = Value::Array(users.into_iter().map(Value::String).collect());
+                r["count"] = Value::from(count);
+            }
+        }
+    }
+    if rs.is_empty() {
+        obj.remove("reactions");
     }
 }
 
@@ -2626,6 +2815,33 @@ mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reactions_toggle_in_the_message_json() {
+        let mut d = serde_json::json!({"text": "x"});
+        patch_reaction(&mut d, "eyes", "U1", true);
+        assert_eq!(
+            d["reactions"],
+            serde_json::json!([{"name": "eyes", "users": ["U1"], "count": 1}])
+        );
+        assert!(has_reaction(&d, "eyes", "U1"));
+        patch_reaction(&mut d, "eyes", "U2", true);
+        assert_eq!(d["reactions"][0]["count"], 2);
+        patch_reaction(&mut d, "eyes", "U1", false);
+        assert_eq!(
+            d["reactions"],
+            serde_json::json!([{"name": "eyes", "users": ["U2"], "count": 1}])
+        );
+        assert!(!has_reaction(&d, "eyes", "U1"));
+        patch_reaction(&mut d, "eyes", "U2", false);
+        assert!(d.get("reactions").is_none());
+        patch_reaction(&mut d, "eyes", "U1", false);
+        assert!(d.get("reactions").is_none());
+        assert_eq!(reaction_name(" :Eyes: "), Some("eyes".to_string()));
+        assert_eq!(reaction_name("👀"), Some("eyes".to_string()));
+        assert_eq!(reaction_name("+1"), Some("+1".to_string()));
+        assert_eq!(reaction_name("::"), None);
     }
 
     #[test]
