@@ -6,6 +6,7 @@ mod archive;
 mod auth;
 mod complete;
 mod edit;
+mod keys;
 mod live;
 mod palette;
 mod render;
@@ -81,6 +82,8 @@ environment
   SLACK_TUI_PALETTE    where /colorpalette saves UI colors, the vintage
                        palette included (default
                        $XDG_CONFIG_HOME/slack-tui/palette.json, or ~/.config/...)
+  SLACK_TUI_KEYS       where /keys saves the key bindings (default keys.json
+                       beside the palette)
   SLACKDUMPS           archive root when --root is not given
   SLACK_SELF_USER_ID   your own user id: names direct messages by the other
                        party and counts your messages per conversation
@@ -88,8 +91,8 @@ environment
 
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
-  Enter thread, Esc back, / a command (Tab completes: colorpalette, find,
-  search, leave, mute, unmute, cache),
+  Enter thread, Esc back, / a command (Tab completes: keys, colorpalette,
+  find, search, leave, mute, unmute, cache),
   d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
@@ -115,7 +118,8 @@ e toggles your reaction on the selected message; /leave leaves a channel.
 /cache wipe deletes its archive; /cache highlight on|off colors the cached
 conversations in the list; /colorpalette vintage opens the editor over the
 vintage palette (terracotta, amber, sand, olive and slate on jet black), and
-/colorpalette default over the terminal's own sixteen colors; /mute and /unmute keep a conversation at the end of
+/colorpalette default over the terminal's own sixteen colors; /keys rebinds
+what the keys do in the two lists, one action per row; /mute and /unmute keep a conversation at the end of
 the list, on top of the channels muted in Slack itself.
 
 exit codes
@@ -450,6 +454,15 @@ fn run() -> i32 {
                 })
                 .map(|dir| dir.join("slack-tui").join("palette.json"))
         });
+    let keys_path = std::env::var_os("SLACK_TUI_KEYS")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            palette_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|dir| dir.join("keys.json"))
+        });
     let mut app = App::new(
         corpus,
         opts.tz,
@@ -460,6 +473,7 @@ fn run() -> i32 {
         lock,
         opts.poll,
         palette_path,
+        keys_path,
     );
     if opts.list {
         let mut text = String::new();

@@ -15,6 +15,7 @@ use crate::api::Client;
 use crate::archive::{ts_to_id, Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
 use crate::complete;
 use crate::edit::Editor;
+use crate::keys::{Action, Chord, Keymap, DEFAULTS};
 use crate::live::{self, Done, Job, JobKind};
 use crate::palette::PRESETS;
 use crate::palette::{Palette, Role, ROLES};
@@ -321,6 +322,14 @@ pub enum View {
         original: Palette,
         return_focus: Focus,
     },
+    /// `/keys`: rebind what the lists' keys do.
+    Keys {
+        cursor: usize,
+        original: Keymap,
+        return_focus: Focus,
+        /// Waiting for the key to bind; true keeps the action's other keys.
+        capture: Option<bool>,
+    },
     /// One message's images, full pane, one at a time.
     Image {
         files: Vec<crate::archive::FileInfo>,
@@ -437,6 +446,9 @@ pub struct App {
     /// Semantic UI colors, loaded from and saved to `palette_path`.
     pub palette: Palette,
     pub palette_path: Option<PathBuf>,
+    /// What the keys do, loaded from and saved to `keys_path`.
+    pub keymap: Keymap,
+    pub keys_path: Option<PathBuf>,
 }
 
 impl App {
@@ -451,12 +463,20 @@ impl App {
         lock: PathBuf,
         poll_secs: u64,
         palette_path: Option<PathBuf>,
+        keys_path: Option<PathBuf>,
     ) -> App {
         let (palette, palette_status) = match Palette::load(palette_path.as_deref()) {
             Ok(palette) => (palette, String::new()),
             Err(error) => (
                 Palette::default(),
                 format!("palette: {error}; using defaults"),
+            ),
+        };
+        let (keymap, keys_status) = match Keymap::load(keys_path.as_deref()) {
+            Ok(keymap) => (keymap, palette_status),
+            Err(error) => (
+                Keymap::default(),
+                format!("keys: {error}; using the default keys"),
             ),
         };
         let mut app = App {
@@ -471,7 +491,7 @@ impl App {
             stack: Vec::new(),
             mode: Mode::Normal,
             help: false,
-            status: palette_status,
+            status: keys_status,
             quit: false,
             msgs_height: 0,
             half_life_days,
@@ -505,6 +525,8 @@ impl App {
             counts_gen: 0,
             palette,
             palette_path,
+            keymap,
+            keys_path,
         };
         app.apply_filter();
         if live {
@@ -575,7 +597,8 @@ impl App {
             Some(View::Raw { .. })
             | Some(View::Image { .. })
             | Some(View::Emoji { .. })
-            | Some(View::ColorPalette { .. }) => Err("close this view first".to_string()),
+            | Some(View::ColorPalette { .. })
+            | Some(View::Keys { .. }) => Err("close this view first".to_string()),
             None => {
                 let conv = match (self.focus, self.open.as_ref()) {
                     (Focus::Msgs, Some(o)) => o.conv,
@@ -658,6 +681,10 @@ impl App {
                 self.restore_filter(filter_before);
                 self.open_color_palette(&preset);
             }
+            Some(Command::Keys) => {
+                self.restore_filter(filter_before);
+                self.open_keys();
+            }
         }
     }
 
@@ -700,6 +727,135 @@ impl App {
                 .to_string(),
         };
         self.status = status;
+    }
+
+    /// `/keys`: the key editor over the messages pane.
+    fn open_keys(&mut self) {
+        if matches!(self.stack.last(), Some(View::Keys { .. })) {
+            return;
+        }
+        let return_focus = self.focus;
+        self.stack.push(View::Keys {
+            cursor: 0,
+            original: self.keymap.clone(),
+            return_focus,
+            capture: None,
+        });
+        self.focus = Focus::Msgs;
+        self.status = "j/k an action; e binds the next key you press, A adds one, d resets the action, D resets all; Enter saves; Esc cancels".to_string();
+    }
+
+    fn keys_action(&self) -> Option<Action> {
+        match self.stack.last() {
+            Some(View::Keys { cursor, .. }) => DEFAULTS.get(*cursor).map(|(action, _)| *action),
+            _ => None,
+        }
+    }
+
+    fn on_keys_key(&mut self, key: KeyEvent, control: bool) {
+        let capture = match self.stack.last() {
+            Some(View::Keys { capture, .. }) => *capture,
+            _ => return,
+        };
+        if let Some(keep) = capture {
+            if key.code == KeyCode::Esc {
+                self.set_keys_capture(None);
+                self.status = "nothing bound".to_string();
+                return;
+            }
+            let Some(chord) = Chord::of(key) else {
+                self.status = "that key cannot carry a binding".to_string();
+                return;
+            };
+            let Some(action) = self.keys_action() else {
+                return;
+            };
+            let stolen = self.keymap.bind(action, chord, keep);
+            self.set_keys_capture(None);
+            self.status = match stolen {
+                Some(other) => format!(
+                    "{} is now {:?}, no longer {:?}",
+                    chord.text(),
+                    action.label(),
+                    other.label()
+                ),
+                None => format!("{} is now {:?}", chord.text(), action.label()),
+            };
+            return;
+        }
+        match (key.code, control) {
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
+                if let Some(View::Keys { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = (*cursor + 1).min(DEFAULTS.len() - 1);
+                }
+            }
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
+                if let Some(View::Keys { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => {
+                if let Some(View::Keys { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = 0;
+                }
+            }
+            (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
+                if let Some(View::Keys { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = DEFAULTS.len() - 1;
+                }
+            }
+            (KeyCode::Char('e'), false) => {
+                self.set_keys_capture(Some(false));
+                self.status = "press the key to bind, Esc to leave it alone".to_string();
+            }
+            (KeyCode::Char('A'), false) => {
+                self.set_keys_capture(Some(true));
+                self.status = "press the key to add, Esc to leave it alone".to_string();
+            }
+            (KeyCode::Char('d'), false) => {
+                if let Some(action) = self.keys_action() {
+                    self.keymap.reset(action);
+                    self.status = format!("{}: {}", action.label(), self.keymap.text(action));
+                }
+            }
+            (KeyCode::Char('D'), false) => {
+                self.keymap = Keymap::default();
+                self.status = "every key back to its default".to_string();
+            }
+            (KeyCode::Enter, _) => self.save_keys(),
+            (KeyCode::Esc, _) => {
+                let (original, return_focus) = match self.stack.pop() {
+                    Some(View::Keys {
+                        original,
+                        return_focus,
+                        ..
+                    }) => (original, return_focus),
+                    _ => return,
+                };
+                self.keymap = original;
+                self.focus = return_focus;
+                self.status = "keys unchanged".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    fn set_keys_capture(&mut self, next: Option<bool>) {
+        if let Some(View::Keys { capture, .. }) = self.stack.last_mut() {
+            *capture = next;
+        }
+    }
+
+    fn save_keys(&mut self) {
+        let return_focus = match self.stack.pop() {
+            Some(View::Keys { return_focus, .. }) => return_focus,
+            _ => return,
+        };
+        self.focus = return_focus;
+        self.status = match self.keymap.save(self.keys_path.as_deref()) {
+            Ok(path) => format!("keys saved to {}", path.display()),
+            Err(error) => format!("keys: {error}"),
+        };
     }
 
     /// `e` in the palette: a color typed as a name or as `#rrggbb`.
@@ -2976,6 +3132,9 @@ impl App {
 
     /// Title of the messages pane.
     pub fn title(&self) -> String {
+        if matches!(self.stack.last(), Some(View::Keys { .. })) {
+            return "keys · what each action answers to".to_string();
+        }
         if matches!(self.stack.last(), Some(View::ColorPalette { .. })) {
             return "color palette · live preview".to_string();
         }
@@ -2985,7 +3144,7 @@ impl App {
         let conv = &self.corpus.convs[o.conv];
         let a = &self.corpus.archives[conv.archive];
         match self.stack.last() {
-            Some(View::ColorPalette { .. }) => {
+            Some(View::ColorPalette { .. }) | Some(View::Keys { .. }) => {
                 unreachable!("handled before opening a conversation")
             }
             Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
@@ -3100,6 +3259,10 @@ impl App {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(View::Keys { .. }) = self.stack.last() {
+            self.on_keys_key(k, ctrl);
+            return;
+        }
         if let Some(View::ColorPalette { .. }) = self.stack.last() {
             self.on_palette_key(k, ctrl);
             return;
@@ -3108,12 +3271,13 @@ impl App {
             self.on_emoji_key(k, ctrl);
             return;
         }
-        match (k.code, ctrl) {
-            (KeyCode::Char('c'), true) | (KeyCode::Char('q'), false) => {
+        let action = self.keymap.action(k);
+        match action {
+            Some(Action::Quit) => {
                 self.quit = true;
                 return;
             }
-            (KeyCode::Char('?'), false) | (KeyCode::Char('H'), false) => {
+            Some(Action::Help) => {
                 self.help = true;
                 return;
             }
@@ -3163,8 +3327,8 @@ impl App {
             return;
         }
         match self.focus {
-            Focus::Convs => self.on_conv_key(k, ctrl),
-            Focus::Msgs => self.on_msg_key(k, ctrl),
+            Focus::Convs => self.on_conv_key(action),
+            Focus::Msgs => self.on_msg_key(action),
         }
     }
 
@@ -3197,27 +3361,19 @@ impl App {
         }
     }
 
-    fn on_conv_key(&mut self, k: KeyEvent, ctrl: bool) {
+    fn on_conv_key(&mut self, action: Option<Action>) {
         let n = self.filtered.len();
         let last = n.saturating_sub(1);
-        match (k.code, ctrl) {
-            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
-                self.conv_cursor = (self.conv_cursor + 1).min(last)
-            }
-            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
-                self.conv_cursor = self.conv_cursor.saturating_sub(1)
-            }
-            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => self.conv_cursor = 0,
-            (KeyCode::Char('G'), false) | (KeyCode::End, _) => self.conv_cursor = last,
-            (KeyCode::Char('d'), true) => self.conv_cursor = (self.conv_cursor + 10).min(last),
-            (KeyCode::Char('u'), true) => self.conv_cursor = self.conv_cursor.saturating_sub(10),
-            (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => {
-                self.conv_cursor = (self.conv_cursor + 20).min(last)
-            }
-            (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => {
-                self.conv_cursor = self.conv_cursor.saturating_sub(20)
-            }
-            (KeyCode::Enter, _) | (KeyCode::Char('l'), false) | (KeyCode::Right, _) => {
+        match action {
+            Some(Action::Down) => self.conv_cursor = (self.conv_cursor + 1).min(last),
+            Some(Action::Up) => self.conv_cursor = self.conv_cursor.saturating_sub(1),
+            Some(Action::First) => self.conv_cursor = 0,
+            Some(Action::Last) => self.conv_cursor = last,
+            Some(Action::HalfPageDown) => self.conv_cursor = (self.conv_cursor + 10).min(last),
+            Some(Action::HalfPageUp) => self.conv_cursor = self.conv_cursor.saturating_sub(10),
+            Some(Action::PageDown) => self.conv_cursor = (self.conv_cursor + 20).min(last),
+            Some(Action::PageUp) => self.conv_cursor = self.conv_cursor.saturating_sub(20),
+            Some(Action::Open) => {
                 if let Some(&idx) = self.filtered.get(self.conv_cursor) {
                     if self.open.as_ref().map(|o| o.conv) == Some(idx) {
                         self.focus = Focus::Msgs;
@@ -3226,21 +3382,21 @@ impl App {
                     }
                 }
             }
-            (KeyCode::Tab, _) => {
+            Some(Action::OtherPane) => {
                 if self.open.is_some() {
                     self.focus = Focus::Msgs;
                 }
             }
-            (KeyCode::Char('/'), false) => self.open_command(),
-            (KeyCode::Esc, _) => self.go_home(),
-            (KeyCode::Char('a'), false) => self.prompt_archive(),
-            (KeyCode::Char('T'), false) => self.open_my_threads(),
-            (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
-            (KeyCode::Char('c'), false) => self.compose(),
-            (KeyCode::Char('e'), false) => self.react(),
-            (KeyCode::Char('m'), false) => self.mark_read(),
-            (KeyCode::Char('M'), false) => self.mark_unread(),
-            (KeyCode::Char('s'), false) => {
+            Some(Action::Command) => self.open_command(),
+            Some(Action::Close) => self.go_home(),
+            Some(Action::Archive) => self.prompt_archive(),
+            Some(Action::MyThreads) => self.open_my_threads(),
+            Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
+            Some(Action::Compose) => self.compose(),
+            Some(Action::React) => self.react(),
+            Some(Action::MarkRead) => self.mark_read(),
+            Some(Action::MarkUnread) => self.mark_unread(),
+            Some(Action::Sort) => {
                 self.sort = self.sort.next();
                 self.apply_filter();
                 self.status = format!("sorted by {}", self.sort_label());
@@ -3249,19 +3405,20 @@ impl App {
                         "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
                 }
             }
+            Some(Action::Keys) => self.open_keys(),
             _ => {}
         }
     }
 
-    fn on_msg_key(&mut self, k: KeyEvent, ctrl: bool) {
+    fn on_msg_key(&mut self, action: Option<Action>) {
         if self.open.is_none() {
             self.focus = Focus::Convs;
             return;
         }
         let height = self.msgs_height.max(2) as isize;
         let timeline = self.in_timeline();
-        match (k.code, ctrl) {
-            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
+        match action {
+            Some(Action::Down) => {
                 let at_end = self
                     .active_list()
                     .map(|l| l.cursor + 1 >= l.len())
@@ -3272,7 +3429,7 @@ impl App {
                     l.move_cursor(1);
                 }
             }
-            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
+            Some(Action::Up) => {
                 let at_start = self.active_list().map(|l| l.cursor == 0).unwrap_or(true);
                 if at_start && timeline {
                     self.load_older();
@@ -3280,7 +3437,7 @@ impl App {
                     l.move_cursor(-1);
                 }
             }
-            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => {
+            Some(Action::First) => {
                 let has_older = self.open.as_ref().is_some_and(|o| o.has_older);
                 if timeline && has_older {
                     let first = self.open_conv_ref().map(|c| c.first_id).unwrap_or(0);
@@ -3292,7 +3449,7 @@ impl App {
                     l.cursor = 0;
                 }
             }
-            (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
+            Some(Action::Last) => {
                 let has_newer = self.open.as_ref().is_some_and(|o| o.has_newer);
                 if timeline && has_newer {
                     self.reload();
@@ -3300,27 +3457,27 @@ impl App {
                     l.cursor = l.len().saturating_sub(1);
                 }
             }
-            (KeyCode::Char('d'), true) => {
+            Some(Action::HalfPageDown) => {
                 if let Some(l) = self.active_list_mut() {
                     l.move_lines(height / 2);
                 }
             }
-            (KeyCode::Char('u'), true) => {
+            Some(Action::HalfPageUp) => {
                 if let Some(l) = self.active_list_mut() {
                     l.move_lines(-(height / 2));
                 }
             }
-            (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => {
+            Some(Action::PageDown) => {
                 if let Some(l) = self.active_list_mut() {
                     l.move_lines(height - 1);
                 }
             }
-            (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => {
+            Some(Action::PageUp) => {
                 if let Some(l) = self.active_list_mut() {
                     l.move_lines(-(height - 1));
                 }
             }
-            (KeyCode::Enter, _) | (KeyCode::Char('l'), false) | (KeyCode::Right, _) => {
+            Some(Action::Open) => {
                 if matches!(self.stack.last(), Some(View::Thread { .. })) {
                     self.open_raw();
                 } else if let Some(m) = self.selected() {
@@ -3328,8 +3485,8 @@ impl App {
                     self.open_hit(cid, root, id);
                 }
             }
-            (KeyCode::Char('v'), false) => self.open_raw(),
-            (KeyCode::Char('o'), false) => {
+            Some(Action::RawJson) => self.open_raw(),
+            Some(Action::ShowInChannel) => {
                 let sel = self.selected().map(|m| {
                     (
                         m.channel_id.clone(),
@@ -3353,25 +3510,25 @@ impl App {
                     }
                 }
             }
-            (KeyCode::Char('/'), false) => self.open_command(),
-            (KeyCode::Char('d'), false) => {
+            Some(Action::Command) => self.open_command(),
+            Some(Action::GoToDate) => {
                 self.mode = Mode::Prompt {
                     kind: PromptKind::Date,
                     buf: Editor::default(),
                     previous: String::new(),
                 };
             }
-            (KeyCode::Char('r'), false) => self.reload(),
-            (KeyCode::Char('R'), false) => self.refresh(),
-            (KeyCode::Char('a'), false) => self.prompt_archive(),
-            (KeyCode::Char('T'), false) => self.open_my_threads(),
-            (KeyCode::Char('U'), false) => self.toggle_unreads_first(),
-            (KeyCode::Char('c'), false) => self.compose(),
-            (KeyCode::Char('e'), false) => self.react(),
-            (KeyCode::Char('i'), false) => self.open_images(),
-            (KeyCode::Char('m'), false) => self.mark_read(),
-            (KeyCode::Char('M'), false) => self.mark_unread(),
-            (KeyCode::Char('I'), false) => {
+            Some(Action::Reload) => self.reload(),
+            Some(Action::Refresh) => self.refresh(),
+            Some(Action::Archive) => self.prompt_archive(),
+            Some(Action::MyThreads) => self.open_my_threads(),
+            Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
+            Some(Action::Compose) => self.compose(),
+            Some(Action::React) => self.react(),
+            Some(Action::Images) => self.open_images(),
+            Some(Action::MarkRead) => self.mark_read(),
+            Some(Action::MarkUnread) => self.mark_unread(),
+            Some(Action::InlineImages) => {
                 self.inline_images = !self.inline_images && self.picker.is_some();
                 self.mark_all_dirty();
                 self.status = if self.inline_images {
@@ -3381,19 +3538,20 @@ impl App {
                 }
                 .to_string();
             }
-            (KeyCode::Esc, _) => {
+            Some(Action::Close) => {
                 // Unwind one stacked view; from the bare timeline, straight home.
                 if self.stack.pop().is_none() {
                     self.go_home();
                 }
             }
-            (KeyCode::Char('h'), false) | (KeyCode::Left, _) => {
+            Some(Action::Back) => {
                 // Back out one view, keeping the conversation open to browse the list.
                 if self.stack.pop().is_none() {
                     self.focus = Focus::Convs;
                 }
             }
-            (KeyCode::Tab, _) => self.focus = Focus::Convs,
+            Some(Action::OtherPane) => self.focus = Focus::Convs,
+            Some(Action::Keys) => self.open_keys(),
             _ => {}
         }
     }
@@ -3469,6 +3627,8 @@ enum Command {
     /// `colorpalette [name]`: edit and persist the semantic UI colors,
     /// starting from a named palette when one is given.
     ColorPalette(String),
+    /// `keys`: rebind what the lists' keys do.
+    Keys,
 }
 
 /// `find x`, `search x`, `leave`, `leave #name`; a leading slash is ignored.
@@ -3484,6 +3644,7 @@ fn parse_command(line: &str) -> Option<Command> {
         "mute" => Some(Command::Mute(true, rest.to_string())),
         "unmute" => Some(Command::Mute(false, rest.to_string())),
         "colorpalette" | "palette" | "colors" => Some(Command::ColorPalette(rest.to_string())),
+        "keys" | "keybindings" if rest.is_empty() => Some(Command::Keys),
         "cache" => {
             let (op, name) = match rest.split_once(char::is_whitespace) {
                 Some((o, n)) => (o, n.trim()),

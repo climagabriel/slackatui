@@ -43,6 +43,11 @@ pub const COMMANDS: &[Cmd] = &[
         help: "the hourly archive refresh, or the color cached conversations take",
     },
     Cmd {
+        name: "keys",
+        args: "",
+        help: "rebind what the keys do in the lists",
+    },
+    Cmd {
         name: "colorpalette",
         args: "[name]",
         help: "edit and persist the UI colors, from a named palette when given",

@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, ImageState, Mode, PromptKind, Sort, View};
 use crate::complete;
+use crate::keys::DEFAULTS;
 use crate::palette::{Palette, Role, ROLES};
 use crate::render::{self, Ctx};
 use ratatui_image::{Image, StatefulImage};
@@ -169,6 +170,10 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
     app.msgs_height = inner.height as usize;
     if inner.width < 4 || inner.height == 0 {
+        return;
+    }
+    if let Some(View::Keys { .. }) = app.stack.last() {
+        draw_keys(frame, app, inner);
         return;
     }
     if let Some(View::ColorPalette { .. }) = app.stack.last() {
@@ -432,6 +437,58 @@ fn editor_lines(ed: &crate::edit::Editor, prefix: Span<'static>) -> Vec<Line<'st
     out
 }
 
+/// `/keys`: one action per row with the keys that reach it.
+fn draw_keys(frame: &mut Frame, app: &App, inner: Rect) {
+    let Some(View::Keys {
+        cursor, capture, ..
+    }) = app.stack.last()
+    else {
+        return;
+    };
+    let visible = inner.height.saturating_sub(3) as usize;
+    let first = cursor
+        .saturating_sub(visible / 2)
+        .min(DEFAULTS.len().saturating_sub(visible));
+    let mut lines = vec![Line::from(Span::styled(
+        " action                                     keys",
+        Style::new().add_modifier(Modifier::DIM),
+    ))];
+    for (index, (action, _)) in DEFAULTS.iter().enumerate().skip(first).take(visible) {
+        let selected = index == *cursor;
+        let marker = if selected { "›" } else { " " };
+        let label_style = if selected {
+            Style::new()
+                .fg(app.palette.get(Role::Accent))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        let bound = app.keymap.text(*action);
+        let keys_style = if selected && capture.is_some() {
+            Style::new()
+                .fg(app.palette.get(Role::Status))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(app.palette.get(Role::Code))
+        };
+        let shown = if selected && capture.is_some() {
+            "press a key…".to_string()
+        } else {
+            bound
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker} {:<40}", action.label()), label_style),
+            Span::styled(shown, keys_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " j/k action · e bind · A add · d reset action · D reset all · Enter save · Esc cancel",
+        Style::new().add_modifier(Modifier::DIM),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
     let Some(View::ColorPalette { cursor, .. }) = app.stack.last() else {
         return;
@@ -668,7 +725,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "/",
-        "a command, Tab completes it and its argument: colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
+        "a command, Tab completes it and its argument: keys rebinds what the keys below do (this guide shows the defaults); colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
     ),
     (
         "o",
