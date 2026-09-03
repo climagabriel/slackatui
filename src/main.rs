@@ -6,6 +6,7 @@ mod archive;
 mod auth;
 mod edit;
 mod live;
+mod palette;
 mod render;
 mod ui;
 
@@ -76,6 +77,8 @@ environment
                        (default /var/lock/slackdump-sync.lock)
   SLACK_TUI_CACHE      where fetched threads live
                        (default $XDG_CACHE_HOME/slack-tui/live, i.e. ~/.cache/...)
+  SLACK_TUI_PALETTE    where /colorpalette saves UI colors (default
+                       $XDG_CONFIG_HOME/slack-tui/palette.json, or ~/.config/...)
   SLACKDUMPS           archive root when --root is not given
   SLACK_SELF_USER_ID   your own user id: names direct messages by the other
                        party and counts your messages per conversation
@@ -83,7 +86,8 @@ environment
 
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
-  Enter thread, Esc back, / a command (find, search, leave), d go to date, v raw JSON,
+  Enter thread, Esc back, / a command (colorpalette, find, search, leave),
+  d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
   i view a message's images, I inline thumbnails on/off, C highlight cached,
@@ -426,6 +430,20 @@ fn run() -> i32 {
     let lock = std::env::var_os("SLACKDUMP_LOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/lock/slackdump-sync.lock"));
+    let palette_path = std::env::var_os("SLACK_TUI_PALETTE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .filter(|value| !value.is_empty())
+                        .map(|home| PathBuf::from(home).join(".config"))
+                })
+                .map(|dir| dir.join("slack-tui").join("palette.json"))
+        });
     let mut app = App::new(
         corpus,
         opts.tz,
@@ -435,6 +453,7 @@ fn run() -> i32 {
         cache_dir,
         lock,
         opts.poll,
+        palette_path,
     );
     if opts.list {
         let mut text = String::new();

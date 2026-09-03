@@ -2,13 +2,14 @@
 //! status lines below, a help overlay on demand.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, ImageState, Mode, PromptKind, Sort, View};
+use crate::palette::{Palette, Role, ROLES};
 use crate::render::{self, Ctx};
 use ratatui_image::{Image, StatefulImage};
 
@@ -24,15 +25,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_msgs(frame, app, right);
     draw_status(frame, app, status);
     if app.help {
-        draw_help(frame, area);
+        draw_help(frame, area, &app.palette);
     }
 }
 
-fn border(focused: bool) -> Style {
+fn border(focused: bool, palette: &Palette) -> Style {
     if focused {
-        Style::new().fg(Color::Cyan)
+        Style::new().fg(palette.get(Role::Accent))
     } else {
-        Style::new().add_modifier(Modifier::DIM)
+        Style::new()
+            .fg(palette.get(Role::InactiveAccent))
+            .add_modifier(Modifier::DIM)
     }
 }
 
@@ -52,7 +55,9 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!(" {} · '{}' ", app.filtered.len(), app.filter)
     };
-    let block = Block::bordered().title(title).border_style(border(focused));
+    let block = Block::bordered()
+        .title(title)
+        .border_style(border(focused, &app.palette));
     let inner = block.inner(area);
     let width = inner.width as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
@@ -89,10 +94,10 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             let pad = room.saturating_sub(name.width());
             let mut name_style = if c.unread {
                 Style::new()
-                    .fg(Color::LightYellow)
+                    .fg(app.palette.get(Role::Unread))
                     .add_modifier(Modifier::BOLD)
             } else if app.highlight_cached && !c.live_only {
-                Style::new().fg(Color::LightGreen)
+                Style::new().fg(app.palette.get(Role::Cached))
             } else if c.live_only || c.left {
                 Style::new().add_modifier(Modifier::DIM)
             } else {
@@ -108,14 +113,14 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             ])
         })
         .collect();
-    // The cursor's row is rewritten black on white rather than styled through
-    // `highlight_style`: a span carries its own colour, which would win.
+    // The cursor's row is rewritten with the palette's selection colors rather
+    // than styled through `highlight_style`: a span's own color would win.
     let items: Vec<ListItem> = items
         .into_iter()
         .enumerate()
         .map(|(k, line)| {
             ListItem::new(if k == app.conv_cursor {
-                on_cursor(line, focused)
+                on_cursor(line, focused, &app.palette)
             } else {
                 line
             })
@@ -136,11 +141,17 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         " {} ",
         clip(&app.title(), area.width.saturating_sub(4) as usize)
     );
-    let block = Block::bordered().title(title).border_style(border(focused));
+    let block = Block::bordered()
+        .title(title)
+        .border_style(border(focused, &app.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.msgs_height = inner.height as usize;
     if inner.width < 4 || inner.height == 0 {
+        return;
+    }
+    if let Some(View::ColorPalette { .. }) = app.stack.last() {
+        draw_color_palette(frame, app, inner);
         return;
     }
     if let Some(View::Emoji { .. }) = app.stack.last() {
@@ -180,6 +191,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         open,
         stack,
         tz,
+        palette,
         ..
     } = app;
     let Some(open) = open.as_mut() else {
@@ -207,6 +219,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         tz: *tz,
         image_font,
         last_read,
+        palette,
     };
     let text_w = inner.width as usize - 1;
     list.rebuild(&ctx, text_w);
@@ -215,9 +228,9 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     let gutter_on = Span::styled(
         "▎",
         Style::new().fg(if focused {
-            Color::Cyan
+            palette.get(Role::Accent)
         } else {
-            Color::DarkGray
+            palette.get(Role::InactiveAccent)
         }),
     );
     let header_line = list.first.get(cursor).copied();
@@ -239,7 +252,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         spans.extend(fl.line.spans.iter().cloned());
         let mut line = Line::from(spans);
         if selected && header_line == Some(i) {
-            line = on_cursor(line, focused);
+            line = on_cursor(line, focused, palette);
         }
         shown.push(line);
     }
@@ -290,7 +303,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// The full-pane viewer: the original file, fitted to the pane.
 /// The reaction picker: the query on the first row, matches below it, the
-/// cursor row reversed. With no match, Enter sends the query as typed.
+/// cursor row selected. With no match, Enter sends the query as typed.
 fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
     let Some(View::Emoji {
         target,
@@ -305,7 +318,7 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
         query,
         Span::styled(
             format!(" {} with: ", target.label),
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(app.palette.get(Role::Accent)),
         ),
     );
     let rows = inner.height.saturating_sub(1) as usize;
@@ -327,7 +340,9 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
         for (k, &i) in matches.iter().enumerate().skip(first).take(rows) {
             let (name, glyph) = &app.emoji_table[i];
             let style = if k == *cursor {
-                Style::new().bg(Color::White).fg(Color::Black)
+                Style::new()
+                    .bg(app.palette.get(Role::SelectionBackground))
+                    .fg(app.palette.get(Role::SelectionText))
             } else {
                 Style::new()
             };
@@ -340,19 +355,25 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The cursor's row: black on white where the pane has the focus, black on
-/// grey where it does not, with each span's own colour dropped so the text
-/// stays readable. Bold, italic and underline survive. A row is rewritten
-/// rather than styled from outside because a span's own colour would win.
-fn on_cursor(line: Line<'_>, focused: bool) -> Line<'_> {
+/// The cursor's row uses the palette's active or inactive selection background,
+/// with each span's own color dropped so the text stays readable. Bold, italic
+/// and underline survive. A row is rewritten because a span's color would win.
+fn on_cursor<'a>(line: Line<'a>, focused: bool, palette: &Palette) -> Line<'a> {
     let keep = Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED;
-    let bg = if focused { Color::White } else { Color::Gray };
+    let bg = palette.get(if focused {
+        Role::SelectionBackground
+    } else {
+        Role::InactiveSelectionBackground
+    });
     let spans: Vec<Span> = line
         .spans
         .into_iter()
         .map(|s| {
             let m = s.style.add_modifier & keep;
-            let style = Style::new().bg(bg).fg(Color::Black).add_modifier(m);
+            let style = Style::new()
+                .bg(bg)
+                .fg(palette.get(Role::SelectionText))
+                .add_modifier(m);
             Span::styled(s.content, style)
         })
         .collect();
@@ -388,6 +409,60 @@ fn editor_lines(ed: &crate::edit::Editor, prefix: Span<'static>) -> Vec<Line<'st
         out.push(Line::from(spans));
     }
     out
+}
+
+fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
+    let Some(View::ColorPalette { cursor, .. }) = app.stack.last() else {
+        return;
+    };
+    let visible = inner.height.saturating_sub(3) as usize;
+    let first = cursor
+        .saturating_sub(visible / 2)
+        .min(ROLES.len().saturating_sub(visible));
+    let mut lines = vec![Line::from(Span::styled(
+        " semantic role                 preview   color",
+        Style::new().add_modifier(Modifier::DIM),
+    ))];
+    for (index, role) in ROLES.iter().enumerate().skip(first).take(visible) {
+        let selected = index == *cursor;
+        let marker = if selected { "›" } else { " " };
+        let label_style = if selected {
+            Style::new()
+                .fg(app.palette.get(Role::Accent))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        let sample_style = match role {
+            Role::SelectionText => Style::new()
+                .fg(app.palette.get(*role))
+                .bg(app.palette.get(Role::SelectionBackground)),
+            Role::SelectionBackground => Style::new()
+                .fg(app.palette.get(Role::SelectionText))
+                .bg(app.palette.get(*role)),
+            Role::InactiveSelectionBackground => Style::new()
+                .fg(app.palette.get(Role::SelectionText))
+                .bg(app.palette.get(*role)),
+            _ => Style::new()
+                .fg(app.palette.get(*role))
+                .add_modifier(Modifier::BOLD),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker} {:<28}", role.label()), label_style),
+            Span::styled(" sample ", sample_style),
+            Span::raw("  "),
+            Span::styled(
+                app.palette.color_name(*role),
+                Style::new().fg(app.palette.get(*role)),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " j/k role · h/l color · d reset role · D reset all · Enter save · Esc cancel",
+        Style::new().add_modifier(Modifier::DIM),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
@@ -442,6 +517,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if let Mode::Prompt { kind, buf, .. } = &app.mode {
         let label = match kind {
             PromptKind::Command => "",
+            PromptKind::PaletteColor => "color (a name, or #rrggbb)",
             PromptKind::Date => "go to date (YYYY-MM-DD)",
             PromptKind::Archive => "archive a conversation from Slack, last 90 days (URL or id)",
             PromptKind::Compose => app
@@ -456,7 +532,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!(" {label}: ")
             },
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(app.palette.get(Role::Accent)),
         );
         let lines = editor_lines(buf, prefix);
         frame.render_widget(Paragraph::new(lines), area);
@@ -471,19 +547,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 job.label,
                 job.started.elapsed().as_secs()
             ),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(app.palette.get(Role::Status)),
         ));
     }
     if !app.status.is_empty() {
         spans.push(Span::styled(
             format!("{}  ", app.status),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(app.palette.get(Role::Status)),
         ));
     }
     if let Some(m) = app.selected() {
         spans.push(Span::styled(
             m.permalink(&app.corpus.workspace_url),
-            Style::new().fg(Color::Blue),
+            Style::new().fg(app.palette.get(Role::Link)),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -508,7 +584,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "/",
-        "a command, each taking an optional #name: find|search TEXT filters the list or searches the open conversation; leave; mute|unmute (kept at the end of the list; Slack's own muted channels count too); cache start|stop|wipe (archive it, pause its hourly refresh, delete its archive)",
+        "a command: colorpalette edits UI colors (h/l cycles, e types a name or #rrggbb, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name",
     ),
     (
         "o",
@@ -521,7 +597,7 @@ const HELP: &[(&str, &str)] = &[
         "the selected message's images, full pane; j/k between them",
     ),
     ("I", "inline image thumbnails on/off"),
-    ("C", "highlight cached conversations in light green on/off"),
+    ("C", "highlight cached conversations in the palette color on/off"),
     ("U", "unread conversations on top on/off"),
     (
         "c",
@@ -564,7 +640,7 @@ const HELP: &[(&str, &str)] = &[
 
 const HELP_NOTE: &str = "The unread part of a conversation starts at the highlighted day divider; the list marks unread conversations with ● and the mention count.";
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect, palette: &Palette) {
     let w = 96.min(area.width.saturating_sub(2));
     let h = (HELP.len() as u16 + 4).min(area.height.saturating_sub(2));
     let rect = Rect {
@@ -577,7 +653,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let mut lines = Vec::new();
     for (k, v) in HELP {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {k:<28} "), Style::new().fg(Color::Cyan)),
+            Span::styled(
+                format!("  {k:<28} "),
+                Style::new().fg(palette.get(Role::Accent)),
+            ),
             Span::raw(*v),
         ]));
     }
@@ -592,7 +671,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     )));
     let block = Block::bordered()
         .title(" keys ")
-        .border_style(Style::new().fg(Color::Cyan));
+        .border_style(Style::new().fg(palette.get(Role::Accent)));
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), rect);
 }
 
@@ -636,6 +715,7 @@ pub fn dump(app: &mut App, width: usize) -> String {
         tz: app.tz,
         image_font: None,
         last_read: None,
+        palette: &app.palette,
     };
     open.list.rebuild(&ctx, width);
     open.list

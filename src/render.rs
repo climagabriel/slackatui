@@ -4,12 +4,13 @@
 //! ratatui lines.
 
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Utc};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use crate::archive::{Archive, Corpus, FileInfo, Msg};
+use crate::palette::{Palette, Role};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tz {
@@ -77,6 +78,7 @@ pub struct Ctx<'a> {
     pub image_font: Option<(u16, u16)>,
     /// The owner's read marker in this timeline: what follows it is new.
     pub last_read: Option<i64>,
+    pub palette: &'a Palette,
 }
 
 /// Rows reserved under a message for one image, at their position.
@@ -248,19 +250,21 @@ pub fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn style_of(s: Sty) -> Style {
+fn style_of(s: Sty, palette: &Palette) -> Style {
     let mut st = Style::new();
     if s.mention {
-        st = st.fg(Color::Cyan);
+        st = st.fg(palette.get(Role::Mention));
     }
     if s.me {
-        st = st.fg(Color::LightYellow);
+        st = st.fg(palette.get(Role::OwnUsername));
     }
     if s.link {
-        st = st.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+        st = st
+            .fg(palette.get(Role::Link))
+            .add_modifier(Modifier::UNDERLINED);
     }
     if s.code || s.pre {
-        st = st.fg(Color::Yellow);
+        st = st.fg(palette.get(Role::Code));
     }
     if s.bold {
         st = st.add_modifier(Modifier::BOLD);
@@ -937,7 +941,7 @@ fn is_blank(line: &Line) -> bool {
 
 /// Greedy word-wrap. A word wider than the line stays whole on its own line
 /// (a long URL is clipped, never split, so it stays clickable).
-pub fn wrap(segs: &[Seg], width: usize, indent: &str) -> Vec<Line<'static>> {
+pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<Line<'static>> {
     let avail = width.saturating_sub(indent.width()).max(8);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
@@ -971,7 +975,7 @@ pub fn wrap(segs: &[Seg], width: usize, indent: &str) -> Vec<Line<'static>> {
                     cur_w += 1;
                 }
                 for (t, s) in parts {
-                    cur.push(Span::styled(t, style_of(s)));
+                    cur.push(Span::styled(t, style_of(s, palette)));
                 }
                 cur_w += w;
             }
@@ -1070,7 +1074,7 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
                 ..Sty::default()
             },
         )];
-        let mut lines = wrap(&segs, width, "       · ");
+        let mut lines = wrap(&segs, width, "       · ", ctx.palette);
         if let Some(first) = lines.first_mut() {
             first.spans[0] = Span::styled(format!("{time}  · "), dim);
         }
@@ -1110,15 +1114,15 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
     }
     let is_me = m.user.is_some() && m.user.as_deref() == ctx.corpus.me.as_deref();
     let author_style = Style::new()
-        .fg(if is_me {
-            Color::LightYellow
+        .fg(ctx.palette.get(if is_me {
+            Role::OwnUsername
         } else {
-            Color::LightBlue
-        })
+            Role::OtherUsername
+        }))
         .add_modifier(Modifier::BOLD);
     spans[2] = Span::styled(author, author_style);
     lines.push(Line::from(spans));
-    lines.extend(wrap(&body(m, ctx), width, "  "));
+    lines.extend(wrap(&body(m, ctx), width, "  ", ctx.palette));
     for f in m.files() {
         let kind = match f.mode.as_str() {
             "snippet" => "snippet",
@@ -1172,7 +1176,10 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
         } else {
             format!("  ↳ {n} {}{last}", plural(n))
         };
-        lines.push(Line::from(Span::styled(s, Style::new().fg(Color::Yellow))));
+        lines.push(Line::from(Span::styled(
+            s,
+            Style::new().fg(ctx.palette.get(Role::ThreadInfo)),
+        )));
     }
     Rendered { lines, images }
 }
@@ -1183,9 +1190,9 @@ fn bar_len(text: &str, width: usize) -> usize {
 }
 
 /// The divider that opens the unread part of a conversation.
-pub fn divider_new(text: &str, width: usize) -> Line<'static> {
+pub fn divider_new(text: &str, width: usize, palette: &Palette) -> Line<'static> {
     let style = Style::new()
-        .fg(Color::LightYellow)
+        .fg(palette.get(Role::Unread))
         .add_modifier(Modifier::BOLD);
     let bar = "─".repeat(bar_len(text, width));
     Line::from(Span::styled(format!("{bar} {text} {bar}"), style))
@@ -1205,6 +1212,8 @@ pub fn line_text(l: &Line) -> String {
 mod tests {
     use super::*;
 
+    static TEST_PALETTE: std::sync::LazyLock<Palette> = std::sync::LazyLock::new(Palette::default);
+
     fn ctx<'a>(archive: &'a Archive, corpus: &'a Corpus) -> Ctx<'a> {
         Ctx {
             archive,
@@ -1212,6 +1221,7 @@ mod tests {
             tz: Tz::Utc,
             image_font: None,
             last_read: None,
+            palette: &TEST_PALETTE,
         }
     }
 
@@ -1234,6 +1244,26 @@ mod tests {
             .iter()
             .any(|s| s.sty.mention && s.text == "@gabriel.clima"));
         assert!(segs.iter().any(|s| s.sty.link && s.text == "the page"));
+    }
+
+    #[test]
+    fn palette_colors_own_author_and_unread_differently() {
+        let mut palette = Palette::default();
+        palette.set(Role::OwnUsername, ratatui::style::Color::Green);
+        palette.set(Role::Unread, ratatui::style::Color::LightRed);
+        let own = style_of(
+            Sty {
+                me: true,
+                ..Sty::default()
+            },
+            &palette,
+        );
+        assert_eq!(own.fg, Some(ratatui::style::Color::Green));
+        let divider = divider_new("new", 20, &palette);
+        assert_eq!(
+            divider.spans[0].style.fg,
+            Some(ratatui::style::Color::LightRed)
+        );
     }
 
     #[test]
@@ -1297,11 +1327,14 @@ mod tests {
             ..Sty::default()
         };
         let segs = mrkdwn("first\n\nsecond", &c, q);
-        let lines = wrap(&segs, 40, "  ");
+        let lines = wrap(&segs, 40, "  ", &TEST_PALETTE);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert_eq!(texts, vec!["  │ first", "  │ ", "  │ second"]);
         let segs = mrkdwn("&gt; quoted line\nplain", &c, Sty::default());
-        let texts: Vec<String> = wrap(&segs, 40, "").iter().map(line_text).collect();
+        let texts: Vec<String> = wrap(&segs, 40, "", &TEST_PALETTE)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(texts, vec!["│ quoted line", "plain"]);
     }
 
@@ -1309,7 +1342,7 @@ mod tests {
     fn dividers_fit_the_width_and_images_get_a_column_on_narrow_panes() {
         for w in [4usize, 12, 20, 60, 200] {
             let d = line_text(&divider("Wed 2026-09-02", w));
-            let n = line_text(&divider_new("new", w));
+            let n = line_text(&divider_new("new", w, &TEST_PALETTE));
             assert!(
                 d.width() <= w.max(20),
                 "divider {} wide for width {w}",
@@ -1343,13 +1376,19 @@ mod tests {
     #[test]
     fn wrap_breaks_between_words_and_keeps_long_words_whole() {
         let segs = vec![Seg::new("one two three four five", Sty::default())];
-        let texts: Vec<String> = wrap(&segs, 11, "").iter().map(line_text).collect();
+        let texts: Vec<String> = wrap(&segs, 11, "", &TEST_PALETTE)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(texts, vec!["one two", "three four", "five"]);
         let segs = vec![Seg::new(
             "x https://very.long.example/path/that/does/not/fit y",
             Sty::default(),
         )];
-        let texts: Vec<String> = wrap(&segs, 12, "").iter().map(line_text).collect();
+        let texts: Vec<String> = wrap(&segs, 12, "", &TEST_PALETTE)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(
             texts,
             vec!["x", "https://very.long.example/path/that/does/not/fit", "y"]
@@ -1370,7 +1409,10 @@ mod tests {
         )
         .unwrap();
         let segs = render_blocks(blocks.as_array().unwrap(), &c, Sty::default());
-        let texts: Vec<String> = wrap(&segs, 60, "").iter().map(line_text).collect();
+        let texts: Vec<String> = wrap(&segs, 60, "", &TEST_PALETTE)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(
             texts,
             vec!["hi @gwen.parker see here <https://a.b/c>", "• one", "• two"]

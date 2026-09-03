@@ -15,6 +15,7 @@ use crate::api::Client;
 use crate::archive::{ts_to_id, Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
 use crate::edit::Editor;
 use crate::live::{self, Done, Job, JobKind};
+use crate::palette::{Palette, Role, ROLES};
 use crate::render::{self, Ctx, ImageSlot, Tz};
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
@@ -134,7 +135,7 @@ impl MsgList {
             if prev_day != Some(day) {
                 let text = ctx.tz.fmt(m.secs(), "%a %Y-%m-%d");
                 let line = if new_here {
-                    render::divider_new(&format!("{text} · new"), width)
+                    render::divider_new(&format!("{text} · new"), width, ctx.palette)
                 } else {
                     render::divider(&text, width)
                 };
@@ -147,7 +148,7 @@ impl MsgList {
             } else if new_here {
                 self.flat.push(FlatLine {
                     msg: None,
-                    line: render::divider_new("new", width),
+                    line: render::divider_new("new", width, ctx.palette),
                     image: None,
                 });
             }
@@ -312,6 +313,12 @@ pub enum View {
         /// Indices into the emoji table that match the query.
         matches: Vec<usize>,
     },
+    /// `/colorpalette`: edit semantic UI colors with a live preview.
+    ColorPalette {
+        cursor: usize,
+        original: Palette,
+        return_focus: Focus,
+    },
     /// One message's images, full pane, one at a time.
     Image {
         files: Vec<crate::archive::FileInfo>,
@@ -340,6 +347,8 @@ pub enum PromptKind {
     Date,
     Archive,
     Compose,
+    /// A color for the role under the palette's cursor.
+    PaletteColor,
 }
 
 pub enum Mode {
@@ -396,7 +405,7 @@ pub struct App {
     /// Encoded inline thumbnails, by file id, with the cell size they were made for.
     pub inline: HashMap<String, (u16, u16, Protocol)>,
     pub file_job: Option<Job>,
-    /// `C`: cached conversations in light green.
+    /// `C`: cached conversations in the palette's cached color.
     pub highlight_cached: bool,
     /// `U`: unread conversations at the top of the list.
     pub unreads_first: bool,
@@ -419,6 +428,9 @@ pub struct App {
     pub draft: Option<Draft>,
     /// Bumped by every mark; a counts result from before it is stale.
     pub counts_gen: u64,
+    /// Semantic UI colors, loaded from and saved to `palette_path`.
+    pub palette: Palette,
+    pub palette_path: Option<PathBuf>,
 }
 
 impl App {
@@ -432,7 +444,15 @@ impl App {
         cache_dir: PathBuf,
         lock: PathBuf,
         poll_secs: u64,
+        palette_path: Option<PathBuf>,
     ) -> App {
+        let (palette, palette_status) = match Palette::load(palette_path.as_deref()) {
+            Ok(palette) => (palette, String::new()),
+            Err(error) => (
+                Palette::default(),
+                format!("palette: {error}; using defaults"),
+            ),
+        };
         let mut app = App {
             corpus,
             tz,
@@ -445,7 +465,7 @@ impl App {
             stack: Vec::new(),
             mode: Mode::Normal,
             help: false,
-            status: String::new(),
+            status: palette_status,
             quit: false,
             msgs_height: 0,
             half_life_days,
@@ -476,6 +496,8 @@ impl App {
             muted_pending: false,
             draft: None,
             counts_gen: 0,
+            palette,
+            palette_path,
         };
         app.apply_filter();
         if live {
@@ -543,9 +565,10 @@ impl App {
                     label: format!("reply in {who}'s thread in {name}"),
                 })
             }
-            Some(View::Raw { .. }) | Some(View::Image { .. }) | Some(View::Emoji { .. }) => {
-                Err("close this view first".to_string())
-            }
+            Some(View::Raw { .. })
+            | Some(View::Image { .. })
+            | Some(View::Emoji { .. })
+            | Some(View::ColorPalette { .. }) => Err("close this view first".to_string()),
             None => {
                 let conv = match (self.focus, self.open.as_ref()) {
                     (Focus::Msgs, Some(o)) => o.conv,
@@ -595,7 +618,7 @@ impl App {
                 }
                 if !line.trim().is_empty() {
                     self.status = format!(
-                        "unknown command: {}; commands: find|search TEXT, leave, mute, unmute, cache start|stop|wipe, each with an optional #name",
+                        "unknown command: {}; commands: colorpalette; find|search TEXT; leave, mute, unmute, cache start|stop|wipe with an optional #name",
                         line.split_whitespace().next().unwrap_or("")
                     );
                 }
@@ -622,6 +645,131 @@ impl App {
                 self.restore_filter(filter_before);
                 self.mute_cmd(on, &name);
             }
+            Some(Command::ColorPalette) => {
+                self.restore_filter(filter_before);
+                self.open_color_palette();
+            }
+        }
+    }
+
+    fn open_color_palette(&mut self) {
+        let return_focus = self.focus;
+        self.stack.push(View::ColorPalette {
+            cursor: 0,
+            original: self.palette.clone(),
+            return_focus,
+        });
+        self.focus = Focus::Msgs;
+        self.status =
+            "j/k a role; h/l a color; e types one (name or #rrggbb); d resets it, D resets all; Enter saves; Esc cancels"
+                .to_string();
+    }
+
+    /// `e` in the palette: a color typed as a name or as `#rrggbb`.
+    fn set_palette_color(&mut self, text: &str) {
+        let Some(role) = self.palette_role() else {
+            return;
+        };
+        match crate::palette::parse_color(text) {
+            Some(color) => {
+                self.palette.set(role, color);
+                self.mark_all_dirty();
+                self.status = format!("{}: {}", role.label(), self.palette.color_name(role));
+            }
+            None => {
+                self.status = format!("{text:?} is not a color name or #rrggbb");
+            }
+        }
+    }
+
+    fn palette_role(&self) -> Option<Role> {
+        match self.stack.last() {
+            Some(View::ColorPalette { cursor, .. }) => ROLES.get(*cursor).copied(),
+            _ => None,
+        }
+    }
+
+    fn on_palette_key(&mut self, key: KeyEvent, control: bool) {
+        match (key.code, control) {
+            (KeyCode::Char('c'), true) | (KeyCode::Char('q'), false) => self.quit = true,
+            (KeyCode::Char('?'), false) | (KeyCode::Char('H'), false) => self.help = true,
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
+                if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = (*cursor + 1).min(ROLES.len() - 1);
+                }
+            }
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
+                if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => {
+                if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = 0;
+                }
+            }
+            (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
+                if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = ROLES.len() - 1;
+                }
+            }
+            (KeyCode::Char('h'), false) | (KeyCode::Left, _) => {
+                if let Some(role) = self.palette_role() {
+                    self.palette.cycle(role, -1);
+                    self.mark_all_dirty();
+                }
+            }
+            (KeyCode::Char('l'), false) | (KeyCode::Right, _) => {
+                if let Some(role) = self.palette_role() {
+                    self.palette.cycle(role, 1);
+                    self.mark_all_dirty();
+                }
+            }
+            (KeyCode::Char('d'), false) => {
+                if let Some(role) = self.palette_role() {
+                    self.palette.reset(role);
+                    self.mark_all_dirty();
+                }
+            }
+            (KeyCode::Char('e'), false) => {
+                if let Some(role) = self.palette_role() {
+                    self.mode = Mode::Prompt {
+                        kind: PromptKind::PaletteColor,
+                        buf: Editor::with(self.palette.color_name(role)),
+                        previous: String::new(),
+                    };
+                }
+            }
+            (KeyCode::Char('D'), false) => {
+                self.palette = Palette::default();
+                self.mark_all_dirty();
+            }
+            (KeyCode::Enter, _) => {
+                let return_focus = match self.stack.pop() {
+                    Some(View::ColorPalette { return_focus, .. }) => return_focus,
+                    _ => return,
+                };
+                self.focus = return_focus;
+                self.status = match self.palette.save(self.palette_path.as_deref()) {
+                    Ok(path) => format!("color palette saved to {}", path.display()),
+                    Err(error) => format!("palette: {error}"),
+                };
+            }
+            (KeyCode::Esc, _) => {
+                let (original, return_focus) = match self.stack.pop() {
+                    Some(View::ColorPalette {
+                        original,
+                        return_focus,
+                        ..
+                    }) => (original, return_focus),
+                    _ => return,
+                };
+                self.palette = original;
+                self.focus = return_focus;
+                self.mark_all_dirty();
+                self.status = "color palette unchanged".to_string();
+            }
+            _ => {}
         }
     }
 
@@ -1191,7 +1339,7 @@ impl App {
         if !needle.is_empty() {
             idx.sort_by_key(|&i| rank(&convs[i].name).unwrap_or(2));
         }
-        // Muted conversations keep their unread colour but sink to the end.
+        // Muted conversations keep their unread color but sink to the end.
         idx.sort_by_key(|&i| convs[i].muted);
         // Keep the highlighted conversation highlighted across a re-sort.
         let current = self.filtered.get(self.conv_cursor).copied();
@@ -1211,6 +1359,7 @@ impl App {
             tz: self.tz,
             image_font: self.image_font(),
             last_read: None,
+            palette: &self.palette,
         }
     }
 
@@ -2709,7 +2858,10 @@ impl App {
         match self.stack.iter().rev().find(|v| {
             !matches!(
                 v,
-                View::Raw { .. } | View::Image { .. } | View::Emoji { .. }
+                View::Raw { .. }
+                    | View::Image { .. }
+                    | View::Emoji { .. }
+                    | View::ColorPalette { .. }
             )
         }) {
             Some(View::Thread { list, .. })
@@ -2723,7 +2875,10 @@ impl App {
         match self.stack.iter_mut().rev().find(|v| {
             !matches!(
                 v,
-                View::Raw { .. } | View::Image { .. } | View::Emoji { .. }
+                View::Raw { .. }
+                    | View::Image { .. }
+                    | View::Emoji { .. }
+                    | View::ColorPalette { .. }
             )
         }) {
             Some(View::Thread { list, .. })
@@ -2751,12 +2906,18 @@ impl App {
 
     /// Title of the messages pane.
     pub fn title(&self) -> String {
+        if matches!(self.stack.last(), Some(View::ColorPalette { .. })) {
+            return "color palette · live preview".to_string();
+        }
         let Some(o) = self.open.as_ref() else {
             return "messages".to_string();
         };
         let conv = &self.corpus.convs[o.conv];
         let a = &self.corpus.archives[conv.archive];
         match self.stack.last() {
+            Some(View::ColorPalette { .. }) => {
+                unreachable!("handled before opening a conversation")
+            }
             Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
             Some(View::Image { files, index, .. }) => {
                 let f = &files[*index];
@@ -2869,6 +3030,10 @@ impl App {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(View::ColorPalette { .. }) = self.stack.last() {
+            self.on_palette_key(k, ctrl);
+            return;
+        }
         if let Some(View::Emoji { .. }) = self.stack.last() {
             self.on_emoji_key(k, ctrl);
             return;
@@ -3202,6 +3367,7 @@ impl App {
                     PromptKind::Date => self.goto_date(&text),
                     PromptKind::Archive => self.archive_new(&text),
                     PromptKind::Compose => self.send_message(text),
+                    PromptKind::PaletteColor => self.set_palette_color(&text),
                 }
             }
             _ => {
@@ -3227,6 +3393,8 @@ enum Command {
     Cache(String, String),
     /// `mute [#name]` (true) and `unmute [#name]` (false).
     Mute(bool, String),
+    /// `colorpalette`: edit and persist the semantic UI colors.
+    ColorPalette,
 }
 
 /// `find x`, `search x`, `leave`, `leave #name`; a leading slash is ignored.
@@ -3241,6 +3409,7 @@ fn parse_command(line: &str) -> Option<Command> {
         "leave" => Some(Command::Leave(rest.to_string())),
         "mute" => Some(Command::Mute(true, rest.to_string())),
         "unmute" => Some(Command::Mute(false, rest.to_string())),
+        "colorpalette" | "palette" | "colors" if rest.is_empty() => Some(Command::ColorPalette),
         "cache" => {
             let (op, name) = match rest.split_once(char::is_whitespace) {
                 Some((o, n)) => (o, n.trim()),
@@ -3401,6 +3570,9 @@ mod tests {
             parse_command("unmute"),
             Some(Command::Mute(false, String::new()))
         );
+        assert_eq!(parse_command("/colorpalette"), Some(Command::ColorPalette));
+        assert_eq!(parse_command("colors"), Some(Command::ColorPalette));
+        assert_eq!(parse_command("colorpalette extra"), None);
         assert_eq!(parse_command(""), None);
     }
 
@@ -3465,6 +3637,7 @@ mod tests {
             tz: Tz::Utc,
             image_font: None,
             last_read: Some(read_marker),
+            palette: &Palette::default(),
         };
         list.rebuild(&ctx, 60);
         let texts: Vec<String> = list.flat.iter().map(|fl| line_text(&fl.line)).collect();
@@ -3491,6 +3664,7 @@ mod tests {
             tz: Tz::Utc,
             image_font: None,
             last_read: None,
+            palette: &Palette::default(),
         };
         list.rebuild(&ctx, 60);
         assert!(list

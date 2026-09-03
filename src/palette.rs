@@ -1,0 +1,332 @@
+//! Persistent semantic colors for the terminal UI.
+
+use std::path::{Path, PathBuf};
+
+use ratatui::style::Color;
+use serde_json::{Map, Value};
+
+pub const ROLE_COUNT: usize = 14;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Role {
+    Accent,
+    InactiveAccent,
+    OwnUsername,
+    OtherUsername,
+    Unread,
+    Cached,
+    Mention,
+    Link,
+    Code,
+    ThreadInfo,
+    Status,
+    SelectionText,
+    SelectionBackground,
+    InactiveSelectionBackground,
+}
+
+pub const ROLES: [Role; ROLE_COUNT] = [
+    Role::Accent,
+    Role::InactiveAccent,
+    Role::OwnUsername,
+    Role::OtherUsername,
+    Role::Unread,
+    Role::Cached,
+    Role::Mention,
+    Role::Link,
+    Role::Code,
+    Role::ThreadInfo,
+    Role::Status,
+    Role::SelectionText,
+    Role::SelectionBackground,
+    Role::InactiveSelectionBackground,
+];
+
+impl Role {
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Accent => "accent / focus",
+            Role::InactiveAccent => "inactive focus",
+            Role::OwnUsername => "my username",
+            Role::OtherUsername => "other usernames",
+            Role::Unread => "unread",
+            Role::Cached => "cached conversations",
+            Role::Mention => "mentions",
+            Role::Link => "links",
+            Role::Code => "code",
+            Role::ThreadInfo => "thread information",
+            Role::Status => "status / warnings",
+            Role::SelectionText => "selected text",
+            Role::SelectionBackground => "selected row",
+            Role::InactiveSelectionBackground => "inactive selected row",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Role::Accent => "accent",
+            Role::InactiveAccent => "inactive_accent",
+            Role::OwnUsername => "own_username",
+            Role::OtherUsername => "other_username",
+            Role::Unread => "unread",
+            Role::Cached => "cached",
+            Role::Mention => "mention",
+            Role::Link => "link",
+            Role::Code => "code",
+            Role::ThreadInfo => "thread_info",
+            Role::Status => "status",
+            Role::SelectionText => "selection_text",
+            Role::SelectionBackground => "selection_background",
+            Role::InactiveSelectionBackground => "inactive_selection_background",
+        }
+    }
+
+    pub fn default_color(self) -> Color {
+        match self {
+            Role::Accent | Role::Mention => Color::Cyan,
+            Role::InactiveAccent => Color::DarkGray,
+            Role::OwnUsername => Color::LightMagenta,
+            Role::OtherUsername => Color::LightBlue,
+            Role::Unread => Color::LightYellow,
+            Role::Cached => Color::LightGreen,
+            Role::Link => Color::Blue,
+            Role::Code | Role::ThreadInfo | Role::Status => Color::Yellow,
+            Role::SelectionText => Color::Black,
+            Role::SelectionBackground => Color::White,
+            Role::InactiveSelectionBackground => Color::Gray,
+        }
+    }
+}
+
+pub const COLORS: [(&str, Color); 16] = [
+    ("black", Color::Black),
+    ("dark gray", Color::DarkGray),
+    ("gray", Color::Gray),
+    ("white", Color::White),
+    ("red", Color::Red),
+    ("light red", Color::LightRed),
+    ("green", Color::Green),
+    ("light green", Color::LightGreen),
+    ("yellow", Color::Yellow),
+    ("light yellow", Color::LightYellow),
+    ("blue", Color::Blue),
+    ("light blue", Color::LightBlue),
+    ("magenta", Color::Magenta),
+    ("light magenta", Color::LightMagenta),
+    ("cyan", Color::Cyan),
+    ("light cyan", Color::LightCyan),
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Palette {
+    colors: [Color; ROLE_COUNT],
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        let mut colors = [Color::Reset; ROLE_COUNT];
+        for role in ROLES {
+            colors[role as usize] = role.default_color();
+        }
+        Self { colors }
+    }
+}
+
+impl Palette {
+    pub fn get(&self, role: Role) -> Color {
+        self.colors[role as usize]
+    }
+
+    pub fn set(&mut self, role: Role, color: Color) {
+        self.colors[role as usize] = color;
+    }
+
+    pub fn reset(&mut self, role: Role) {
+        self.set(role, role.default_color());
+    }
+
+    pub fn cycle(&mut self, role: Role, delta: isize) {
+        let at = COLORS
+            .iter()
+            .position(|(_, color)| *color == self.get(role))
+            .unwrap_or(0) as isize;
+        let next = (at + delta).rem_euclid(COLORS.len() as isize) as usize;
+        self.set(role, COLORS[next].1);
+    }
+
+    /// A color as it is typed and stored: one of the sixteen names, or
+    /// `#rrggbb` for anything else the terminal can show.
+    pub fn color_name(&self, role: Role) -> String {
+        color_name(self.get(role))
+    }
+
+    pub fn load(path: Option<&Path>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        let object = serde_json::from_str::<Value>(&text)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let object = object
+            .as_object()
+            .ok_or_else(|| format!("{}: expected a JSON object", path.display()))?;
+        let mut palette = Self::default();
+        for role in ROLES {
+            let Some(value) = object.get(role.key()) else {
+                continue;
+            };
+            let name = value.as_str().ok_or_else(|| {
+                format!("{}: {} must be a color name", path.display(), role.key())
+            })?;
+            let color = parse_color(name)
+                .ok_or_else(|| format!("{}: unknown color {name:?}", path.display()))?;
+            palette.set(role, color);
+        }
+        Ok(palette)
+    }
+
+    pub fn save(&self, path: Option<&Path>) -> Result<PathBuf, String> {
+        let path = path.ok_or_else(|| {
+            "no configuration directory; set SLACK_TUI_PALETTE to a file".to_string()
+        })?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+        let mut object = Map::new();
+        object.insert("version".to_string(), Value::from(1));
+        for role in ROLES {
+            object.insert(role.key().to_string(), Value::from(self.color_name(role)));
+        }
+        let text = serde_json::to_string_pretty(&object).map_err(|error| error.to_string())?;
+        let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&temporary, format!("{text}\n"))
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("{}: {error}", path.display()));
+        }
+        Ok(path.to_path_buf())
+    }
+}
+
+pub fn color_name(color: Color) -> String {
+    if let Some(name) = COLORS
+        .iter()
+        .find_map(|(name, value)| (*value == color).then_some(*name))
+    {
+        return name.to_string();
+    }
+    match color {
+        Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+/// A color name, or `#rgb` / `#rrggbb`.
+pub fn parse_color(name: &str) -> Option<Color> {
+    let text = name.trim();
+    if let Some(hex) = text.strip_prefix('#') {
+        let digits: Vec<u8> = hex
+            .chars()
+            .map(|c| c.to_digit(16).map(|d| d as u8))
+            .collect::<Option<Vec<u8>>>()?;
+        return match digits.len() {
+            3 => Some(Color::Rgb(digits[0] * 17, digits[1] * 17, digits[2] * 17)),
+            6 => Some(Color::Rgb(
+                digits[0] * 16 + digits[1],
+                digits[2] * 16 + digits[3],
+                digits[4] * 16 + digits[5],
+            )),
+            _ => None,
+        };
+    }
+    let normalized = text.to_lowercase().replace(['-', '_'], " ");
+    COLORS
+        .iter()
+        .find_map(|(known, color)| (*known == normalized).then_some(*color))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_file(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "slack-tui-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn own_username_and_unread_have_distinct_defaults() {
+        let palette = Palette::default();
+        assert_eq!(palette.get(Role::OwnUsername), Color::LightMagenta);
+        assert_eq!(palette.get(Role::Unread), Color::LightYellow);
+        assert_ne!(palette.get(Role::OwnUsername), palette.get(Role::Unread));
+    }
+
+    #[test]
+    fn palette_round_trips_and_missing_roles_keep_their_defaults() {
+        let path = temporary_file("round-trip");
+        let mut palette = Palette::default();
+        palette.set(Role::OwnUsername, Color::Green);
+        palette.set(Role::Unread, Color::LightRed);
+        palette.save(Some(&path)).unwrap();
+        assert_eq!(Palette::load(Some(&path)).unwrap(), palette);
+
+        std::fs::write(&path, "{\"own_username\":\"light-cyan\"}\n").unwrap();
+        let partial = Palette::load(Some(&path)).unwrap();
+        assert_eq!(partial.get(Role::OwnUsername), Color::LightCyan);
+        assert_eq!(partial.get(Role::Unread), Role::Unread.default_color());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn typed_colors_take_names_and_hex() {
+        assert_eq!(parse_color(" Light-Blue "), Some(Color::LightBlue));
+        assert_eq!(parse_color("#ff8800"), Some(Color::Rgb(255, 136, 0)));
+        assert_eq!(parse_color("#f80"), Some(Color::Rgb(255, 136, 0)));
+        assert_eq!(parse_color("#ff88"), None);
+        assert_eq!(parse_color("#gg0000"), None);
+        assert_eq!(color_name(Color::Rgb(255, 136, 0)), "#ff8800");
+        assert_eq!(color_name(Color::LightBlue), "light blue");
+
+        let path = temporary_file("hex");
+        let mut palette = Palette::default();
+        palette.set(Role::OwnUsername, Color::Rgb(1, 2, 3));
+        palette.save(Some(&path)).unwrap();
+        assert_eq!(Palette::load(Some(&path)).unwrap(), palette);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cycling_wraps_and_invalid_colors_are_rejected() {
+        let mut palette = Palette::default();
+        palette.set(Role::Accent, COLORS[0].1);
+        palette.cycle(Role::Accent, -1);
+        assert_eq!(palette.get(Role::Accent), COLORS[COLORS.len() - 1].1);
+        palette.cycle(Role::Accent, 1);
+        assert_eq!(palette.get(Role::Accent), COLORS[0].1);
+
+        let path = temporary_file("invalid");
+        std::fs::write(&path, "{\"accent\":\"ultraviolet\"}\n").unwrap();
+        let error = Palette::load(Some(&path)).unwrap_err();
+        assert!(error.contains("unknown color"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+}
