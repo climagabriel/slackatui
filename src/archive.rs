@@ -414,20 +414,28 @@ impl Corpus {
         self.users.get(uid).is_some_and(|u| u.is_bot)
     }
 
-    /// The conversation holding a channel id, if archived.
+    /// The archived entry wins when a conversation is listed twice, once
+    /// from an archive and once from Slack's membership list.
     pub fn conv_by_channel(&self, cid: &str) -> Option<usize> {
-        self.convs.iter().position(|c| c.id == cid)
+        let mut hits = self.convs.iter().enumerate().filter(|(_, c)| c.id == cid);
+        let first = hits.next()?;
+        Some(hits.find(|(_, c)| !c.live_only).unwrap_or(first).0)
     }
 
-    /// A conversation by display name, `#kudos` or `kudos`, case-insensitive.
+    /// A conversation by display name, `#kudos` or `kudos`, case-insensitive;
+    /// the archived entry wins over a live-only twin.
     pub fn conv_by_name(&self, name: &str) -> Option<usize> {
         let want = name.trim().trim_start_matches(['#', '@']).to_lowercase();
         if want.is_empty() {
             return None;
         }
-        self.convs
+        let mut hits = self
+            .convs
             .iter()
-            .position(|c| c.name.trim_start_matches(['#', '@']).to_lowercase() == want)
+            .enumerate()
+            .filter(|(_, c)| c.name.trim_start_matches(['#', '@']).to_lowercase() == want);
+        let first = hits.next()?;
+        Some(hits.find(|(_, c)| !c.live_only).unwrap_or(first).0)
     }
 
     #[cfg(test)]

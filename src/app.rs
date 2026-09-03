@@ -1112,10 +1112,14 @@ impl App {
             }
             Some(1)
         };
-        let mut idx: Vec<usize> = (0..self.corpus.convs.len())
+        // A live-only entry whose channel an archive also holds (one made by
+        // `a` or `/cache start` this run) stays out of the list.
+        let convs_all = &self.corpus.convs;
+        let mut idx: Vec<usize> = (0..convs_all.len())
             .filter(|&i| {
-                let c = &self.corpus.convs[i];
-                rank(&c.name).is_some() || c.id.to_lowercase() == needle
+                let c = &convs_all[i];
+                let twin = c.live_only && convs_all.iter().any(|x| !x.live_only && x.id == c.id);
+                !twin && (rank(&c.name).is_some() || c.id.to_lowercase() == needle)
             })
             .collect();
         let convs = &self.corpus.convs;
