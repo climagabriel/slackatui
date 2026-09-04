@@ -62,7 +62,7 @@ flags
                   no query. Under tmux or screen the query's responses can eat
                   the first key, so there it runs only when asked for.
   --call 'METHOD k=v ...'
-                  one Web API call with the signed-in session, JSON out (debug)
+                  one allowlisted read-only Web API call, JSON out (debug)
   --delete-message URL
                   delete your own message at that permalink (debug)
   --fetch-file URL OUT
@@ -159,6 +159,55 @@ struct Opts {
     call: Option<String>,
 }
 
+/// Methods the debug `--call` escape hatch may invoke. Keep this exact: Slack
+/// method-name prefixes mix reads and writes.
+const READ_ONLY_CALL_METHODS: &[&str] = &[
+    "auth.test",
+    "bots.info",
+    "bookmarks.list",
+    "client.counts",
+    "conversations.history",
+    "conversations.info",
+    "conversations.list",
+    "conversations.members",
+    "conversations.replies",
+    "dnd.info",
+    "emoji.list",
+    "files.info",
+    "files.list",
+    "pins.list",
+    "reactions.get",
+    "reminders.info",
+    "reminders.list",
+    "search.all",
+    "search.files",
+    "search.messages",
+    "stars.list",
+    "team.info",
+    "team.preferences.list",
+    "usergroups.list",
+    "usergroups.users.list",
+    "users.conversations",
+    "users.info",
+    "users.list",
+    "users.prefs.get",
+    "users.profile.get",
+];
+
+fn read_only_call_method(spec: &str) -> Result<&str, String> {
+    let method = spec
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "--call needs a method name".to_string())?;
+    if READ_ONLY_CALL_METHODS.contains(&method) {
+        Ok(method)
+    } else {
+        Err(format!(
+            "--call refuses '{method}': method is not in the read-only allowlist"
+        ))
+    }
+}
+
 fn parse_args() -> Result<Opts, String> {
     let mut opts = Opts {
         root: std::env::var_os("SLACKDUMPS")
@@ -223,7 +272,9 @@ fn parse_args() -> Result<Opts, String> {
                 opts.delete_message = Some(value("--delete-message")?);
             }
             "--call" => {
-                opts.call = Some(value("--call")?);
+                let spec = value("--call")?;
+                read_only_call_method(&spec)?;
+                opts.call = Some(spec);
             }
             "--poll" => {
                 opts.poll = value("--poll")?
@@ -335,10 +386,9 @@ fn run() -> i32 {
         eprintln!("credentials: {}", auth.source);
         if let Some(spec) = &opts.call {
             let mut words = spec.split_whitespace();
-            let Some(method) = words.next() else {
-                eprintln!("slack-tui: --call needs a method name");
-                return 2;
-            };
+            let method = words
+                .next()
+                .expect("parse_args validated the --call method");
             let params: Vec<(String, String)> = words
                 .filter_map(|w| {
                     w.split_once('=')
@@ -604,4 +654,44 @@ fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io:
     };
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_only_call_method, READ_ONLY_CALL_METHODS};
+
+    #[test]
+    fn call_allowlist_accepts_established_inspection_methods() {
+        for method in READ_ONLY_CALL_METHODS {
+            assert_eq!(read_only_call_method(method), Ok(*method));
+        }
+        assert_eq!(
+            read_only_call_method("conversations.info channel=C123"),
+            Ok("conversations.info")
+        );
+    }
+
+    #[test]
+    fn call_allowlist_rejects_writes_and_non_methods() {
+        for method in [
+            "apps.connections.open",
+            "chat.delete",
+            "chat.postMessage",
+            "conversations.join",
+            "conversations.leave",
+            "conversations.mark",
+            "files.completeUploadExternal",
+            "files.getUploadURLExternal",
+            "reactions.add",
+            "reactions.remove",
+            "users.prefs.set",
+        ] {
+            assert!(
+                read_only_call_method(method).is_err(),
+                "write method {method} passed the read-only allowlist"
+            );
+        }
+        assert!(read_only_call_method("").is_err());
+        assert!(read_only_call_method("conversations.info/../chat.postMessage").is_err());
+    }
 }
