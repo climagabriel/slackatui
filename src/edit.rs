@@ -134,13 +134,17 @@ impl Editor {
                 self.text.insert_str(self.cursor, &k);
                 self.cursor += k.len();
             }
-            (KeyCode::Char('j'), true, _) if multiline => {
-                self.text.insert(self.cursor, '\n');
-                self.cursor += 1;
-            }
+            (KeyCode::Char('j'), true, _) if multiline => self.newline(),
             _ => return false,
         }
         true
+    }
+
+    /// Breaks the line at the cursor, for the keys a caller reads before the
+    /// editor sees them.
+    pub fn newline(&mut self) {
+        self.text.insert(self.cursor, '\n');
+        self.cursor += 1;
     }
 
     /// Lines of text with the cursor as a byte range of one char (or an
@@ -227,5 +231,10 @@ mod tests {
         press(&mut e, KeyCode::Backspace, KeyModifiers::NONE);
         ctrl(&mut e, 'k');
         assert_eq!(e.text, "one");
+        // What Alt-Enter reaches, the prompt reading the key before the editor.
+        ctrl(&mut e, 'a');
+        e.newline();
+        assert_eq!(e.text, "\none");
+        assert_eq!(e.cursor, 1);
     }
 }

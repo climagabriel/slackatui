@@ -258,6 +258,13 @@ pub struct Draft {
     pub text: String,
 }
 
+/// A delete asked for and not confirmed yet: the same key again carries it
+/// out, anything else drops it.
+pub struct PendingDelete {
+    pub cid: String,
+    pub id: i64,
+}
+
 /// The message `e` reacts to.
 pub struct ReactTarget {
     pub cid: String,
@@ -436,6 +443,8 @@ pub struct App {
     tail_pending: Option<(usize, Option<i64>)>,
     /// The target of a reaction being sent.
     pub react: Option<ReactTarget>,
+    /// A delete waiting for its second key press.
+    pub pending_delete: Option<PendingDelete>,
     /// (name, glyph) for the picker: Unicode emoji, then the workspace's custom ones as `:name:`.
     pub emoji_table: Vec<(String, String)>,
     /// Muted conversation ids: `<cache>/muted.json` plus the channels muted
@@ -527,6 +536,7 @@ impl App {
             attach_note: None,
             tail_pending: None,
             react: None,
+            pending_delete: None,
             emoji_table: Vec::new(),
             muted: HashSet::new(),
             muted_in_slack: HashSet::new(),
@@ -1241,6 +1251,80 @@ impl App {
     }
 
     /// `e`: the reaction picker for the selected message.
+    /// `D`: arm a delete of the selected message, or carry out the one
+    /// already armed. Slack only lets the author withdraw a message, so a
+    /// message written by someone else is refused before the round trip.
+    fn delete_selected(&mut self) {
+        if let Some(pending) = self.pending_delete.take() {
+            let Some(c) = self.api.clone() else {
+                self.status = "deleting needs the Slack sign-in".to_string();
+                return;
+            };
+            if self.job.is_some() {
+                self.status = "a fetch is already running; press D again in a moment".to_string();
+                return;
+            }
+            self.job = Some(live::api_delete(c, pending.cid, pending.id));
+            return;
+        }
+        if self.api.is_none() {
+            self.status = "deleting needs the Slack sign-in".to_string();
+            return;
+        }
+        let Some(m) = self.selected() else {
+            self.status = "no message selected".to_string();
+            return;
+        };
+        let Some(me) = self.corpus.me.as_deref() else {
+            self.status = "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
+            return;
+        };
+        if m.user.as_deref() != Some(me) {
+            let who = m
+                .user
+                .as_deref()
+                .and_then(|u| self.corpus.user_name(u))
+                .unwrap_or_else(|| "someone else".to_string());
+            self.status = format!("that message is {who}'s; Slack only deletes your own");
+            return;
+        }
+        let first = m.text.lines().next().unwrap_or("").trim().to_string();
+        let shown: String = first.chars().take(40).collect();
+        self.pending_delete = Some(PendingDelete {
+            cid: m.channel_id.clone(),
+            id: m.id,
+        });
+        self.status = if shown.is_empty() {
+            "delete this message? D again confirms, any other key cancels".to_string()
+        } else {
+            format!("delete \u{201c}{shown}\u{201d}? D again confirms, any other key cancels")
+        };
+    }
+
+    /// Drop a deleted message from every list holding it.
+    fn drop_message(&mut self, id: i64) {
+        let mut lists: Vec<&mut MsgList> = Vec::new();
+        if let Some(o) = self.open.as_mut() {
+            lists.push(&mut o.list);
+        }
+        for view in self.stack.iter_mut() {
+            match view {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } => {
+                    lists.push(list)
+                }
+                _ => {}
+            }
+        }
+        for list in lists {
+            let Some(at) = list.msgs.iter().position(|m| m.id == id) else {
+                continue;
+            };
+            list.msgs.remove(at);
+            list.cursor = list.cursor.min(list.len().saturating_sub(1));
+            list.mark_dirty();
+        }
+    }
+
     fn react(&mut self) {
         if self.api.is_none() {
             self.status = "reacting needs the Slack sign-in".to_string();
@@ -3140,6 +3224,10 @@ impl App {
                     }
                 }
             }
+            (JobKind::Delete { id }, Done::Deleted) => {
+                self.drop_message(id);
+                self.status = "message deleted".to_string();
+            }
             (JobKind::Leave { conv }, Done::Left) => {
                 let c = &mut self.corpus.convs[conv];
                 c.left = true;
@@ -3404,6 +3492,14 @@ impl App {
             return;
         }
         let action = self.keymap.action(k);
+        // An armed delete lives for exactly one more key, and only in the
+        // pane that armed it.
+        if self.pending_delete.is_some()
+            && (action != Some(Action::Delete) || self.focus != Focus::Msgs)
+        {
+            self.pending_delete = None;
+            self.status = "delete cancelled".to_string();
+        }
         match action {
             Some(Action::Quit) => {
                 self.quit = true;
@@ -3531,6 +3627,10 @@ impl App {
             Some(Action::Sort) => {
                 self.sort = self.sort.next();
                 self.apply_filter();
+                // A new order is a new list: read it from the top rather than
+                // chasing where the highlighted conversation landed.
+                self.conv_cursor = 0;
+                self.conv_offset = 0;
                 self.status = format!("sorted by {}", self.sort_label());
                 if self.sort == Sort::Mine && self.corpus.me.is_none() {
                     self.status =
@@ -3657,6 +3757,7 @@ impl App {
             Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
             Some(Action::Compose) => self.compose(),
             Some(Action::React) => self.react(),
+            Some(Action::Delete) => self.delete_selected(),
             Some(Action::Images) => self.open_images(),
             Some(Action::MarkRead) => self.mark_read(),
             Some(Action::MarkUnread) => self.mark_unread(),
@@ -3714,6 +3815,15 @@ impl App {
                         self.status = format!("{name} not sent");
                     }
                 }
+            }
+            // Alt-Enter, and Shift-Enter where the terminal reports it, break
+            // the line instead of sending; Ctrl-j does the same from the editor.
+            KeyCode::Enter
+                if kind == PromptKind::Compose
+                    && k.modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                buf.newline();
             }
             KeyCode::Enter => {
                 let text = buf.text.clone();

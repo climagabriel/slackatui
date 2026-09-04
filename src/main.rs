@@ -98,7 +98,8 @@ keys (also ? inside)
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
   i view a message's images, I inline thumbnails on/off,
-  m mark read, M mark unread from the cursor, H the key guide,
+  m mark read, M mark unread from the cursor, D delete your own message,
+  H the key guide,
   Esc in the list closes the conversation
 
 Images: thumbnails under messages and a full-pane viewer, through the
@@ -113,8 +114,9 @@ messages, every conversation you are a member of, and unread markers; a
 thread lands in the cache, the open conversation is re-checked every
 --poll seconds. Without a sign-in, slackdump does the same more slowly,
 and `a` still archives a new conversation into the root. Writes to Slack:
-m and M move your own read marker; c composes a message, Enter sends it;
-e toggles your reaction on the selected message; /upload [path] sends a file
+m and M move your own read marker; c composes a message, Ctrl-j and Alt-Enter
+break the line and Enter sends it; D deletes one of your own messages, the
+same key again confirming; e toggles your reaction on the selected message; /upload [path] sends a file
 with the next message, and Ctrl-v in the compose prompt attaches the image on
 the clipboard (through wl-paste or xclip); /leave leaves a channel.
 /cache start archives a conversation; /cache stop pauses its hourly refresh;

@@ -767,7 +767,11 @@ const HELP: &[HelpRow] = &[
     HelpRow::Bound(Action::UnreadsFirst, "unread conversations on top on/off"),
     HelpRow::Bound(
         Action::Compose,
-        "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Ctrl-v attaches the clipboard's image, Enter sends, Esc keeps the draft",
+        "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Ctrl-v attaches the clipboard's image, Ctrl-j and Alt-Enter break the line, Enter sends, Esc keeps the draft",
+    ),
+    HelpRow::Bound(
+        Action::Delete,
+        "delete the selected message, which Slack allows only for your own; the same key again confirms, any other cancels",
     ),
     HelpRow::Bound(
         Action::React,
@@ -796,7 +800,7 @@ const HELP: &[HelpRow] = &[
     HelpRow::Bound(Action::Quit, "quit"),
     HelpRow::Fixed(
         "in a prompt",
-        "Ctrl-a/e line start/end, Ctrl-b/f and Alt-b/f by char and word, Ctrl-k/u kill to line end/start, Ctrl-w and Alt-d kill a word, Ctrl-y yank, Ctrl-d delete under the cursor; Ctrl-j a newline in a message",
+        "Ctrl-a/e line start/end, Ctrl-b/f and Alt-b/f by char and word, Ctrl-k/u kill to line end/start, Ctrl-w and Alt-d kill a word, Ctrl-y yank, Ctrl-d delete under the cursor; Ctrl-j or Alt-Enter a newline in a message",
     ),
 ];
 

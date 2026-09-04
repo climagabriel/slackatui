@@ -70,6 +70,10 @@ pub enum JobKind {
         conv: usize,
         thread: Option<i64>,
     },
+    /// One of the owner's own messages withdrawn from Slack.
+    Delete {
+        id: i64,
+    },
     /// Your reaction `name` added to or removed from message `id`.
     React {
         id: i64,
@@ -102,6 +106,8 @@ pub enum Done {
     Sent(Box<Msg>),
     /// A file reached Slack; the name it went up under.
     Uploaded(String),
+    /// A message Slack no longer holds.
+    Deleted,
     Reacted,
     Left,
     EmojiList(Vec<String>),
@@ -380,6 +386,14 @@ pub fn api_upload(
             Ok(Done::Uploaded(name))
         },
     )
+}
+
+/// Withdraw one of the owner's own messages.
+pub fn api_delete(client: Arc<Client>, cid: String, id: i64) -> Job {
+    spawn(JobKind::Delete { id }, "deleting".to_string(), move || {
+        client.delete_message(&cid, &id_to_ts(id))?;
+        Ok(Done::Deleted)
+    })
 }
 
 pub fn api_react(client: Arc<Client>, cid: String, id: i64, name: String, add: bool) -> Job {
