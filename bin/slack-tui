@@ -98,6 +98,15 @@ EOF
     exit 0
 fi
 
+# What /version shows: the plugin manifest beside this launcher, so a plugin
+# update is visible in the TUI without a rebuild.
+if [[ -z "${SLACK_TUI_VERSION:-}" && -r "$here/../.claude-plugin/plugin.json" ]]; then
+    SLACK_TUI_VERSION=$(sed --quiet \
+        's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$here/../.claude-plugin/plugin.json" | head -1)
+    export SLACK_TUI_VERSION
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
     echo "slack-tui: cargo not found; install a Rust toolchain from https://rustup.rs" >&2
     exit 2

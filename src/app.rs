@@ -429,6 +429,8 @@ pub struct App {
     /// `/cache highlight on|off`: cached conversations in the palette's
     /// cached color.
     pub highlight_cached: bool,
+    /// `/version`: the version in the status line's right corner.
+    pub show_version: bool,
     /// `U`: unread conversations at the top of the list.
     pub unreads_first: bool,
     /// The target of the open compose prompt.
@@ -530,6 +532,7 @@ impl App {
             file_job: None,
             conv_offset: 0,
             highlight_cached: false,
+            show_version: false,
             unreads_first: true,
             compose: None,
             attachment: None,
@@ -706,6 +709,10 @@ impl App {
                 self.restore_filter(filter_before);
                 self.open_keys();
             }
+            Some(Command::Version) => {
+                self.restore_filter(filter_before);
+                self.toggle_version();
+            }
             Some(Command::Upload(path)) => {
                 self.restore_filter(filter_before);
                 self.attach(&path);
@@ -752,6 +759,16 @@ impl App {
                 .to_string(),
         };
         self.status = status;
+    }
+
+    /// `/version`: the version in the corner of the status line, or not.
+    fn toggle_version(&mut self) {
+        self.show_version = !self.show_version;
+        self.status = if self.show_version {
+            format!("version {}", crate::version())
+        } else {
+            String::new()
+        };
     }
 
     /// `/keys`: the key editor over the messages pane.
@@ -3877,6 +3894,8 @@ enum Command {
     ColorPalette(String),
     /// `keys`: rebind what the lists' keys do.
     Keys,
+    /// `version`: show the version in the corner, or hide it again.
+    Version,
     /// `upload [path]`: attach a file, the clipboard's image without a path.
     Upload(String),
 }
@@ -3895,6 +3914,7 @@ fn parse_command(line: &str) -> Option<Command> {
         "unmute" => Some(Command::Mute(false, rest.to_string())),
         "colorpalette" | "palette" | "colors" => Some(Command::ColorPalette(rest.to_string())),
         "keys" | "keybindings" if rest.is_empty() => Some(Command::Keys),
+        "version" if rest.is_empty() => Some(Command::Version),
         "upload" | "attach" => Some(Command::Upload(rest.to_string())),
         "cache" => {
             let (op, name) = match rest.split_once(char::is_whitespace) {
@@ -4096,6 +4116,8 @@ mod tests {
             parse_command("colorpalette vintage"),
             Some(Command::ColorPalette("vintage".into()))
         );
+        assert_eq!(parse_command("/version"), Some(Command::Version));
+        assert_eq!(parse_command("version now"), None);
         assert_eq!(parse_command(""), None);
     }
 

@@ -57,6 +57,11 @@ pub const COMMANDS: &[Cmd] = &[
         args: "[name]",
         help: "edit and persist the UI colors, from a named palette when given",
     },
+    Cmd {
+        name: "version",
+        args: "",
+        help: "show the version in the corner of the status line, or hide it",
+    },
 ];
 
 const CACHE_OPS: &[(&str, &str)] = &[

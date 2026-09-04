@@ -689,6 +689,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
+    // The version keeps the right corner; the rest of the line shortens.
+    let mut area = area;
+    if app.show_version {
+        let label = format!(" {} ", crate::version());
+        let width = label.width() as u16;
+        if area.width > width {
+            let [rest, corner] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(area);
+            frame.render_widget(Paragraph::new(Span::styled(label, dim)), corner);
+            area = rest;
+        }
+    }
     let mut spans = vec![Span::styled(format!(" {} ", app.tz.label()), dim)];
     if let Some(job) = &app.job {
         let frame_char = crate::live::SPINNER[app.spinner % crate::live::SPINNER.len()];
@@ -750,7 +762,7 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(
         Action::Command,
-        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; upload [path] sends a file with the next message, the clipboard's image when no path is given; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
+        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; upload [path] sends a file with the next message, the clipboard's image when no path is given; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations; version shows the version in the corner",
     ),
     HelpRow::Bound(Action::Keys, "rebind these keys (also /keys)"),
     HelpRow::Bound(

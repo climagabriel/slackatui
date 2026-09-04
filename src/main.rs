@@ -18,6 +18,19 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
+/// What `/version` shows: the plugin version the launcher exports, and the
+/// crate's own when slack-tui was started some other way.
+pub fn version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        std::env::var("SLACK_TUI_VERSION")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    })
+}
+
 use crate::app::{App, Focus};
 use crate::archive::Corpus;
 use crate::render::Tz;
@@ -85,6 +98,8 @@ environment
                        $XDG_CONFIG_HOME/slack-tui/palette.json, or ~/.config/...)
   SLACK_TUI_KEYS       where /keys saves the key bindings (default keys.json
                        beside the palette)
+  SLACK_TUI_VERSION    the version /version shows (the launcher sets it from
+                       the plugin manifest; the crate's own version otherwise)
   SLACKDUMPS           archive root when --root is not given
   SLACK_SELF_USER_ID   your own user id: names direct messages by the other
                        party and counts your messages per conversation
@@ -93,7 +108,7 @@ environment
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
   Enter thread, Esc back, / a command (Tab completes: upload, keys,
-  colorpalette, find, search, leave, mute, unmute, cache),
+  colorpalette, version, find, search, leave, mute, unmute, cache),
   d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
@@ -125,7 +140,8 @@ conversations in the list; /colorpalette vintage opens the editor over the
 vintage palette (terracotta, amber, sand, olive and slate, over whichever
 background the terminal already draws), and
 /colorpalette default over the terminal's own sixteen colors; /keys rebinds
-what the keys do in the two lists, one action per row; /mute and /unmute keep a conversation at the end of
+what the keys do in the two lists, one action per row; /version shows the
+version in the status line's right corner, and hides it again; /mute and /unmute keep a conversation at the end of
 the list, on top of the channels muted in Slack itself.
 
 exit codes
