@@ -656,16 +656,26 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // One line: a prompt when one is open; else the clock, a running job,
     // the last status, and the selected message's permalink. H lists the keys.
     if let Mode::Prompt { kind, buf, .. } = &app.mode {
+        let compose_label = match (app.compose.as_ref(), app.attachment.as_deref()) {
+            (Some(c), Some(file)) => format!(
+                "{} with {}",
+                c.label,
+                file.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("a file")
+            ),
+            (Some(c), None) => match app.attach_note.as_deref() {
+                Some(why) => format!("{} · {why}", c.label),
+                None => c.label.clone(),
+            },
+            (None, _) => "message".to_string(),
+        };
         let label = match kind {
             PromptKind::Command => "",
             PromptKind::PaletteColor => "color (a name, or #rrggbb)",
             PromptKind::Date => "go to date (YYYY-MM-DD)",
             PromptKind::Archive => "archive a conversation from Slack, last 90 days (URL or id)",
-            PromptKind::Compose => app
-                .compose
-                .as_ref()
-                .map(|c| c.label.as_str())
-                .unwrap_or("message"),
+            PromptKind::Compose => &compose_label,
         };
         let prefix = Span::styled(
             if label.is_empty() {
@@ -740,7 +750,7 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(
         Action::Command,
-        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
+        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; upload [path] sends a file with the next message, the clipboard's image when no path is given; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations",
     ),
     HelpRow::Bound(Action::Keys, "rebind these keys (also /keys)"),
     HelpRow::Bound(
@@ -757,7 +767,7 @@ const HELP: &[HelpRow] = &[
     HelpRow::Bound(Action::UnreadsFirst, "unread conversations on top on/off"),
     HelpRow::Bound(
         Action::Compose,
-        "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Enter sends, Esc keeps the draft",
+        "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Ctrl-v attaches the clipboard's image, Enter sends, Esc keeps the draft",
     ),
     HelpRow::Bound(
         Action::React,

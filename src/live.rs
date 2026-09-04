@@ -18,33 +18,68 @@ use crate::auth;
 
 pub enum JobKind {
     /// Resume one archive directory; `conv` is the conversation to reload.
-    Refresh { conv: usize, before: i64 },
+    Refresh {
+        conv: usize,
+        before: i64,
+    },
     /// Fetch one thread.
-    Thread { cid: String, root: i64, focus: i64 },
+    Thread {
+        cid: String,
+        root: i64,
+        focus: i64,
+    },
     /// Workspace-wide message search.
-    Search { query: String },
+    Search {
+        query: String,
+    },
     /// Archive a conversation not in the cache yet.
-    ArchiveNew { spec: String },
+    ArchiveNew {
+        spec: String,
+    },
     /// Sign in through the environment, the cached token, or the desktop app.
     Auth,
     /// Messages newer than what is loaded for `conv`.
-    Tail { conv: usize },
+    Tail {
+        conv: usize,
+    },
     /// Messages older than what is loaded for `conv` (API-only conversations).
-    Older { conv: usize },
+    Older {
+        conv: usize,
+    },
     /// The conversations the user is a member of.
     Conversations,
     /// Unread state per conversation, tagged with the generation it was asked for.
-    Counts { gen: u64 },
+    Counts {
+        gen: u64,
+    },
     /// One file into the file cache.
-    File { id: String },
+    File {
+        id: String,
+    },
     /// The read marker of `conv` moved to message `id`.
-    Mark { conv: usize, id: i64 },
+    Mark {
+        conv: usize,
+        id: i64,
+    },
     /// A message posted to `conv`, into the thread rooted at `thread` when given.
-    Send { conv: usize, thread: Option<i64> },
+    Send {
+        conv: usize,
+        thread: Option<i64>,
+    },
+    Upload {
+        conv: usize,
+        thread: Option<i64>,
+    },
     /// Your reaction `name` added to or removed from message `id`.
-    React { id: i64, name: String, add: bool },
+    React {
+        id: i64,
+        name: String,
+        add: bool,
+    },
     /// Membership of `conv` given up.
-    Leave { conv: usize },
+    Leave {
+        conv: usize,
+    },
     /// The workspace's custom emoji names, for the reaction picker.
     EmojiList,
     /// The channels muted in Slack itself.
@@ -65,6 +100,8 @@ pub enum Done {
     File(PathBuf),
     Marked,
     Sent(Box<Msg>),
+    /// A file reached Slack; the name it went up under.
+    Uploaded(String),
     Reacted,
     Left,
     EmojiList(Vec<String>),
@@ -309,6 +346,38 @@ pub fn api_send(
             Msg::from_api(cid, data)
                 .map(|m| Done::Sent(Box::new(m)))
                 .ok_or_else(|| "sent, but Slack's answer carried no timestamp".to_string())
+        },
+    )
+}
+
+/// Upload `path` into a conversation, with `comment` as its message.
+pub fn api_upload(
+    client: Arc<Client>,
+    conv: usize,
+    cid: String,
+    thread: Option<i64>,
+    path: std::path::PathBuf,
+    comment: String,
+    scratch: &Path,
+) -> Job {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    // A clipboard capture is this tool's own temporary file; it goes once
+    // Slack has the bytes.
+    let temporary = path.starts_with(scratch);
+    spawn(
+        JobKind::Upload { conv, thread },
+        format!("uploading {name}"),
+        move || {
+            let ts = thread.map(id_to_ts);
+            client.upload_file(&cid, ts.as_deref(), &path, &comment)?;
+            if temporary {
+                let _ = std::fs::remove_file(&path);
+            }
+            Ok(Done::Uploaded(name))
         },
     )
 }

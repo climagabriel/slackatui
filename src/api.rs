@@ -13,6 +13,10 @@ pub struct Client {
     auth: Auth,
 }
 
+/// What this client will carry in one upload; Slack's own limit is larger,
+/// but the bytes go through memory.
+pub const MAX_UPLOAD: u64 = 256 * 1024 * 1024;
+
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(60)))
@@ -216,6 +220,83 @@ impl Client {
             return Err("Slack answered with a page, not the file (session expired?)".to_string());
         }
         Ok(bytes)
+    }
+
+    /// Upload one file into `cid` (into the thread when `thread_ts` is
+    /// given), with `comment` as the message that carries it. Slack wants
+    /// three calls: a URL, the bytes, then the message.
+    pub fn upload_file(
+        &self,
+        cid: &str,
+        thread_ts: Option<&str>,
+        path: &std::path::Path,
+        comment: &str,
+    ) -> Result<Value, String> {
+        let size = std::fs::metadata(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        if size == 0 {
+            return Err(format!("{}: the file is empty", path.display()));
+        }
+        if size > MAX_UPLOAD {
+            return Err(format!(
+                "{}: {size} bytes is past the {MAX_UPLOAD}-byte limit this client sets",
+                path.display()
+            ));
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("upload")
+            .to_string();
+        let length = bytes.len().to_string();
+        let ticket = self.call(
+            "files.getUploadURLExternal",
+            &[("filename", &name), ("length", &length)],
+        )?;
+        let url = ticket
+            .get("upload_url")
+            .and_then(Value::as_str)
+            .ok_or("files.getUploadURLExternal: no upload_url")?;
+        let file_id = ticket
+            .get("file_id")
+            .and_then(Value::as_str)
+            .ok_or("files.getUploadURLExternal: no file_id")?
+            .to_string();
+        // The upload URL is Slack's own, single-use, and carries no session.
+        let host = url
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or_default();
+        if host != "slack.com" && !host.ends_with(".slack.com") {
+            return Err(format!("upload: Slack handed out a URL on {host}"));
+        }
+        // Its own agent: the shared one gives every call a minute, which a
+        // large file over a slow link does not fit into.
+        let uploader: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(600)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut resp = uploader
+            .post(url)
+            .header("Content-Type", "application/octet-stream")
+            .send(&bytes[..])
+            .map_err(|e| format!("upload {name}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("upload {name}: HTTP {}", resp.status().as_u16()));
+        }
+        let _ = resp.body_mut().read_to_string();
+        let files = serde_json::json!([{ "id": file_id, "title": name }]).to_string();
+        let mut params = vec![("files", files.as_str()), ("channel_id", cid)];
+        if let Some(ts) = thread_ts {
+            params.push(("thread_ts", ts));
+        }
+        if !comment.is_empty() {
+            params.push(("initial_comment", comment));
+        }
+        self.call("files.completeUploadExternal", &params)
     }
 
     /// Move the read marker of a conversation to a message: the one write

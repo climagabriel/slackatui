@@ -426,6 +426,14 @@ pub struct App {
     pub unreads_first: bool,
     /// The target of the open compose prompt.
     pub compose: Option<Compose>,
+    /// The file the next send carries, from /upload or the clipboard.
+    pub attachment: Option<PathBuf>,
+    /// Why the last attach attempt gave nothing, shown in the prompt: the
+    /// status line is where the prompt itself is drawn.
+    pub attach_note: Option<String>,
+    /// What an upload left to fetch: the conversation, and the thread when
+    /// the file went into one.
+    tail_pending: Option<(usize, Option<i64>)>,
     /// The target of a reaction being sent.
     pub react: Option<ReactTarget>,
     /// (name, glyph) for the picker: Unicode emoji, then the workspace's custom ones as `:name:`.
@@ -515,6 +523,9 @@ impl App {
             highlight_cached: false,
             unreads_first: true,
             compose: None,
+            attachment: None,
+            attach_note: None,
+            tail_pending: None,
             react: None,
             emoji_table: Vec::new(),
             muted: HashSet::new(),
@@ -684,6 +695,10 @@ impl App {
             Some(Command::Keys) => {
                 self.restore_filter(filter_before);
                 self.open_keys();
+            }
+            Some(Command::Upload(path)) => {
+                self.restore_filter(filter_before);
+                self.attach(&path);
             }
         }
     }
@@ -1404,6 +1419,69 @@ impl App {
         self.job = Some(live::api_react(c, t.cid, t.id, name, !mine));
     }
 
+    /// `/upload [path]`: hold a file for the next send and open the compose
+    /// prompt, so a comment can go with it. No path means the clipboard.
+    fn attach(&mut self, argument: &str) {
+        let file = if argument.trim().is_empty() {
+            crate::clip::image(&self.cache_dir.join("uploads"))
+        } else {
+            let text = argument.trim().trim_matches(['"', '\'']);
+            let path = match text.strip_prefix("~/") {
+                Some(rest) => match std::env::var_os("HOME") {
+                    Some(home) => PathBuf::from(home).join(rest),
+                    None => PathBuf::from(text),
+                },
+                None => PathBuf::from(text),
+            };
+            match path.is_file() {
+                true => Ok(path),
+                false => Err(format!("{}: not a file", path.display())),
+            }
+        };
+        match file {
+            Ok(path) => {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let name = file_name(&path);
+                self.attachment = Some(path);
+                self.compose();
+                if self.compose.is_some() {
+                    self.status = format!("{name} attached, {}", human_size(size));
+                } else {
+                    // No target took it: nothing to send it with.
+                    self.attachment = None;
+                }
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    /// Lets go of the held file, deleting it when this tool made it: a
+    /// clipboard capture nobody sent has no other owner.
+    fn drop_attachment(&mut self) -> Option<String> {
+        let path = self.attachment.take()?;
+        if path.starts_with(self.cache_dir.join("uploads")) {
+            let _ = std::fs::remove_file(&path);
+        }
+        Some(file_name(&path))
+    }
+
+    /// Ctrl-v in the compose prompt: the clipboard's image, held for the send.
+    fn attach_clipboard(&mut self) {
+        match crate::clip::image(&self.cache_dir.join("uploads")) {
+            Ok(path) => {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                self.drop_attachment();
+                self.status = format!("{} attached, {}", file_name(&path), human_size(size));
+                self.attach_note = None;
+                self.attachment = Some(path);
+            }
+            Err(error) => {
+                self.status = error.clone();
+                self.attach_note = Some(clip_note(&error));
+            }
+        }
+    }
+
     /// `c`: the compose prompt, with the unsent draft if one was kept.
     fn compose(&mut self) {
         if self.api.is_none() {
@@ -1417,6 +1495,7 @@ impl App {
                     _ => String::new(),
                 };
                 self.compose = Some(t);
+                self.attach_note = None;
                 self.mode = Mode::Prompt {
                     kind: PromptKind::Compose,
                     buf: Editor::with(buf),
@@ -1453,7 +1532,7 @@ impl App {
         let Some(t) = self.compose.take() else {
             return;
         };
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && self.attachment.is_none() {
             self.status = "nothing to send".to_string();
             return;
         }
@@ -1475,7 +1554,13 @@ impl App {
             thread: t.thread,
             text,
         });
-        self.job = Some(live::api_send(c, t.conv, t.cid, t.thread, wire));
+        let uploads = self.cache_dir.join("uploads");
+        self.job = match self.attachment.take() {
+            Some(path) => Some(live::api_upload(
+                c, t.conv, t.cid, t.thread, path, wire, &uploads,
+            )),
+            None => Some(live::api_send(c, t.conv, t.cid, t.thread, wire)),
+        };
     }
 
     fn link_mentions(&self, text: &str) -> String {
@@ -2865,6 +2950,39 @@ impl App {
                 self.muted_pending = false;
                 self.bg = Some(live::api_muted_channels(c.clone()));
             }
+            if let (Some((conv, thread)), true) = (self.tail_pending, self.bg.is_none()) {
+                let open_here = self.open.as_ref().map(|o| o.conv) == Some(conv);
+                let open_root = match self.stack.last() {
+                    Some(View::Thread { root, .. }) => Some(*root),
+                    _ => None,
+                };
+                let cid = self.corpus.convs[conv].id.clone();
+                match (thread, open_root) {
+                    // A reply lands in the thread pane, which history cannot
+                    // fill; the timeline behind it waits for the next poll.
+                    (Some(root), Some(open)) if open == root => {
+                        self.tail_pending = None;
+                        self.bg = Some(live::api_thread(
+                            c.clone(),
+                            &self.cache_dir,
+                            cid,
+                            root,
+                            root,
+                        ));
+                    }
+                    (None, _) if open_here => {
+                        self.tail_pending = None;
+                        let since = self
+                            .open
+                            .as_ref()
+                            .and_then(|o| o.list.msgs.last().map(|m| m.id))
+                            .unwrap_or(0);
+                        self.bg = Some(live::api_tail(c.clone(), conv, cid, since, true));
+                    }
+                    // Nothing on screen wants it: drop the errand.
+                    _ => self.tail_pending = None,
+                }
+            }
             if self.bg.is_none() && self.poll_every.as_secs() > 0 {
                 if self.last_poll.elapsed() >= self.poll_every {
                     self.last_poll = Instant::now();
@@ -2916,6 +3034,11 @@ impl App {
             Ok(d) => d,
             Err(e) => {
                 self.status = format!("Slack: {e}");
+                if let JobKind::Upload { .. } = &job.kind {
+                    // The file left the prompt when the send started; say so,
+                    // rather than let the next conversation inherit it.
+                    self.status = format!("Slack: {e}; the file is not attached any more");
+                }
                 if let JobKind::Search { query } = &job.kind {
                     if let Some(View::Search {
                         query: q,
@@ -2982,6 +3105,15 @@ impl App {
                 }
                 self.mark_all_dirty();
                 self.status = format!("{name} {what}");
+            }
+            (JobKind::Upload { conv, thread }, Done::Uploaded(name)) => {
+                self.draft = None;
+                self.attachment = None;
+                let cname = self.corpus.convs[conv].name.clone();
+                self.status = format!("{name} sent to {cname}");
+                // Slack builds the message around the file, so it has to be
+                // fetched; the background slot may still be busy.
+                self.tail_pending = Some((conv, thread));
             }
             (JobKind::Send { conv, thread }, Done::Sent(msg)) => {
                 let msg = *msg;
@@ -3578,6 +3710,9 @@ impl App {
                 }
                 if kind == PromptKind::Compose {
                     self.keep_draft(typed);
+                    if let Some(name) = self.drop_attachment() {
+                        self.status = format!("{name} not sent");
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -3600,6 +3735,9 @@ impl App {
                     }
                     self.filter_live(&done);
                 }
+            }
+            KeyCode::Char('v') if kind == PromptKind::Compose && ctrl(k) => {
+                self.attach_clipboard();
             }
             _ => {
                 if buf.key(k, kind == PromptKind::Compose) {
@@ -3629,6 +3767,8 @@ enum Command {
     ColorPalette(String),
     /// `keys`: rebind what the lists' keys do.
     Keys,
+    /// `upload [path]`: attach a file, the clipboard's image without a path.
+    Upload(String),
 }
 
 /// `find x`, `search x`, `leave`, `leave #name`; a leading slash is ignored.
@@ -3645,6 +3785,7 @@ fn parse_command(line: &str) -> Option<Command> {
         "unmute" => Some(Command::Mute(false, rest.to_string())),
         "colorpalette" | "palette" | "colors" => Some(Command::ColorPalette(rest.to_string())),
         "keys" | "keybindings" if rest.is_empty() => Some(Command::Keys),
+        "upload" | "attach" => Some(Command::Upload(rest.to_string())),
         "cache" => {
             let (op, name) = match rest.split_once(char::is_whitespace) {
                 Some((o, n)) => (o, n.trim()),
@@ -3654,6 +3795,34 @@ fn parse_command(line: &str) -> Option<Command> {
                 .then(|| Command::Cache(op.to_string(), name.to_string()))
         }
         _ => None,
+    }
+}
+
+fn ctrl(k: KeyEvent) -> bool {
+    k.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// The prompt has room for a reason, not for a helper's whole complaint.
+fn clip_note(error: &str) -> String {
+    let one_line = error.replace('\n', " ");
+    match one_line.char_indices().nth(60) {
+        Some((at, _)) => format!("{}…", &one_line[..at]),
+        None => one_line,
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string()
+}
+
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        0..=1023 => format!("{bytes} B"),
+        1024..=1_048_575 => format!("{:.0} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
     }
 }
 

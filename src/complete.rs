@@ -43,6 +43,11 @@ pub const COMMANDS: &[Cmd] = &[
         help: "the hourly archive refresh, or the color cached conversations take",
     },
     Cmd {
+        name: "upload",
+        args: "[path]",
+        help: "send a file with the next message; no path takes the clipboard's image",
+    },
+    Cmd {
         name: "keys",
         args: "",
         help: "rebind what the keys do in the lists",

@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod archive;
 mod auth;
+mod clip;
 mod complete;
 mod edit;
 mod keys;
@@ -91,8 +92,8 @@ environment
 
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
-  Enter thread, Esc back, / a command (Tab completes: keys, colorpalette,
-  find, search, leave, mute, unmute, cache),
+  Enter thread, Esc back, / a command (Tab completes: upload, keys,
+  colorpalette, find, search, leave, mute, unmute, cache),
   d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
@@ -113,7 +114,9 @@ thread lands in the cache, the open conversation is re-checked every
 --poll seconds. Without a sign-in, slackdump does the same more slowly,
 and `a` still archives a new conversation into the root. Writes to Slack:
 m and M move your own read marker; c composes a message, Enter sends it;
-e toggles your reaction on the selected message; /leave leaves a channel.
+e toggles your reaction on the selected message; /upload [path] sends a file
+with the next message, and Ctrl-v in the compose prompt attaches the image on
+the clipboard (through wl-paste or xclip); /leave leaves a channel.
 /cache start archives a conversation; /cache stop pauses its hourly refresh;
 /cache wipe deletes its archive; /cache highlight on|off colors the cached
 conversations in the list; /colorpalette vintage opens the editor over the
