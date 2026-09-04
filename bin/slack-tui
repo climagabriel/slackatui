@@ -1,35 +1,160 @@
-#!/bin/sh
-# maturity: low; issues-found: 1
+#!/usr/bin/env bash
+# maturity: low; issues-found: 2
 # slack-tui - front door for libexec/slack-tui, a Rust crate. Builds it on
 # first use into the user's cache and execs the binary; rebuilds when the
 # source changes (checksum), so a plugin update takes effect on the next run.
 # The build never lands beside the source: a plugin install is read-only and
 # replaced wholesale on update.
 #
-#   slack-tui --help        the tool's own help
-#   SLACK_TUI_REBUILD=1     force a rebuild
-#
 # Needs cargo (https://rustup.rs) and a C compiler for the bundled SQLite.
-set -eu
+set -euo pipefail
+
 here=$(cd "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
 src="$here/../libexec/slack-tui"
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/slack-tui"
 bin="$cache/bin/slack-tui"
 stamp="$cache/source.sha256"
 
+force_rebuild=0
+verbose=0
+show_help=0
+parse_launcher_flags=1
+application_arguments=()
+
+for argument in "$@"; do
+    if ((parse_launcher_flags)); then
+        case "$argument" in
+            --build | --rebuild)
+                force_rebuild=1
+                verbose=1
+                ;;
+            --verbose | -v)
+                verbose=1
+                ;;
+            --help | -h)
+                show_help=1
+                ;;
+            --)
+                parse_launcher_flags=0
+                ;;
+            *)
+                application_arguments+=("$argument")
+                ;;
+        esac
+    else
+        application_arguments+=("$argument")
+    fi
+done
+
+if ((show_help)); then
+    cat <<'EOF'
+slack-tui launcher
+
+usage: slack-tui [LAUNCHER_FLAG ...] [APPLICATION_ARGUMENT ...]
+
+launcher flags
+  --build, --rebuild  synonyms; force a slack-tui release rebuild and imply
+                      --verbose
+  --verbose, -v       synonyms; show the launcher decision and cargo output
+                      when building; do not force a rebuild
+  --help, -h          show combined help without checking cargo or building
+
+argument boundary
+  --                  stop launcher parsing; the launcher consumes it
+  Launcher flags are recognized anywhere before --. Use -- before an
+  application argument that matches a launcher flag.
+
+environment
+  SLACK_TUI_REBUILD=1  force the build step without enabling verbose output;
+                       command-line verbosity still applies
+  XDG_CACHE_HOME       build cache: $XDG_CACHE_HOME/slack-tui;
+                       default: $HOME/.cache/slack-tui
+
+launcher-defined exit codes
+  0  combined help printed
+  1  application help could not be read
+  2  cargo unavailable before launch
+  Cargo failures and application statuses pass through and may reuse these
+  numbers.
+
+examples
+  slack-tui --build
+  SLACK_TUI_REBUILD=1 slack-tui
+  slack-tui --verbose --channel '#team-alpha'
+  slack-tui -- --help
+
+application help
+EOF
+    application_help=$(awk '
+        /^const HELP: &str = "\\$/ { in_help=1; next }
+        in_help && /^";$/ { exit }
+        in_help { print }
+    ' "$src/src/main.rs")
+    if [[ -z "$application_help" ]]; then
+        echo "slack-tui: could not read application help from $src/src/main.rs" >&2
+        exit 1
+    fi
+    printf '%s\n' "$application_help"
+    exit 0
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
     echo "slack-tui: cargo not found; install a Rust toolchain from https://rustup.rs" >&2
     exit 2
 fi
-sum=$(cat "$src/Cargo.toml" "$src/Cargo.lock" "$src"/src/*.rs | sha256sum | cut -d ' ' -f 1)
-if [ ! -x "$bin" ] || [ "${SLACK_TUI_REBUILD:-0}" = 1 ] || [ "$(cat "$stamp" 2>/dev/null || true)" != "$sum" ]; then
-    echo "slack-tui: building (first run, or the source changed)..." >&2
-    mkdir -p "$cache/bin"
-    cargo build --release --locked --quiet --manifest-path "$src/Cargo.toml" --target-dir "$cache/target"
+sum=$(cat "$src/Cargo.toml" "$src/Cargo.lock" "$src"/src/*.rs | sha256sum | cut --delimiter=' ' --fields=1)
+cached_sum=$(cat "$stamp" 2>/dev/null || true)
+needs_build=0
+build_reason="cached binary is current"
+
+if ((force_rebuild)); then
+    needs_build=1
+    build_reason="forced by --build/--rebuild"
+elif [[ "${SLACK_TUI_REBUILD:-0}" == 1 ]]; then
+    needs_build=1
+    build_reason="forced by SLACK_TUI_REBUILD=1"
+elif [[ ! -x "$bin" ]]; then
+    needs_build=1
+    build_reason="first run"
+elif [[ "$cached_sum" != "$sum" ]]; then
+    needs_build=1
+    build_reason="source changed"
+fi
+
+if ((verbose)); then
+    if ((needs_build)); then
+        echo "slack-tui: building ($build_reason)..." >&2
+    else
+        echo "slack-tui: $build_reason; using $bin" >&2
+    fi
+fi
+
+if ((needs_build)); then
+    mkdir --parents "$cache/bin"
+    if ((force_rebuild)); then
+        cargo clean \
+            --release \
+            --package slack-tui \
+            --locked \
+            --manifest-path "$src/Cargo.toml" \
+            --target-dir "$cache/target"
+    fi
+    cargo_arguments=(
+        build
+        --release
+        --locked
+        --manifest-path "$src/Cargo.toml"
+        --target-dir "$cache/target"
+    )
+    if ((!verbose)); then
+        cargo_arguments+=(--quiet)
+    fi
+    cargo "${cargo_arguments[@]}"
     # A running instance keeps the old file busy; a rename replaces the entry
     # under it instead of failing with "Text file busy".
     cp "$cache/target/release/slack-tui" "$bin.new.$$"
-    mv -f "$bin.new.$$" "$bin"
+    mv --force "$bin.new.$$" "$bin"
     printf '%s\n' "$sum" > "$stamp"
 fi
-exec "$bin" "$@"
+
+exec "$bin" "${application_arguments[@]}"
