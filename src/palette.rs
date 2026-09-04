@@ -136,7 +136,8 @@ const VINTAGE_AMBER: Color = Color::Rgb(0xd3, 0x9b, 0x49);
 const VINTAGE_SAND: Color = Color::Rgb(0xe9, 0xd9, 0x9f);
 const VINTAGE_OLIVE: Color = Color::Rgb(0x82, 0x83, 0x69);
 const VINTAGE_SLATE: Color = Color::Rgb(0x4b, 0x63, 0x69);
-const VINTAGE_BLACK: Color = Color::Rgb(0x16, 0x16, 0x16);
+/// Text drawn on the light selection bar, not a background of its own.
+const VINTAGE_INK: Color = Color::Rgb(0x16, 0x16, 0x16);
 
 pub const PRESETS: &[Preset] = &[
     Preset {
@@ -146,9 +147,8 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "vintage",
-        help: "terracotta, amber, sand, olive and slate on jet black",
+        help: "terracotta, amber, sand, olive and slate, over the terminal's own background",
         colors: &[
-            (Role::Background, VINTAGE_BLACK),
             (Role::Accent, VINTAGE_AMBER),
             (Role::InactiveAccent, VINTAGE_SLATE),
             (Role::OwnUsername, VINTAGE_TERRACOTTA),
@@ -160,7 +160,7 @@ pub const PRESETS: &[Preset] = &[
             (Role::Code, VINTAGE_SAND),
             (Role::ThreadInfo, VINTAGE_OLIVE),
             (Role::Status, VINTAGE_AMBER),
-            (Role::SelectionText, VINTAGE_BLACK),
+            (Role::SelectionText, VINTAGE_INK),
             (Role::SelectionBackground, VINTAGE_SAND),
             (Role::InactiveSelectionBackground, VINTAGE_OLIVE),
         ],
@@ -389,11 +389,12 @@ mod tests {
     #[test]
     fn the_vintage_preset_paints_every_role() {
         let vintage = Palette::preset("Vintage ").expect("a preset named vintage");
-        assert_eq!(vintage.get(Role::Background), VINTAGE_BLACK);
         assert_eq!(vintage.get(Role::Accent), VINTAGE_AMBER);
         assert_ne!(vintage, Palette::default());
-        for role in ROLES {
-            assert_ne!(vintage.get(role), Color::Reset, "{}", role.label());
+        // The terminal keeps its own background; every other role is painted.
+        assert_eq!(vintage.get(Role::Background), Color::Reset);
+        for role in ROLES.iter().filter(|r| **r != Role::Background) {
+            assert_ne!(vintage.get(*role), Color::Reset, "{}", role.label());
         }
         assert_eq!(Palette::preset("default"), Some(Palette::default()));
         assert_eq!(Palette::preset("sepia"), None);

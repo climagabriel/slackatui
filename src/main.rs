@@ -120,7 +120,8 @@ the clipboard (through wl-paste or xclip); /leave leaves a channel.
 /cache start archives a conversation; /cache stop pauses its hourly refresh;
 /cache wipe deletes its archive; /cache highlight on|off colors the cached
 conversations in the list; /colorpalette vintage opens the editor over the
-vintage palette (terracotta, amber, sand, olive and slate on jet black), and
+vintage palette (terracotta, amber, sand, olive and slate, over whichever
+background the terminal already draws), and
 /colorpalette default over the terminal's own sixteen colors; /keys rebinds
 what the keys do in the two lists, one action per row; /mute and /unmute keep a conversation at the end of
 the list, on top of the channels muted in Slack itself.
