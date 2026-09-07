@@ -3841,16 +3841,10 @@ impl App {
                 }
                 .to_string();
             }
-            Some(Action::Close) => {
+            Some(Action::Close) | Some(Action::Back) => {
                 // Unwind one stacked view; from the bare timeline, straight home.
                 if self.stack.pop().is_none() {
                     self.go_home();
-                }
-            }
-            Some(Action::Back) => {
-                // Back out one view, keeping the conversation open to browse the list.
-                if self.stack.pop().is_none() {
-                    self.focus = Focus::Convs;
                 }
             }
             Some(Action::OtherPane) => self.focus = Focus::Convs,
@@ -4187,6 +4181,39 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
+    }
+
+    #[test]
+    fn back_clears_the_message_pane_like_escape() {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
+        for action in [Action::Back, Action::Close] {
+            app.open_conv(0);
+            app.stack.push(View::Raw {
+                title: "raw".into(),
+                lines: vec!["test".into()],
+                scroll: 0,
+            });
+            app.on_msg_key(Some(action));
+            assert!(app.open.is_some());
+            assert!(app.stack.is_empty());
+            app.on_msg_key(Some(action));
+            assert!(app.open.is_none());
+            assert!(app.focus == Focus::Convs);
+            assert!(app.status.is_empty());
+            assert_eq!(app.title(), "messages");
+        }
     }
 
     #[test]
