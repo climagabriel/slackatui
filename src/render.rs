@@ -175,6 +175,13 @@ pub fn image_cells(f: &FileInfo, font: (u16, u16), width: usize) -> Option<(u16,
 }
 
 impl Ctx<'_> {
+    fn usergroup<'a>(&'a self, id: &'a str) -> &'a str {
+        self.corpus
+            .usergroups
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or(if id.is_empty() { "group" } else { id })
+    }
     fn channel(&self, cid: &str) -> String {
         self.archive
             .and_then(|a| a.channel_name(cid))
@@ -504,7 +511,7 @@ fn angle(inner: &str, base: Sty, ctx: &Ctx) -> Option<Vec<Seg>> {
         let text = if let Some(l) = label {
             unescape(l)
         } else if let Some(rest) = bang.strip_prefix("subteam^") {
-            format!("@{rest}")
+            format!("@{}", ctx.usergroup(rest))
         } else if bang.starts_with("date^") {
             bang.to_string()
         } else {
@@ -774,10 +781,7 @@ fn section(el: &Value, ctx: &Ctx, base: Sty, out: &mut Vec<Seg>) {
             }
             "usergroup" => {
                 let id = s("usergroup_id");
-                out.push(Seg::new(
-                    format!("@{}", if id.is_empty() { "group" } else { id }),
-                    mention,
-                ));
+                out.push(Seg::new(format!("@{}", ctx.usergroup(id)), mention));
             }
             "channel" => out.push(Seg::new(
                 format!("#{}", ctx.channel(s("channel_id"))),
@@ -1276,6 +1280,36 @@ pub fn line_text(l: &Line) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usergroup_mentions_resolve_both_formats_and_keep_fallbacks() {
+        let a = Archive::stub(&[], &[]);
+        let mut corpus = Corpus::stub(&[]);
+        corpus.usergroups.insert("S1".into(), "oncall".into());
+        let c = ctx(&a, &corpus);
+        assert_eq!(
+            text(&mrkdwn(
+                "<!subteam^S1> <!subteam^S2> <!subteam^S1|@explicit>",
+                &c,
+                Sty::default()
+            )),
+            "@oncall @S2 @explicit"
+        );
+        let value = serde_json::json!([
+            {"type":"usergroup", "usergroup_id":"S1"},
+            {"type":"usergroup", "usergroup_id":"S2"},
+            {"type":"usergroup"}
+        ]);
+        let original = value.clone();
+        let mut out = Vec::new();
+        section(
+            &serde_json::json!({"elements":value}),
+            &c,
+            Sty::default(),
+            &mut out,
+        );
+        assert_eq!(text(&out), "@oncall@S2@group");
+        assert_eq!(value, original);
+    }
     #[test]
     fn json_highlighting_preserves_escapes_unicode_and_token_kinds() {
         use crate::palette::{Palette, Role};

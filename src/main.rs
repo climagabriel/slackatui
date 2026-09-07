@@ -143,6 +143,12 @@ leave user IDs visible. Only IDs, resolved names and bot flags are stored
 in owner-only files under the profile subdirectory of the cache configured
 by SLACK_TUI_CACHE.
 
+User groups load independently through usergroups.list (usergroups:read).
+Their IDs and handles are cached in usergroups/<team-id>.json under the same
+cache root, with the same 24-hour lifetime and stale-on-error behavior.
+Rich-text group mentions and <!subteam^ID> resolve through this directory;
+explicit mention labels are preserved and unknown groups keep their IDs.
+
 When the cache cannot answer, Slack is asked in the background. Signed in
 through the desktop app's session (nothing to copy; SLACK_TOKEN and
 SLACK_COOKIE override), the Web API serves threads, search, the newest

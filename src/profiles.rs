@@ -12,6 +12,25 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn minimal_groups_include_disabled_and_prefer_handles() {
+        let groups = fetch_groups(json!({"usergroups":[
+            {"id":"S1", "handle":" @oncall ", "name":"On Call", "users":["U1"], "description":"private"},
+            {"id":"S2", "handle":"", "name":" Legacy ", "date_delete":42},
+            {"id":"S3"}, {"id":""}, {}
+        ]})).unwrap();
+        assert_eq!(
+            groups,
+            vec![
+                json!({"id":"S1", "name":"oncall"}),
+                json!({"id":"S2", "name":"Legacy"}),
+                json!({"id":"S3", "name":"S3"})
+            ]
+        );
+        assert!(fetch_groups(json!({})).is_err());
+        assert!(fetch_groups(json!({"usergroups":[]})).unwrap().is_empty());
+    }
+
+    #[test]
     fn pagination_and_minimal_profiles() {
         let mut cursors = Vec::new();
         let users = fetch(|cursor| {
@@ -44,6 +63,39 @@ mod tests {
         assert_eq!(
             load_or_fetch(&root, "T1", || Ok(users.clone())).unwrap().0,
             users
+        );
+        let groups = vec![json!({"id":"S1", "name":"oncall"})];
+        assert_eq!(
+            load_groups(&root, "T1", || Ok(groups.clone())).unwrap().0,
+            groups
+        );
+        assert_eq!(
+            load_groups(&root, "T1", || panic!("fresh group cache fetched"))
+                .unwrap()
+                .0,
+            groups
+        );
+        assert!(load_groups(&root, "T2", || Err("missing_scope".into())).is_err());
+        assert!(load_groups(&root, "../escape", || panic!()).is_err());
+        let group_path = root.join("usergroups/T1.json");
+        assert_eq!(
+            std::fs::metadata(&group_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        save(
+            &group_path,
+            &json!({"team":"T1", "fetched":0, "groups":groups}),
+        )
+        .unwrap();
+        let group_before = std::fs::read(&group_path).unwrap();
+        let (cached, warning) = load_groups(&root, "T1", || Err("missing_scope".into())).unwrap();
+        assert_eq!(cached, groups);
+        assert!(warning.unwrap().contains("using stale cache"));
+        assert_eq!(std::fs::read(&group_path).unwrap(), group_before);
+        std::fs::write(&group_path, "broken").unwrap();
+        assert_eq!(
+            load_groups(&root, "T1", || Ok(groups.clone())).unwrap().0,
+            groups
         );
         assert_eq!(
             load_or_fetch(&root, "T1", || panic!("fresh cache fetched"))
@@ -128,10 +180,52 @@ pub fn load_or_fetch(
     team: &str,
     fetch: impl FnOnce() -> Result<Vec<Value>, String>,
 ) -> Result<(Vec<Value>, Option<String>), String> {
+    load_directory(root, team, "profiles", "users", fetch)
+}
+
+pub fn fetch_groups(response: Value) -> Result<Vec<Value>, String> {
+    let groups = response["usergroups"]
+        .as_array()
+        .ok_or("usergroups.list: missing usergroups")?;
+    Ok(groups
+        .iter()
+        .filter_map(|v| {
+            let id = v["id"].as_str()?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let name = [v.get("handle"), v.get("name")]
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .map(|s| s.trim_start_matches('@'))
+                .find(|s| !s.is_empty())
+                .unwrap_or(id);
+            Some(json!({"id":id, "name":name}))
+        })
+        .collect())
+}
+
+pub fn load_groups(
+    root: &Path,
+    team: &str,
+    fetch: impl FnOnce() -> Result<Vec<Value>, String>,
+) -> Result<(Vec<Value>, Option<String>), String> {
+    load_directory(root, team, "usergroups", "groups", fetch)
+}
+
+fn load_directory(
+    root: &Path,
+    team: &str,
+    directory: &str,
+    key: &str,
+    fetch: impl FnOnce() -> Result<Vec<Value>, String>,
+) -> Result<(Vec<Value>, Option<String>), String> {
     if team.is_empty() || !team.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        return Err("profiles: invalid workspace id".into());
+        return Err(format!("{directory}: invalid workspace id"));
     }
-    let path = root.join("profiles").join(format!("{team}.json"));
+    let path = root.join(directory).join(format!("{team}.json"));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -141,7 +235,7 @@ pub fn load_or_fetch(
         .and_then(|s| serde_json::from_slice::<Value>(&s).ok())
         .filter(|v| {
             v["team"] == team
-                && v["users"].as_array().is_some_and(|a| {
+                && v[key].as_array().is_some_and(|a| {
                     a.iter()
                         .all(|u| u["id"].is_string() && u["name"].is_string())
                 })
@@ -151,7 +245,7 @@ pub fn load_or_fetch(
             .as_u64()
             .is_some_and(|t| t <= now && now - t < TTL)
         {
-            return Ok((v["users"].as_array().unwrap().clone(), None));
+            return Ok((v[key].as_array().unwrap().clone(), None));
         }
     }
     let users = match fetch() {
@@ -160,19 +254,16 @@ pub fn load_or_fetch(
             return cached
                 .map(|v| {
                     (
-                        v["users"].as_array().unwrap().clone(),
-                        Some(format!("profiles: {e}; using stale cache")),
+                        v[key].as_array().unwrap().clone(),
+                        Some(format!("{directory}: {e}; using stale cache")),
                     )
                 })
                 .ok_or(e)
         }
     };
-    let warning = save(
-        &path,
-        &json!({"team": team, "fetched": now, "users": users}),
-    )
-    .err()
-    .map(|e| format!("profiles: cannot save cache: {e}"));
+    let warning = save(&path, &json!({"team": team, "fetched": now, (key): users}))
+        .err()
+        .map(|e| format!("{directory}: cannot save cache: {e}"));
     Ok((users, warning))
 }
 

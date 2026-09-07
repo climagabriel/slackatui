@@ -431,6 +431,7 @@ pub struct App {
     /// Quiet background work: sign-in, conversation list, counts, tails.
     pub bg: Option<Job>,
     profile_job: Option<Job>,
+    group_job: Option<Job>,
     dm_users: HashMap<String, String>,
     /// A slackdump binary answers; the fallback engine.
     pub slackdump: bool,
@@ -565,6 +566,7 @@ impl App {
             api: None,
             bg: None,
             profile_job: None,
+            group_job: None,
             dm_users: HashMap::new(),
             slackdump,
             poll_every: Duration::from_secs(poll_secs),
@@ -3067,9 +3069,35 @@ impl App {
         self.update_notes();
     }
 
+    fn take_usergroups(&mut self, groups: Vec<Value>) {
+        self.corpus.usergroups = groups
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v["id"].as_str()?.to_string(),
+                    v["name"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        self.mark_all_dirty();
+    }
+
     /// Advance the spinner and collect a finished job.
     pub fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+        if let Some(outcome) = self.group_job.as_ref().and_then(|j| j.poll()) {
+            self.group_job = None;
+            match outcome {
+                Ok(Done::Usergroups(groups, warning)) => {
+                    self.take_usergroups(groups);
+                    if let Some(warning) = warning {
+                        self.status = warning;
+                    }
+                }
+                Err(e) => self.status = format!("user groups: {e}"),
+                _ => {}
+            }
+        }
         if let Some(outcome) = self.profile_job.as_ref().and_then(|j| j.poll()) {
             self.profile_job = None;
             match outcome {
@@ -3107,6 +3135,8 @@ impl App {
                     self.api = Some(client.clone());
                     self.profile_job =
                         Some(live::api_profiles(client.clone(), self.cache_dir.clone()));
+                    self.group_job =
+                        Some(live::api_usergroups(client.clone(), self.cache_dir.clone()));
                     self.status = format!("signed in as {who}");
                     self.bg = Some(live::api_conversations(client));
                 }
@@ -4603,6 +4633,11 @@ mod tests {
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
         assert!(crate::ui::dump(&mut app, 80).contains("live-channel"));
+        app.open.as_mut().unwrap().list =
+            MsgList::new(vec![msg(1, "hello <#C1> <!subteam^S1>")], false);
+        assert!(crate::ui::dump(&mut app, 80).contains("@S1"));
+        app.take_usergroups(vec![json!({"id":"S1", "name":"oncall"})]);
+        assert!(crate::ui::dump(&mut app, 80).contains("@oncall"));
         assert_eq!(app.ctx_for(0).user("U1"), "U1");
         app.run_search("hello");
         assert!(app.status.contains("no message matching"));

@@ -49,6 +49,7 @@ pub enum JobKind {
     /// The conversations the user is a member of.
     Conversations,
     Profiles,
+    Usergroups,
     /// Unread state per conversation, tagged with the generation it was asked for.
     Counts {
         gen: u64,
@@ -102,6 +103,7 @@ pub enum Done {
     Messages(Vec<Msg>),
     Conversations(Vec<Value>),
     Profiles(Vec<Value>, Option<String>),
+    Usergroups(Vec<Value>, Option<String>),
     Counts(Value),
     File(PathBuf),
     Marked,
@@ -328,6 +330,30 @@ pub fn api_profiles(client: Arc<Client>, cache: PathBuf) -> Job {
                 })
             })?;
             Ok(Done::Profiles(users, warning))
+        },
+    )
+}
+
+pub fn api_usergroups(client: Arc<Client>, cache: PathBuf) -> Job {
+    spawn(
+        JobKind::Usergroups,
+        "loading user groups".into(),
+        move || {
+            let identity = client.call("auth.test", &[])?;
+            let team = identity["team_id"]
+                .as_str()
+                .ok_or("usergroups: auth.test missing team_id")?;
+            let (groups, warning) = crate::profiles::load_groups(&cache, team, || {
+                crate::profiles::fetch_groups(client.call(
+                    "usergroups.list",
+                    &[
+                        ("team_id", team),
+                        ("include_disabled", "true"),
+                        ("include_users", "false"),
+                    ],
+                )?)
+            })?;
+            Ok(Done::Usergroups(groups, warning))
         },
     )
 }

@@ -90,6 +90,7 @@ pub struct Corpus {
     /// archived elsewhere still gets its name.
     pub channel_names: HashMap<String, String>,
     pub half_life_days: f64,
+    pub usergroups: HashMap<String, String>,
     /// The workspace's users, from the archive with the most of them: every
     /// archive stores the whole list, so one table answers for all.
     users: HashMap<String, User>,
@@ -364,6 +365,7 @@ impl Corpus {
             me,
             half_life_days,
             users: HashMap::new(),
+            usergroups: HashMap::new(),
         };
         if let Some(c) = &cache {
             c.save();
@@ -467,6 +469,7 @@ impl Corpus {
             me: None,
             half_life_days: 30.0,
             users: HashMap::new(),
+            usergroups: HashMap::new(),
         }
     }
 
