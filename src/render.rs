@@ -1050,7 +1050,13 @@ fn human_bytes(n: i64) -> String {
 /// footer. `in_thread` drops the footer (the replies are on screen).
 pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rendered {
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let time = ctx.tz.fmt(m.secs(), "%H:%M");
+    let time = ctx.tz.fmt(
+        m.secs(),
+        match ctx.tz {
+            Tz::Utc => "%a %Y-%m-%d %H:%M UTC",
+            Tz::Local => "%a %Y-%m-%d %H:%M %:z",
+        },
+    );
     let sub = m.subtype.as_deref().unwrap_or("");
     if is_system(m) {
         let text = match sub {
@@ -1074,7 +1080,8 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
                 ..Sty::default()
             },
         )];
-        let mut lines = wrap(&segs, width, "       · ", ctx.palette);
+        let indent = format!("{}  · ", " ".repeat(time.len()));
+        let mut lines = wrap(&segs, width, &indent, ctx.palette);
         if let Some(first) = lines.first_mut() {
             first.spans[0] = Span::styled(format!("{time}  · "), dim);
         }
@@ -1227,6 +1234,39 @@ mod tests {
 
     fn text(segs: &[Seg]) -> String {
         plain(segs)
+    }
+
+    #[test]
+    fn message_headers_include_date_and_timezone() {
+        let a = Archive::stub(&[("U1", "Ada")], &[]);
+        let corpus = Corpus::stub(&[]);
+        let mut c = ctx(&a, &corpus);
+        let secs = Utc
+            .with_ymd_and_hms(2026, 9, 7, 10, 59, 0)
+            .unwrap()
+            .timestamp();
+        for subtype in ["", "channel_join"] {
+            let m = Msg::from_api(
+                "C1".into(),
+                serde_json::json!({
+                    "ts": format!("{secs}.000000"), "user":"U1", "text":"joined the channel",
+                    "subtype": subtype,
+                }),
+            )
+            .unwrap();
+            for in_thread in [false, true] {
+                let rendered = message_lines(&m, &c, 120, in_thread);
+                assert!(line_text(&rendered.lines[0]).starts_with("Mon 2026-09-07 10:59 UTC"));
+            }
+            c.tz = Tz::Local;
+            let expected = Local
+                .timestamp_opt(secs, 0)
+                .unwrap()
+                .format("%a %Y-%m-%d %H:%M %:z")
+                .to_string();
+            assert!(line_text(&message_lines(&m, &c, 120, false).lines[0]).starts_with(&expected));
+            c.tz = Tz::Utc;
+        }
     }
 
     #[test]
