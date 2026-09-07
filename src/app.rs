@@ -413,6 +413,8 @@ pub struct App {
     pub api: Option<Arc<Client>>,
     /// Quiet background work: sign-in, conversation list, counts, tails.
     pub bg: Option<Job>,
+    profile_job: Option<Job>,
+    dm_users: HashMap<String, String>,
     /// A slackdump binary answers; the fallback engine.
     pub slackdump: bool,
     pub poll_every: Duration,
@@ -521,6 +523,8 @@ impl App {
             lock,
             api: None,
             bg: None,
+            profile_job: None,
+            dm_users: HashMap::new(),
             slackdump,
             poll_every: Duration::from_secs(poll_secs),
             last_poll: Instant::now(),
@@ -2486,6 +2490,7 @@ impl App {
             let raw = s("name");
             let (kind, name) = if b("is_im") {
                 let u = s("user");
+                self.dm_users.insert(id.clone(), u.clone());
                 let n = self.corpus.user_name(&u).unwrap_or_else(|| u.clone());
                 (
                     Kind::Im,
@@ -2986,9 +2991,50 @@ impl App {
         }
     }
 
+    fn take_profiles(&mut self, users: Vec<Value>) {
+        self.corpus.merge_profiles(users);
+        let names: Vec<_> = self
+            .corpus
+            .convs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, conv)| {
+                let uid = self.dm_users.get(&conv.id)?;
+                let name = if self.corpus.me.as_deref() == Some(uid) {
+                    "@me (self)".to_string()
+                } else {
+                    format!(
+                        "@{}",
+                        self.corpus.user_name(uid).unwrap_or_else(|| uid.clone())
+                    )
+                };
+                Some((idx, name))
+            })
+            .collect();
+        for (idx, name) in names {
+            self.corpus.convs[idx].name = name;
+        }
+        self.mark_all_dirty();
+        self.apply_filter();
+        self.update_notes();
+    }
+
     /// Advance the spinner and collect a finished job.
     pub fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+        if let Some(outcome) = self.profile_job.as_ref().and_then(|j| j.poll()) {
+            self.profile_job = None;
+            match outcome {
+                Ok(Done::Profiles(users, warning)) => {
+                    self.take_profiles(users);
+                    if let Some(warning) = warning {
+                        self.status = warning;
+                    }
+                }
+                Err(e) => self.status = format!("user profiles: {e}"),
+                _ => {}
+            }
+        }
         // The file slot: one download at a time, decoded on arrival.
         if let Some(outcome) = self.file_job.as_ref().and_then(|j| j.poll()) {
             let job = self.file_job.take().expect("polled");
@@ -3011,6 +3057,8 @@ impl App {
             match outcome {
                 Ok(Done::Auth(client, who)) => {
                     self.api = Some(client.clone());
+                    self.profile_job =
+                        Some(live::api_profiles(client.clone(), self.cache_dir.clone()));
                     self.status = format!("signed in as {who}");
                     self.bg = Some(live::api_conversations(client));
                 }
@@ -4120,6 +4168,14 @@ mod tests {
         assert_eq!(app.ctx_for(0).user("U1"), "U1");
         app.run_search("hello");
         assert!(app.status.contains("no message matching"));
+
+        app.merge_conversations(vec![json!({"id":"D1", "is_im":true, "user":"U1"})]);
+        app.take_profiles(vec![json!({"id":"U1", "name":"Ada", "is_bot":false})]);
+        assert_eq!(app.corpus.convs[1].name, "@Ada");
+        assert_eq!(app.ctx_for(0).author(&msg(1, "hello")), "Ada");
+        assert!(crate::ui::dump(&mut app, 80).contains("Ada"));
+        app.merge_conversations(vec![json!({"id":"D2", "is_im":true, "user":"U1"})]);
+        assert_eq!(app.corpus.convs[2].name, "@Ada");
 
         // Index zero must not become the live conversation's archive when a
         // different conversation has a local cache.

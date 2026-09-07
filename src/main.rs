@@ -10,6 +10,7 @@ mod edit;
 mod keys;
 mod live;
 mod palette;
+mod profiles;
 mod render;
 mod storage;
 mod ui;
@@ -95,7 +96,7 @@ environment
   SLACKDUMP            the slackdump binary (default: slackdump on PATH)
   SLACKDUMP_LOCK       lock file shared with the hourly refresh
                        (default /var/lock/slackdump-sync.lock)
-  SLACK_TUI_CACHE      where fetched threads live
+  SLACK_TUI_CACHE      where fetched threads and user profiles live
                        (default $XDG_CACHE_HOME/slack-tui/live, i.e. ~/.cache/...)
   SLACK_TUI_PALETTE    where /colorpalette saves UI colors, the vintage
                        palette included (default
@@ -129,6 +130,13 @@ Images: thumbnails under messages and a full-pane viewer, through the
 kitty, Sixel or iTerm2 protocol when the terminal has one and half-block
 cells otherwise. Files come from the archive's own uploads, then from the
 cache, then from Slack when signed in.
+
+After sign-in, user profiles load automatically in a separate background job.
+Their workspace-scoped cache is reused for 24 hours, then refreshed on the
+next start. Failed refreshes retain stale names; failures without a cache
+leave user IDs visible. Only IDs, resolved names and bot flags are stored
+in owner-only files under the profile subdirectory of the cache configured
+by SLACK_TUI_CACHE.
 
 When the cache cannot answer, Slack is asked in the background. Signed in
 through the desktop app's session (nothing to copy; SLACK_TOKEN and

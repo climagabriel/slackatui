@@ -48,6 +48,7 @@ pub enum JobKind {
     },
     /// The conversations the user is a member of.
     Conversations,
+    Profiles,
     /// Unread state per conversation, tagged with the generation it was asked for.
     Counts {
         gen: u64,
@@ -100,6 +101,7 @@ pub enum Done {
     Auth(Arc<Client>, String),
     Messages(Vec<Msg>),
     Conversations(Vec<Value>),
+    Profiles(Vec<Value>, Option<String>),
     Counts(Value),
     File(PathBuf),
     Marked,
@@ -309,6 +311,25 @@ pub fn api_conversations(client: Arc<Client>) -> Job {
     spawn(JobKind::Conversations, String::new(), move || {
         Ok(Done::Conversations(client.my_conversations()?))
     })
+}
+
+pub fn api_profiles(client: Arc<Client>, cache: PathBuf) -> Job {
+    spawn(
+        JobKind::Profiles,
+        "loading user profiles".into(),
+        move || {
+            let identity = client.call("auth.test", &[])?;
+            let team = identity["team_id"]
+                .as_str()
+                .ok_or("profiles: auth.test missing team_id")?;
+            let (users, warning) = crate::profiles::load_or_fetch(&cache, team, || {
+                crate::profiles::fetch(|cursor| {
+                    client.call("users.list", &[("limit", "200"), ("cursor", cursor)])
+                })
+            })?;
+            Ok(Done::Profiles(users, warning))
+        },
+    )
 }
 
 pub fn fetch_file(client: Arc<Client>, id: String, url: String, dest: PathBuf) -> Job {

@@ -274,6 +274,19 @@ pub(crate) fn ts_to_id(ts: &str) -> Option<i64> {
 }
 
 impl Corpus {
+    pub fn merge_profiles(&mut self, users: Vec<Value>) {
+        for u in users {
+            if let (Some(id), Some(name)) = (u["id"].as_str(), u["name"].as_str()) {
+                self.users.insert(
+                    id.to_string(),
+                    User {
+                        name: name.to_string(),
+                        is_bot: u["is_bot"].as_bool().unwrap_or(false),
+                    },
+                );
+            }
+        }
+    }
     /// Live-only conversations have no archive; their numeric index is a placeholder.
     pub fn conv_archive(&self, conv: &Conv) -> Option<&Archive> {
         if conv.live_only {
