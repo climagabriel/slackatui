@@ -58,7 +58,7 @@ pub struct Conv {
     pub name: String,
     pub kind: Kind,
     pub archived: bool,
-    /// Distinct message timestamps, the same figure `slack cache list` shows.
+    /// Distinct message timestamps, the same figure `slq cache list` shows.
     pub msgs: i64,
     /// Messages written by the archive's owner, replies included.
     pub mine: i64,
