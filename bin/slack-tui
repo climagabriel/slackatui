@@ -16,6 +16,7 @@ bin="$cache/bin/slack-tui"
 stamp="$cache/source.sha256"
 
 force_rebuild=0
+debug_build=0
 verbose=0
 show_help=0
 parse_launcher_flags=1
@@ -24,6 +25,11 @@ application_arguments=()
 for argument in "$@"; do
     if ((parse_launcher_flags)); then
         case "$argument" in
+            --build-debug)
+                debug_build=1
+                force_rebuild=1
+                verbose=1
+                ;;
             --build | --rebuild)
                 force_rebuild=1
                 verbose=1
@@ -55,6 +61,10 @@ usage: slack-tui [LAUNCHER_FLAG ...] [APPLICATION_ARGUMENT ...]
 launcher flags
   --build, --rebuild  synonyms; force a slack-tui release rebuild and imply
                       --verbose
+  --build-debug      always rebuild the dev profile with full debug symbols,
+                      no stripping or optimization, and unwind panics;
+                      launch with RUST_BACKTRACE=full and imply --verbose
+                      Takes precedence over --build/--rebuild when combined.
   --verbose, -v       synonyms; show the launcher decision and cargo output
                       when building; do not force a rebuild
   --help, -h          show combined help without checking cargo or building
@@ -69,6 +79,8 @@ environment
                        command-line verbosity still applies
   XDG_CACHE_HOME       build cache: $XDG_CACHE_HOME/slack-tui;
                        default: $HOME/.cache/slack-tui
+  Debug binary and checksum are cached separately from release. A plain
+  slack-tui invocation still launches release.
 
 launcher-defined exit codes
   0  combined help printed
@@ -79,6 +91,7 @@ launcher-defined exit codes
 
 examples
   slack-tui --build
+  slack-tui --build-debug
   SLACK_TUI_REBUILD=1 slack-tui
   slack-tui --verbose --channel '#team-alpha'
   slack-tui -- --help
@@ -96,6 +109,20 @@ EOF
     fi
     printf '%s\n' "$application_help"
     exit 0
+fi
+
+profile_arguments=(--release)
+build_directory=release
+if ((debug_build)); then
+    profile_arguments=(--profile dev)
+    build_directory=debug
+    bin="$cache/bin/slack-tui-debug"
+    stamp="$cache/source-debug.sha256"
+    export CARGO_PROFILE_DEV_DEBUG=2
+    export CARGO_PROFILE_DEV_STRIP=none
+    export CARGO_PROFILE_DEV_OPT_LEVEL=0
+    export CARGO_PROFILE_DEV_PANIC=unwind
+    export RUST_BACKTRACE=full
 fi
 
 # What /version shows: the plugin manifest beside this launcher, so a plugin
@@ -119,6 +146,9 @@ build_reason="cached binary is current"
 if ((force_rebuild)); then
     needs_build=1
     build_reason="forced by --build/--rebuild"
+    if ((debug_build)); then
+        build_reason="forced by --build-debug; debug symbols, RUST_BACKTRACE=full"
+    fi
 elif [[ "${SLACK_TUI_REBUILD:-0}" == 1 ]]; then
     needs_build=1
     build_reason="forced by SLACK_TUI_REBUILD=1"
@@ -142,7 +172,7 @@ if ((needs_build)); then
     mkdir --parents "$cache/bin"
     if ((force_rebuild)); then
         cargo clean \
-            --release \
+            "${profile_arguments[@]}" \
             --package slack-tui \
             --locked \
             --manifest-path "$src/Cargo.toml" \
@@ -150,7 +180,7 @@ if ((needs_build)); then
     fi
     cargo_arguments=(
         build
-        --release
+        "${profile_arguments[@]}"
         --locked
         --manifest-path "$src/Cargo.toml"
         --target-dir "$cache/target"
@@ -161,7 +191,7 @@ if ((needs_build)); then
     cargo "${cargo_arguments[@]}"
     # A running instance keeps the old file busy; a rename replaces the entry
     # under it instead of failing with "Text file busy".
-    cp "$cache/target/release/slack-tui" "$bin.new.$$"
+    cp "$cache/target/$build_directory/slack-tui" "$bin.new.$$"
     mv --force "$bin.new.$$" "$bin"
     printf '%s\n' "$sum" > "$stamp"
 fi

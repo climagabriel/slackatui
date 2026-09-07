@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # maturity: low; issues-found: 0
 set -euo pipefail
+unset XDG_CACHE_HOME SLACK_TUI_REBUILD
 
 plugin_root=$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 launcher=$plugin_root/bin/slack-tui
@@ -17,6 +18,7 @@ cat > "$fake_application" <<'FAKE_APPLICATION'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '[%s]\n' "$@" > "$SLACK_TUI_APPLICATION_ARGUMENT_LOG"
+printf '%s\n' "${RUST_BACKTRACE:-unset}" > "$SLACK_TUI_BACKTRACE_LOG"
 FAKE_APPLICATION
 chmod +x "$fake_application"
 
@@ -27,6 +29,7 @@ printf '[%s]\n' "$@" >> "$SLACK_TUI_CARGO_ARGUMENT_LOG"
 command=$1
 target_dir=
 quiet=0
+build_directory=debug
 while (($#)); do
     case "$1" in
         --target-dir)
@@ -36,6 +39,13 @@ while (($#)); do
         --quiet)
             quiet=1
             ;;
+        --release)
+            build_directory=release
+            ;;
+        --profile)
+            shift
+            [[ "$1" == dev ]]
+            ;;
     esac
     shift
 done
@@ -43,11 +53,17 @@ done
 if ((!quiet)); then
     echo "fake cargo: verbose $command output" >&2
 fi
-mkdir --parents "$target_dir/release"
+mkdir --parents "$target_dir/$build_directory"
 if [[ "$command" == clean ]]; then
-    rm --force "$target_dir/release/slack-tui"
+    rm --force "$target_dir/$build_directory/slack-tui"
 else
-    cp "$SLACK_TUI_FAKE_APPLICATION" "$target_dir/release/slack-tui"
+    cp "$SLACK_TUI_FAKE_APPLICATION" "$target_dir/$build_directory/slack-tui"
+fi
+if [[ "$build_directory" == debug ]]; then
+    [[ "$CARGO_PROFILE_DEV_DEBUG" == 2 ]]
+    [[ "$CARGO_PROFILE_DEV_STRIP" == none ]]
+    [[ "$CARGO_PROFILE_DEV_OPT_LEVEL" == 0 ]]
+    [[ "$CARGO_PROFILE_DEV_PANIC" == unwind ]]
 fi
 FAKE_CARGO
 chmod +x "$fake_tools/cargo"
@@ -55,14 +71,15 @@ chmod +x "$fake_tools/cargo"
 export SLACK_TUI_CARGO_ARGUMENT_LOG=$cargo_argument_log
 export SLACK_TUI_APPLICATION_ARGUMENT_LOG=$application_argument_log
 export SLACK_TUI_FAKE_APPLICATION=$fake_application
+export SLACK_TUI_BACKTRACE_LOG=$test_root/backtrace
 test_path=$fake_tools:$PATH
-home=$test_root/home
+test_home=$test_root/home
 stdout=$test_root/stdout
 stderr=$test_root/stderr
 
 # An ordinary first run builds quietly and passes every application argument
 # unchanged, including an argument containing whitespace.
-HOME=$home PATH=$test_path "$launcher" \
+HOME=$test_home PATH=$test_path "$launcher" \
     --channel '#zero-member-test' 'two words' > "$stdout" 2> "$stderr"
 [[ ! -s "$stdout" ]]
 [[ ! -s "$stderr" ]]
@@ -74,7 +91,7 @@ cmp "$test_root/expected-application-arguments" "$application_argument_log"
 # A current cached binary is silent and does not call cargo.
 : > "$cargo_argument_log"
 : > "$application_argument_log"
-HOME=$home PATH=$test_path "$launcher" --list > "$stdout" 2> "$stderr"
+HOME=$test_home PATH=$test_path "$launcher" --list > "$stdout" 2> "$stderr"
 [[ ! -s "$stdout" ]]
 [[ ! -s "$stderr" ]]
 [[ ! -s "$cargo_argument_log" ]]
@@ -90,7 +107,7 @@ for verbose_flag in --verbose -v; do
     esac
     : > "$cargo_argument_log"
     : > "$application_argument_log"
-    HOME=$home PATH=$test_path "$launcher" "$verbose_flag" --list \
+    HOME=$test_home PATH=$test_path "$launcher" "$verbose_flag" --list \
         > "$test_root/$verbose_name.stdout" \
         2> "$test_root/$verbose_name.stderr"
     [[ ! -s "$cargo_argument_log" ]]
@@ -106,7 +123,7 @@ cmp "$test_root/verbose.stderr" "$test_root/v.stderr"
 for build_flag in --build --rebuild; do
     : > "$cargo_argument_log"
     : > "$application_argument_log"
-    HOME=$home PATH=$test_path "$launcher" "$build_flag" --list \
+    HOME=$test_home PATH=$test_path "$launcher" "$build_flag" --list \
         > "$test_root/${build_flag#--}.stdout" \
         2> "$test_root/${build_flag#--}.stderr"
     grep --fixed-strings --quiet '[clean]' "$cargo_argument_log"
@@ -130,7 +147,7 @@ cmp "$test_root/build.stderr" "$test_root/rebuild.stderr"
 # The delimiter is consumed and disables launcher parsing for later flags.
 : > "$cargo_argument_log"
 : > "$application_argument_log"
-HOME=$home PATH=$test_path "$launcher" -- --build -v --list \
+HOME=$test_home PATH=$test_path "$launcher" -- --build -v --list \
     > "$stdout" 2> "$stderr"
 [[ ! -s "$stdout" ]]
 [[ ! -s "$stderr" ]]
@@ -142,7 +159,7 @@ cmp "$test_root/expected-application-arguments" "$application_argument_log"
 # The legacy environment rebuild stays quiet.
 : > "$cargo_argument_log"
 : > "$application_argument_log"
-HOME=$home PATH=$test_path SLACK_TUI_REBUILD=1 "$launcher" --list \
+HOME=$test_home PATH=$test_path SLACK_TUI_REBUILD=1 "$launcher" --list \
     > "$stdout" 2> "$stderr"
 [[ ! -s "$stdout" ]]
 [[ ! -s "$stderr" ]]
@@ -161,5 +178,53 @@ grep --fixed-strings --quiet -- '--build, --rebuild' "$stdout"
 grep --fixed-strings --quiet -- '--verbose, -v' "$stdout"
 grep --fixed-strings --quiet 'do not force a rebuild' "$stdout"
 grep --fixed-strings --quiet -- '--root DIR' "$stdout"
+
+# Debug forces a dev build and full backtrace, with a separate binary/stamp.
+cp "$test_home/.cache/slack-tui/source.sha256" "$test_root/release-stamp"
+: > "$cargo_argument_log"
+HOME=$test_home PATH=$test_path RUST_BACKTRACE=0 "$launcher" --build-debug --list \
+    > "$stdout" 2> "$stderr"
+grep --fixed-strings --quiet '[--profile]' "$cargo_argument_log"
+grep --fixed-strings --quiet '[dev]' "$cargo_argument_log"
+grep --fixed-strings --quiet '[clean]' "$cargo_argument_log"
+grep --fixed-strings --quiet '[build]' "$cargo_argument_log"
+if grep --fixed-strings --quiet '[--release]' "$cargo_argument_log"; then
+    echo 'debug build unexpectedly touched release' >&2
+    exit 1
+fi
+[[ $(< "$SLACK_TUI_BACKTRACE_LOG") == full ]]
+[[ -x "$test_home/.cache/slack-tui/bin/slack-tui-debug" ]]
+[[ -s "$test_home/.cache/slack-tui/source-debug.sha256" ]]
+cmp "$test_root/release-stamp" "$test_home/.cache/slack-tui/source.sha256"
+printf '%s\n' '[--list]' > "$test_root/expected-application-arguments"
+cmp "$test_root/expected-application-arguments" "$application_argument_log"
+
+# Plain launch still uses the current release without rebuilding or enabling backtraces.
+: > "$cargo_argument_log"
+HOME=$test_home PATH=$test_path RUST_BACKTRACE=0 "$launcher" --list > "$stdout" 2> "$stderr"
+[[ ! -s "$cargo_argument_log" ]]
+[[ $(< "$SLACK_TUI_BACKTRACE_LOG") == 0 ]]
+
+# A repeated debug request rebuilds; debug takes precedence over release flags in either position.
+: > "$cargo_argument_log"
+HOME=$test_home PATH=$test_path "$launcher" --build --build-debug --rebuild --list \
+    > "$stdout" 2> "$stderr"
+grep --fixed-strings --quiet '[clean]' "$cargo_argument_log"
+grep --fixed-strings --quiet '[dev]' "$cargo_argument_log"
+if grep --fixed-strings --quiet '[--release]' "$cargo_argument_log"; then
+    echo 'combined build flags unexpectedly selected release' >&2
+    exit 1
+fi
+
+# Help remains side-effect-free even when combined with debug; -- passes the flag through.
+: > "$cargo_argument_log"
+HOME=$help_home PATH=$test_path "$launcher" --build-debug --help > "$stdout" 2> "$stderr"
+[[ ! -s "$cargo_argument_log" ]]
+[[ ! -e "$help_home/.cache/slack-tui" ]]
+grep --fixed-strings --quiet -- '--build-debug' "$stdout"
+HOME=$test_home PATH=$test_path "$launcher" -- --build-debug > "$stdout" 2> "$stderr"
+[[ ! -s "$cargo_argument_log" ]]
+printf '%s\n' '[--build-debug]' > "$test_root/expected-application-arguments"
+cmp "$test_root/expected-application-arguments" "$application_argument_log"
 
 echo 'slack-tui launcher tests: passed'
