@@ -311,13 +311,6 @@ impl Corpus {
             }
         }
         crate::trace("open: archives opened");
-        if archives.is_empty() {
-            return Err(format!(
-                "no slackdump.sqlite under {}/{{{}}}",
-                root.display(),
-                ARCHIVE_SETS.join(",")
-            ));
-        }
         let me = std::env::var("SLACK_SELF_USER_ID")
             .ok()
             .filter(|s| !s.is_empty())

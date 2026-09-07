@@ -11,6 +11,7 @@ mod keys;
 mod live;
 mod palette;
 mod render;
+mod storage;
 mod ui;
 
 use std::path::PathBuf;
@@ -56,6 +57,9 @@ size). Your user id comes from the DM archive, or from SLACK_SELF_USER_ID.
 
 flags
   --root DIR      archive root (default $SLACKDUMPS, then /srv/slackdumps)
+                  created if missing; inaccessible roots fall back to
+                  $XDG_CACHE_HOME/slackdumps (default $HOME/.cache/slackdumps)
+                  Existing archives are preserved; an empty root is supported.
   --channel NAME  open this conversation at once (#team-alpha, @someone, or the id)
   --local         show times in local time instead of UTC
   --list          print the conversations (with your message count) and exit
@@ -145,7 +149,7 @@ version in the status line's right corner, and hides it again; /mute and /unmute
 the list, on top of the channels muted in Slack itself.
 
 exit codes
-  0  ok        1  no archive, or the conversation was not found
+  0  ok        1  storage unavailable, or the conversation was not found
   2  bad usage
 
 examples
@@ -371,11 +375,14 @@ fn run() -> i32 {
                 .join("slack-tui")
                 .join("live")
         });
-    let corpus = match Corpus::open(
-        &opts.root,
-        opts.half_life,
-        Some(cache_dir.join("stats.json")),
-    ) {
+    let root = match storage::resolve_root(&opts.root) {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("slack-tui: {error}");
+            return 1;
+        }
+    };
+    let corpus = match Corpus::open(&root, opts.half_life, Some(cache_dir.join("stats.json"))) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("slack-tui: {e}");
