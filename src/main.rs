@@ -167,6 +167,10 @@ Space toggles, Enter saves, Esc cancels; type to search. Reset to default
 enables every category and removes individual overrides. Muted is an additional
 filter across types; individual show/hide overrides take precedence.
 Preferences persist per workspace in conversations-pane.json beside keys.json.
+The Number column row cycles through follow sorting, cached messages, your
+cached messages, activity score, mentions and hidden. Explicit choices are
+independent of sorting; unavailable archive counts show a dash. Reset restores
+follow sorting. /conversation-pane is an alias for /conversations-pane.
 In the image viewer, Ctrl-Shift-= / Ctrl-Shift-- zoom in/out; plain + / - also
 work, and 0 restores fit. Zoom is centered, from 25% to 800% of the fitted size.
 Terminal font shortcuts must be disabled or reassigned in terminal preferences

@@ -472,7 +472,7 @@ pub struct App {
     pub keymap: Keymap,
     pub keys_path: Option<PathBuf>,
     pub pane_menu: Option<crate::conversations_pane::Menu>,
-    pane_settings: crate::conversations_pane::Settings,
+    pub pane_settings: crate::conversations_pane::Settings,
     pane_path: Option<PathBuf>,
     pane_workspace: String,
 }
@@ -4083,7 +4083,9 @@ fn parse_command(line: &str) -> Option<Command> {
         "mute" => Some(Command::Mute(true, rest.to_string())),
         "unmute" => Some(Command::Mute(false, rest.to_string())),
         "colorpalette" | "palette" | "colors" => Some(Command::ColorPalette(rest.to_string())),
-        "conversations-pane" if rest.is_empty() => Some(Command::ConversationsPane),
+        "conversations-pane" | "conversation-pane" if rest.is_empty() => {
+            Some(Command::ConversationsPane)
+        }
         "keys" | "keybindings" if rest.is_empty() => Some(Command::Keys),
         "version" if rest.is_empty() => Some(Command::Version),
         "upload" | "attach" => Some(Command::Upload(rest.to_string())),
@@ -4250,6 +4252,77 @@ mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn conversation_number_modes_and_menu() {
+        use crate::conversations_pane::{Menu, NumberColumn as N, Settings};
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![json!({"id":"C1","name":"one","is_member":true})]);
+        let c = &mut app.corpus.convs[0];
+        c.msgs = 123;
+        c.mine = 12;
+        c.score = 3.6;
+        c.mentions = 2;
+        assert_eq!(N::Messages.value(c, true), None);
+        assert_eq!(N::Mentions.value(c, false), Some(2));
+        assert_eq!(N::Sort.value(c, true), Some(4));
+        assert_eq!(N::Sort.value(c, false), Some(123));
+        c.live_only = false;
+        for sort in [true, false] {
+            assert_eq!(N::Messages.value(c, sort), Some(123));
+            assert_eq!(N::Mine.value(c, sort), Some(12));
+            assert_eq!(N::Activity.value(c, sort), Some(4));
+            assert_eq!(N::Hidden.value(c, sort), None);
+        }
+        let mut menu = Menu::new(Settings::default(), &app.corpus.convs);
+        menu.cursor = 7;
+        menu.toggle();
+        assert_eq!(menu.settings.number, N::Messages);
+        assert!(menu.rows()[7].contains("Cached messages"));
+        menu.cursor = 8;
+        menu.toggle();
+        assert_eq!(menu.settings.overrides.get("C1"), Some(&true));
+        menu.cursor = 0;
+        menu.toggle();
+        assert_eq!(menu.settings, Settings::default());
+        app.run_command("conversation-pane", "");
+        app.pane_menu.as_mut().unwrap().cursor = 7;
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.pane_settings.number, N::Sort);
+        app.run_command("conversation-pane", "");
+        app.pane_menu.as_mut().unwrap().cursor = 7;
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.pane_settings.number, N::Messages);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            (1..29)
+                .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(&terminal).ends_with("123"));
+        app.pane_settings.number = N::Hidden;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(!row(&terminal).contains("123"));
+        app.pane_settings.number = N::Messages;
+        app.corpus.convs[0].live_only = true;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(row(&terminal).ends_with('—'));
     }
 
     #[test]

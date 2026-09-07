@@ -30,6 +30,78 @@ pub fn category(c: &Conv) -> usize {
 pub struct Settings {
     pub hidden: BTreeSet<String>,
     pub overrides: BTreeMap<String, bool>,
+    pub number: NumberColumn,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub enum NumberColumn {
+    #[default]
+    Sort,
+    Messages,
+    Mine,
+    Activity,
+    Mentions,
+    Hidden,
+}
+
+impl NumberColumn {
+    const ALL: [Self; 6] = [
+        Self::Sort,
+        Self::Messages,
+        Self::Mine,
+        Self::Activity,
+        Self::Mentions,
+        Self::Hidden,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Sort => "sort",
+            Self::Messages => "messages",
+            Self::Mine => "mine",
+            Self::Activity => "activity",
+            Self::Mentions => "mentions",
+            Self::Hidden => "hidden",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sort => "Follow sorting (current behavior)",
+            Self::Messages => "Cached messages (not a Slack-wide total)",
+            Self::Mine => "Your cached messages",
+            Self::Activity => "Your recency-weighted activity score",
+            Self::Mentions => "Mentions (last known count)",
+            Self::Hidden => "Hidden",
+        }
+    }
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::Sort => "auto",
+            Self::Messages => "cached msgs",
+            Self::Mine => "my msgs",
+            Self::Activity => "score",
+            Self::Mentions => "mentions",
+            Self::Hidden => "no number",
+        }
+    }
+    pub fn next(self) -> Self {
+        Self::ALL[(Self::ALL.iter().position(|&n| n == self).unwrap() + 1) % Self::ALL.len()]
+    }
+    pub fn value(self, c: &Conv, sort_mine: bool) -> Option<i64> {
+        match self {
+            Self::Hidden => None,
+            Self::Sort => Some(if sort_mine {
+                c.score.round() as i64
+            } else {
+                c.msgs
+            }),
+            Self::Mentions => Some(c.mentions),
+            _ if c.live_only => None,
+            Self::Messages => Some(c.msgs),
+            Self::Mine => Some(c.mine),
+            Self::Activity => Some(c.score.round() as i64),
+        }
+    }
 }
 
 impl Settings {
@@ -72,6 +144,12 @@ impl Settings {
             .ok_or("invalid hidden_categories")?;
         let overrides = v["overrides"].as_object().ok_or("invalid overrides")?;
         let mut settings = Self::default();
+        if let Some(number) = v.get("number") {
+            settings.number = NumberColumn::ALL
+                .into_iter()
+                .find(|n| Some(n.key()) == number.as_str())
+                .ok_or("invalid number column")?;
+        }
         for value in hidden {
             let key = value
                 .as_str()
@@ -96,7 +174,7 @@ impl Settings {
             .ok_or("invalid settings object")?
             .insert(
                 workspace.into(),
-                json!({"hidden_categories":self.hidden, "overrides":self.overrides}),
+                json!({"hidden_categories":self.hidden, "overrides":self.overrides, "number":self.number.key()}),
             );
         save(path, &doc).map_err(|e| e.to_string())
     }
@@ -193,6 +271,7 @@ mod tests {
         let mut a = Settings::default();
         a.toggle_category(5);
         a.cycle("C1");
+        a.number = NumberColumn::Mine;
         a.save(Some(&path), "workspace-a").unwrap();
         Settings::default()
             .save(Some(&path), "workspace-b")
@@ -206,6 +285,23 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        for number in NumberColumn::ALL {
+            a.number = number;
+            a.save(Some(&path), "workspace-a").unwrap();
+            assert_eq!(
+                Settings::load(Some(&path), "workspace-a").unwrap().number,
+                number
+            );
+        }
+        std::fs::write(
+            &path,
+            r#"{"old":{"hidden_categories":["muted"],"overrides":{"C1":false}}}"#,
+        )
+        .unwrap();
+        let old = Settings::load(Some(&path), "old").unwrap();
+        assert_eq!(old.number, NumberColumn::Sort);
+        assert!(old.hidden.contains("muted"));
+        assert_eq!(old.overrides.get("C1"), Some(&false));
         std::fs::write(&path, "broken").unwrap();
         assert!(a.save(Some(&path), "workspace-a").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
@@ -265,6 +361,10 @@ impl Menu {
                 }
             ));
         }
+        rows.push(format!(
+            "Number column: {} · Space cycles",
+            self.settings.number.label()
+        ));
         for i in self.matching() {
             let e = &self.entries[i];
             let choice = match self.settings.overrides.get(&e.id) {
@@ -291,8 +391,9 @@ impl Menu {
         match self.cursor {
             0 => self.settings = Settings::default(),
             1..=6 => self.settings.toggle_category(self.cursor - 1),
+            7 => self.settings.number = self.settings.number.next(),
             _ => {
-                if let Some(&i) = self.matching().get(self.cursor - 7) {
+                if let Some(&i) = self.matching().get(self.cursor - 8) {
                     self.settings.cycle(&self.entries[i].id);
                 }
             }

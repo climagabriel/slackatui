@@ -82,8 +82,9 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Convs;
     let title = if app.filter.is_empty() {
         format!(
-            " {} · {}by {} ",
+            " {} · {} · {}by {} ",
             app.filtered.len(),
+            app.pane_settings.number.heading(),
             if app.unreads_first {
                 "unread first · "
             } else {
@@ -92,7 +93,12 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             app.sort_label()
         )
     } else {
-        format!(" {} · '{}' ", app.filtered.len(), app.filter)
+        format!(
+            " {} · {} · '{}' ",
+            app.filtered.len(),
+            app.pane_settings.number.heading(),
+            app.filter
+        )
     };
     let block = Block::bordered()
         .title(title)
@@ -106,14 +112,19 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&i| {
             let c = app.conv(i);
-            // The number that ordered the list: the owner's recency-weighted
-            // messages under "my activity", the conversation's total otherwise.
-            let count = human_count(if app.sort == Sort::Mine {
-                c.score.round() as i64
+            let hidden =
+                app.pane_settings.number == crate::conversations_pane::NumberColumn::Hidden;
+            let count = if hidden {
+                String::new()
             } else {
-                c.msgs
-            });
-            let room = width.saturating_sub(count.len() + 1);
+                app.pane_settings
+                    .number
+                    .value(c, app.sort == Sort::Mine)
+                    .map(human_count)
+                    .unwrap_or_else(|| "—".into())
+            };
+            let gap = usize::from(!hidden);
+            let room = width.saturating_sub(count.width() + gap);
             let mut name = c.name.clone();
             if c.archived {
                 name.push('†');
@@ -147,7 +158,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             Line::from(vec![
                 Span::styled(name, name_style),
-                Span::raw(" ".repeat(pad + 1)),
+                Span::raw(" ".repeat(pad + gap)),
                 Span::styled(count, dim),
             ])
         })
