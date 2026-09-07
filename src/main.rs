@@ -57,9 +57,9 @@ size). Your user id comes from the DM archive, or from SLACK_SELF_USER_ID.
 
 flags
   --root DIR      archive root (default $SLACKDUMPS, then /srv/slackdumps)
-                  created if missing; inaccessible roots fall back to
-                  $XDG_CACHE_HOME/slackdumps (default $HOME/.cache/slackdumps)
-                  Existing archives are preserved; an empty root is supported.
+                  missing or inaccessible storage exits with repair commands;
+                  no directory is created and no fallback is selected.
+                  Existing empty archive directories are supported.
   --channel NAME  open this conversation at once (#team-alpha, @someone, or the id)
   --local         show times in local time instead of UTC
   --list          print the conversations (with your message count) and exit
