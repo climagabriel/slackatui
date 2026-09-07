@@ -110,14 +110,19 @@ fn decrypt_cookie(enc: &[u8], password: &[u8]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(text).into_owned())
 }
 
-fn keyring_passwords() -> Vec<Vec<u8>> {
+fn keyring_passwords() -> Result<Vec<Vec<u8>>, String> {
     // The keyring-backed `v11` case: ask libsecret the way Chromium stores it.
     let out = std::process::Command::new("secret-tool")
         .args(["lookup", "application", "Slack"])
         .output();
     match out {
-        Ok(o) if o.status.success() && !o.stdout.is_empty() => vec![o.stdout],
-        _ => Vec::new(),
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => Ok(vec![o.stdout]),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+            "secret-tool is missing; install libsecret-tools to read the Slack desktop keyring"
+                .to_string(),
+        ),
+        Err(error) => Err(format!("cannot run secret-tool: {error}")),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -130,7 +135,7 @@ pub fn desktop_cookie(profile: &Path, scratch: &Path) -> Result<String, String> 
     match enc.get(..3) {
         Some(b"v10") => decrypt_cookie(&enc, b"peanuts"),
         Some(b"v11") => {
-            let pws = keyring_passwords();
+            let pws = keyring_passwords()?;
             if pws.is_empty() {
                 return Err(
                     "cookie is keyring-encrypted (v11) and secret-tool found no Slack entry"
@@ -148,6 +153,48 @@ pub fn desktop_cookie(profile: &Path, scratch: &Path) -> Result<String, String> 
         }
         _ => Err("unknown cookie encryption version".to_string()),
     }
+}
+
+/// Limit workspace hints to Slack hosts before attaching a session cookie.
+fn normalize_workspace_url(name: &str) -> Option<String> {
+    let host = name
+        .trim()
+        .strip_prefix("https://")
+        .unwrap_or(name.trim())
+        .trim_end_matches('/');
+    let label = host.strip_suffix(".slack.com").unwrap_or(host);
+    if label.is_empty()
+        || label.len() > 63
+        || label.starts_with('-')
+        || label.ends_with('-')
+        || !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    Some(format!("https://{}.slack.com", label.to_ascii_lowercase()))
+}
+
+/// Without an archive, use the same workspace selection as slack-workspace-auth.
+pub fn selected_workspace_url() -> Option<String> {
+    if let Ok(name) = std::env::var("SLACK_WORKSPACE") {
+        if !name.trim().is_empty() {
+            return normalize_workspace_url(&name);
+        }
+    }
+    let cache = std::env::var_os("SLACKDUMP_CACHE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .filter(|value| !value.is_empty())
+                .map(|path| PathBuf::from(path).join("slackdump"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/slackdump"))
+        })?;
+    normalize_workspace_url(&std::fs::read_to_string(cache.join("workspace.txt")).ok()?)
 }
 
 /// Mint an `xoxc` token: the workspace page embeds one for the session.
@@ -261,6 +308,28 @@ pub fn from_desktop(
 mod tests {
     use super::*;
     use aes::cipher::BlockEncryptMut;
+
+    #[test]
+    fn workspace_selection_accepts_slack_hosts_only() {
+        for value in ["myorg", "myorg.slack.com", " https://myorg.slack.com/\n"] {
+            assert_eq!(
+                normalize_workspace_url(value).as_deref(),
+                Some("https://myorg.slack.com")
+            );
+        }
+        for value in [
+            "",
+            "https://evil.example",
+            "myorg.slack.com.evil.example",
+            "user@myorg.slack.com",
+            "http://myorg.slack.com",
+            "myorg.slack.com:443",
+            "myorg/path",
+            "-myorg",
+        ] {
+            assert!(normalize_workspace_url(value).is_none(), "accepted {value}");
+        }
+    }
 
     fn encrypt(plain: &[u8], password: &[u8]) -> Vec<u8> {
         let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(password).unwrap();

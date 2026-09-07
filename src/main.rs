@@ -105,6 +105,10 @@ environment
   SLACK_TUI_VERSION    the version /version shows (the launcher sets it from
                        the plugin manifest; the crate's own version otherwise)
   SLACKDUMPS           archive root when --root is not given
+  SLACK_WORKSPACE      workspace name or HTTPS Slack URL when no archive
+                       identifies it; defaults to slackdump's selected workspace
+  SLACKDUMP_CACHE      slackdump workspace selection directory (default
+                       $XDG_CACHE_HOME/slackdump, or $HOME/.cache/slackdump)
   SLACK_SELF_USER_ID   your own user id: names direct messages by the other
                        party and counts your messages per conversation
                        (derived from the DM archive otherwise)

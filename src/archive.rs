@@ -323,6 +323,7 @@ impl Corpus {
         let workspace_url = archives
             .iter()
             .find_map(|a| a.workspace_url())
+            .or_else(crate::auth::selected_workspace_url)
             .unwrap_or_else(|| "https://slack.com".to_string());
         crate::trace("open: me and workspace url");
         let mut cache = stats_cache.map(StatsCache::load);
