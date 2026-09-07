@@ -1766,7 +1766,7 @@ impl App {
 
     fn ctx_for(&self, conv: usize) -> Ctx<'_> {
         Ctx {
-            archive: &self.corpus.archives[self.corpus.convs[conv].archive],
+            archive: self.corpus.conv_archive(&self.corpus.convs[conv]),
             corpus: &self.corpus,
             tz: self.tz,
             image_font: self.image_font(),
@@ -2214,7 +2214,10 @@ impl App {
         let conv_idx = o.conv;
         let ctx = self.ctx_for(conv_idx);
         let conv = &self.corpus.convs[conv_idx];
-        let candidates = match ctx.archive.search(&conv.id, query, SEARCH_CAP) {
+        let candidates = match ctx
+            .archive
+            .map_or_else(|| Ok(Vec::new()), |a| a.search(&conv.id, query, SEARCH_CAP))
+        {
             Ok(c) => c,
             Err(e) => {
                 self.status = format!("{e}");
@@ -3379,7 +3382,6 @@ impl App {
             return "messages".to_string();
         };
         let conv = &self.corpus.convs[o.conv];
-        let a = &self.corpus.archives[conv.archive];
         match self.stack.last() {
             Some(View::ColorPalette { .. }) | Some(View::Keys { .. }) => {
                 unreachable!("handled before opening a conversation")
@@ -3478,7 +3480,10 @@ impl App {
                     conv.kind.label(),
                     o.total,
                     o.list.len(),
-                    a.rel
+                    self.corpus
+                        .conv_archive(conv)
+                        .map(|a| a.rel.as_str())
+                        .unwrap_or("not cached")
                 )
             }
         }
@@ -4082,6 +4087,53 @@ mod tests {
     }
 
     #[test]
+    fn live_only_conversation_renders_without_an_archive() {
+        let mut app = App::new(
+            Corpus::stub(&[("C1", "live-channel")]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![
+            json!({"id": "C1", "name": "live-channel", "is_member": true}),
+        ]);
+        assert_eq!(app.corpus.convs.len(), 1);
+        assert!(app.corpus.convs[0].live_only);
+        assert!(app.open_conv(0));
+        assert!(app.title().contains("live from Slack"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1, "hello <#C1>")], false);
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert!(crate::ui::dump(&mut app, 80).contains("live-channel"));
+        assert_eq!(app.ctx_for(0).user("U1"), "U1");
+        app.run_search("hello");
+        assert!(app.status.contains("no message matching"));
+
+        // Index zero must not become the live conversation's archive when a
+        // different conversation has a local cache.
+        app.corpus
+            .archives
+            .push(Archive::stub(&[], &[("C1", "wrong-channel")]));
+        assert!(app.ctx_for(0).archive.is_none());
+        assert!(crate::ui::dump(&mut app, 80).contains("live-channel"));
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+    }
+
+    #[test]
     fn slash_lines_parse_into_commands() {
         assert_eq!(
             parse_command("find team nginx"),
@@ -4177,7 +4229,7 @@ mod tests {
         let read_marker = 2 * day * 1_000_000; // between day 1 and day 2
         let mut list = MsgList::new(msgs, false);
         let ctx = Ctx {
-            archive: &a,
+            archive: Some(&a),
             corpus: &corpus,
             tz: Tz::Utc,
             image_font: None,
@@ -4204,7 +4256,7 @@ mod tests {
         let corpus = Corpus::stub(&[]);
         let mut list = MsgList::new(vec![msg(100, "a"), msg(200, "b")], false);
         let ctx = Ctx {
-            archive: &a,
+            archive: Some(&a),
             corpus: &corpus,
             tz: Tz::Utc,
             image_font: None,

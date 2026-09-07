@@ -70,7 +70,7 @@ impl Tz {
 
 pub struct Ctx<'a> {
     /// The archive of the conversation on screen: its users and channels first.
-    pub archive: &'a Archive,
+    pub archive: Option<&'a Archive>,
     /// Every other archive: a user or channel named elsewhere still resolves.
     pub corpus: &'a Corpus,
     pub tz: Tz,
@@ -118,7 +118,7 @@ pub fn image_cells(f: &FileInfo, font: (u16, u16), width: usize) -> Option<(u16,
 impl Ctx<'_> {
     fn channel(&self, cid: &str) -> String {
         self.archive
-            .channel_name(cid)
+            .and_then(|a| a.channel_name(cid))
             .or_else(|| self.corpus.channel_names.get(cid).cloned())
             .unwrap_or_else(|| cid.to_string())
     }
@@ -128,13 +128,13 @@ impl Ctx<'_> {
             return "Slackbot".to_string();
         }
         self.archive
-            .user(uid)
+            .and_then(|a| a.user(uid))
             .or_else(|| self.corpus.user_name(uid))
             .unwrap_or_else(|| uid.to_string())
     }
 
     pub fn user_is_bot(&self, uid: &str) -> bool {
-        self.archive.user_is_bot(uid) || self.corpus.user_is_bot(uid)
+        self.archive.is_some_and(|a| a.user_is_bot(uid)) || self.corpus.user_is_bot(uid)
     }
 
     /// Who wrote it, as a reader would name them.
@@ -147,7 +147,7 @@ impl Ctx<'_> {
         if let Some(uid) = &m.user {
             if let Some(name) = self
                 .archive
-                .user(uid)
+                .and_then(|a| a.user(uid))
                 .or_else(|| self.corpus.user_name(uid))
             {
                 return name;
@@ -1216,7 +1216,7 @@ mod tests {
 
     fn ctx<'a>(archive: &'a Archive, corpus: &'a Corpus) -> Ctx<'a> {
         Ctx {
-            archive,
+            archive: Some(archive),
             corpus,
             tz: Tz::Utc,
             image_font: None,

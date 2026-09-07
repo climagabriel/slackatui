@@ -274,6 +274,14 @@ pub(crate) fn ts_to_id(ts: &str) -> Option<i64> {
 }
 
 impl Corpus {
+    /// Live-only conversations have no archive; their numeric index is a placeholder.
+    pub fn conv_archive(&self, conv: &Conv) -> Option<&Archive> {
+        if conv.live_only {
+            None
+        } else {
+            self.archives.get(conv.archive)
+        }
+    }
     pub fn open(
         root: &Path,
         half_life_days: f64,

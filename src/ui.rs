@@ -229,13 +229,13 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let conv = &corpus.convs[open.conv];
-    let conv_archive = &corpus.archives[conv.archive];
+    let conv_archive = corpus.conv_archive(conv);
     let (list, archive) = match stack
         .iter_mut()
         .rev()
         .find(|v| !matches!(v, View::Raw { .. }))
     {
-        Some(View::Thread { list, live, .. }) => (list, live.as_deref().unwrap_or(conv_archive)),
+        Some(View::Thread { list, live, .. }) => (list, live.as_deref().or(conv_archive)),
         Some(View::Search { list, .. }) | Some(View::Threads { list }) => (list, conv_archive),
         _ => (&mut open.list, conv_archive),
     };
@@ -898,7 +898,7 @@ pub fn dump(app: &mut App, width: usize) -> String {
     };
     let conv = &app.corpus.convs[open.conv];
     let ctx = Ctx {
-        archive: &app.corpus.archives[conv.archive],
+        archive: app.corpus.conv_archive(conv),
         corpus: &app.corpus,
         tz: app.tz,
         image_font: None,
