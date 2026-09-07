@@ -30,6 +30,7 @@ command=$1
 target_dir=
 quiet=0
 build_directory=debug
+prune_all=1
 while (($#)); do
     case "$1" in
         --target-dir)
@@ -40,9 +41,11 @@ while (($#)); do
             quiet=1
             ;;
         --release)
+            prune_all=0
             build_directory=release
             ;;
         --profile)
+            prune_all=0
             shift
             [[ "$1" == dev ]]
             ;;
@@ -50,6 +53,10 @@ while (($#)); do
     shift
 done
 [[ -n "$target_dir" ]]
+if [[ "$command" == clean && "$prune_all" == 1 ]]; then
+    rm --recursive --force -- "$target_dir"
+    exit 0
+fi
 if ((!quiet)); then
     echo "fake cargo: verbose $command output" >&2
 fi
@@ -226,5 +233,47 @@ HOME=$test_home PATH=$test_path "$launcher" -- --build-debug > "$stdout" 2> "$st
 [[ ! -s "$cargo_argument_log" ]]
 printf '%s\n' '[--build-debug]' > "$test_root/expected-application-arguments"
 cmp "$test_root/expected-application-arguments" "$application_argument_log"
+
+# Prune keeps runnable binaries, stamps and Slack data; never launches or builds.
+mkdir --parents "$test_home/.cache/slack-tui/live/profiles"
+printf 'keep\n' > "$test_home/.cache/slack-tui/live/profiles/test.json"
+: > "$cargo_argument_log"
+: > "$application_argument_log"
+HOME=$test_home PATH=$test_path "$launcher" --build-cache-prune > "$stdout" 2> "$stderr"
+[[ ! -e "$test_home/.cache/slack-tui/target" ]]
+[[ -x "$test_home/.cache/slack-tui/bin/slack-tui" ]]
+[[ -x "$test_home/.cache/slack-tui/bin/slack-tui-debug" ]]
+[[ -s "$test_home/.cache/slack-tui/source-debug.sha256" ]]
+cmp "$test_root/release-stamp" "$test_home/.cache/slack-tui/source.sha256"
+[[ $(< "$test_home/.cache/slack-tui/live/profiles/test.json") == keep ]]
+[[ ! -s "$application_argument_log" ]]
+grep --fixed-strings --quiet '[clean]' "$cargo_argument_log"
+: > "$cargo_argument_log"
+HOME=$test_home PATH=$test_path "$launcher" --build-cache-prune > "$stdout" 2> "$stderr"
+[[ ! -s "$cargo_argument_log" ]]
+HOME=$test_home PATH=$test_path "$launcher" --list > "$stdout" 2> "$stderr"
+[[ ! -s "$cargo_argument_log" ]]
+for conflict in --build --build-debug --list; do
+    if HOME=$test_home PATH=$test_path "$launcher" --build-cache-prune "$conflict" > "$stdout" 2> "$stderr"; then
+        echo 'conflicting prune arguments accepted' >&2; exit 1
+    fi
+done
+ln --symbolic "$test_home/.cache/slack-tui/live" "$test_home/.cache/slack-tui/target"
+if HOME=$test_home PATH=$test_path "$launcher" --build-cache-prune > "$stdout" 2> "$stderr"; then
+    echo 'symlink target accepted' >&2; exit 1
+fi
+[[ -s "$test_home/.cache/slack-tui/live/profiles/test.json" ]]
+exec {held_lock}>"$test_home/.cache/slack-tui/build.lock"
+flock --exclusive "$held_lock"
+lock_status=0
+HOME=$test_home PATH=$test_path timeout 1 "$launcher" --build-cache-prune > "$stdout" 2> "$stderr" || lock_status=$?
+[[ "$lock_status" == 124 ]]
+[[ ! -s "$stdout" && ! -s "$stderr" ]]
+flock --unlock "$held_lock"
+exec {held_lock}>&-
+HOME=$test_home PATH=$test_path "$launcher" --build-cache-prune --help > "$stdout" 2> "$stderr"
+[[ -L "$test_home/.cache/slack-tui/target" ]]
+HOME=$test_home PATH=$test_path "$launcher" -- --build-cache-prune > "$stdout" 2> "$stderr"
+grep --fixed-strings --quiet '[--build-cache-prune]' "$application_argument_log"
 
 echo 'slack-tui launcher tests: passed'

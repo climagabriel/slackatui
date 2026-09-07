@@ -17,6 +17,7 @@ stamp="$cache/source.sha256"
 
 force_rebuild=0
 debug_build=0
+prune_build_cache=0
 verbose=0
 show_help=0
 parse_launcher_flags=1
@@ -25,6 +26,9 @@ application_arguments=()
 for argument in "$@"; do
     if ((parse_launcher_flags)); then
         case "$argument" in
+            --build-cache-prune)
+                prune_build_cache=1
+                ;;
             --build-debug)
                 debug_build=1
                 force_rebuild=1
@@ -59,6 +63,12 @@ slack-tui launcher
 usage: slack-tui [LAUNCHER_FLAG ...] [APPLICATION_ARGUMENT ...]
 
 launcher flags
+  --build-cache-prune remove Cargo target artifacts and exit; retain published
+                      binaries, checksums and Slack data outside target/.
+                      Reject --build/--rebuild/--build-debug and all application
+                      arguments. --help takes precedence without pruning.
+                      Waits for builds using this launcher's lock; stop builds
+                      from older plugin releases before pruning.
   --build, --rebuild  synonyms; force a slack-tui release rebuild and imply
                       --verbose
   --build-debug      always rebuild the dev profile with full debug symbols,
@@ -83,13 +93,14 @@ environment
   slack-tui invocation still launches release.
 
 launcher-defined exit codes
-  0  combined help printed
+  0  combined help printed or build cache pruned
   1  application help could not be read
-  2  cargo unavailable before launch
+  2  missing cargo/flock, incompatible prune arguments, or unsafe target
   Cargo failures and application statuses pass through and may reuse these
   numbers.
 
 examples
+  slack-tui --build-cache-prune
   slack-tui --build
   slack-tui --build-debug
   SLACK_TUI_REBUILD=1 slack-tui
@@ -108,6 +119,37 @@ EOF
         exit 1
     fi
     printf '%s\n' "$application_help"
+    exit 0
+fi
+
+if ((prune_build_cache)) && ((force_rebuild || ${#application_arguments[@]})); then
+    echo 'slack-tui: --build-cache-prune cannot be combined with build or application arguments' >&2
+    exit 2
+fi
+
+# Serialize build, binary publication and pruning across launcher instances.
+if ! command -v flock >/dev/null 2>&1; then
+    echo 'slack-tui: flock not found; install util-linux' >&2
+    exit 2
+fi
+mkdir --parents "$cache"
+exec {build_lock}>"$cache/build.lock"
+flock --exclusive "$build_lock"
+if ((prune_build_cache)); then
+    if [[ -L "$cache/target" || ( -e "$cache/target" && ! -d "$cache/target" ) ]]; then
+        echo "slack-tui: refusing to prune non-directory or symlink $cache/target" >&2
+        exit 2
+    fi
+    if [[ ! -d "$cache/target" ]]; then
+        echo "slack-tui: no build artifacts at $cache/target"
+        exit 0
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo 'slack-tui: cargo not found; cannot prune build artifacts' >&2
+        exit 2
+    fi
+    cargo clean --locked --manifest-path "$src/Cargo.toml" --target-dir "$cache/target"
+    echo "slack-tui: pruned $cache/target; kept binaries, checksums and Slack data"
     exit 0
 fi
 
@@ -196,4 +238,6 @@ if ((needs_build)); then
     printf '%s\n' "$sum" > "$stamp"
 fi
 
+flock --unlock "$build_lock"
+exec {build_lock}>&-
 exec "$bin" "${application_arguments[@]}"
