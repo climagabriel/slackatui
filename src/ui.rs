@@ -193,10 +193,22 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Msgs;
-    let title = format!(
-        " {} ",
-        clip(&app.title(), area.width.saturating_sub(4) as usize)
-    );
+    let reading = !matches!(
+        app.stack.last(),
+        Some(
+            View::Raw { .. }
+                | View::Image { .. }
+                | View::Emoji { .. }
+                | View::Keys { .. }
+                | View::ColorPalette { .. }
+        )
+    ) && app.active_list().is_some_and(|list| list.line_scroll);
+    let label = if reading {
+        format!("read lines · l: raw · {}", app.title())
+    } else {
+        app.title()
+    };
+    let title = format!(" {} ", clip(&label, area.width.saturating_sub(4) as usize));
     let block = Block::bordered()
         .title(title)
         .border_style(border(focused, &app.palette));
@@ -227,7 +239,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
             .iter()
             .skip(*scroll)
             .take(inner.height as usize)
-            .map(|s| Line::from(s.as_str()))
+            .map(|s| render::json_line(s, &app.palette))
             .collect();
         frame.render_widget(Paragraph::new(Text::from(shown)), inner);
         return;
@@ -853,7 +865,7 @@ const HELP: &[HelpRow] = &[
     HelpRow::Bound(Action::OtherPane, "the other pane"),
     HelpRow::Bound(
         Action::Open,
-        "open: the conversation, the selected message's thread, and inside a thread its raw JSON",
+        "open conversation; on messages l/Right first reads by line (j/k, arrows, PgUp/PgDn, Home/End), then opens raw JSON; Enter opens the thread, or raw JSON inside a thread",
     ),
     HelpRow::Bound(
         Action::Back,

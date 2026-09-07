@@ -96,6 +96,65 @@ pub struct Rendered {
     pub images: Vec<ImageSlot>,
 }
 
+/// Highlight one line of pretty-printed JSON without changing its contents.
+/// Strings cannot span physical lines; escaped quotes stay inside the token.
+pub fn json_line<'a>(text: &'a str, palette: &Palette) -> Line<'a> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        let role = match bytes[at] {
+            b'"' => {
+                at += 1;
+                while at < bytes.len() {
+                    match bytes[at] {
+                        b'\\' => at = (at + 2).min(bytes.len()),
+                        b'"' => {
+                            at += 1;
+                            break;
+                        }
+                        _ => at += 1,
+                    }
+                }
+                if text[at..].trim_start().starts_with(':') {
+                    Role::Link
+                } else {
+                    Role::Code
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                at += 1;
+                while at < bytes.len()
+                    && (bytes[at].is_ascii_digit() || b".eE+-".contains(&bytes[at]))
+                {
+                    at += 1;
+                }
+                Role::Mention
+            }
+            b't' | b'f' | b'n' => {
+                while at < bytes.len() && bytes[at].is_ascii_alphabetic() {
+                    at += 1;
+                }
+                if &text[start..at] == "null" {
+                    Role::ThreadInfo
+                } else {
+                    Role::Unread
+                }
+            }
+            _ => {
+                at += text[at..].chars().next().unwrap().len_utf8();
+                Role::InactiveAccent
+            }
+        };
+        spans.push(Span::styled(
+            &text[start..at],
+            Style::new().fg(palette.get(role)),
+        ));
+    }
+    Line::from(spans)
+}
+
 /// Cells an image takes: its natural size at this font, capped to the pane
 /// and to 14 rows; the renderer keeps the aspect ratio inside that box.
 pub fn image_cells(f: &FileInfo, font: (u16, u16), width: usize) -> Option<(u16, u16)> {
@@ -1217,6 +1276,34 @@ pub fn line_text(l: &Line) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_highlighting_preserves_escapes_unicode_and_token_kinds() {
+        use crate::palette::{Palette, Role};
+        let palette = Palette::default();
+        let input = r#"  "key\"é": ["hello\\world", -1.25e+3, true, false, null],"#;
+        let line = super::json_line(input, &palette);
+        assert_eq!(super::line_text(&line), input);
+        for (token, role) in [
+            (r#""key\"é""#, Role::Link),
+            (r#""hello\\world""#, Role::Code),
+            ("-1.25e+3", Role::Mention),
+            ("true", Role::Unread),
+            ("false", Role::Unread),
+            ("null", Role::ThreadInfo),
+        ] {
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.content == token && s.style.fg == Some(palette.get(role))),
+                "{token}"
+            );
+        }
+        let data = serde_json::json!({"text":"é 😀 quoted \" value\nnext", "bool":false, "n":null});
+        for raw in serde_json::to_string_pretty(&data).unwrap().lines() {
+            assert_eq!(super::line_text(&super::json_line(raw, &palette)), raw);
+        }
+    }
+
     use super::*;
 
     static TEST_PALETTE: std::sync::LazyLock<Palette> = std::sync::LazyLock::new(Palette::default);

@@ -51,6 +51,10 @@ Opens every slackdump.sqlite under <root>/full/ and <root>/dms/ read-only
 (a resume writing the same database at the same time is fine) and shows
 the conversations on the left, the messages of the selected one on the
 right. Enter on a message opens its thread; Esc goes back.
+l or Right on a message first enables line-by-line reading: j/k or arrows
+scroll one line, PageUp/PageDown scroll a page, Home/End reach its start/end.
+Press l or Right again for syntax-highlighted raw JSON; Esc returns to the same
+reading position. JSON colors follow /colorpalette.
 
 Conversations are ordered by your own activity, weighted by recency: each
 message you wrote counts 2^(-age / half-life), so where you wrote last

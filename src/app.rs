@@ -72,6 +72,8 @@ pub struct MsgList {
     pub msgs: Vec<Msg>,
     pub cursor: usize,
     pub scroll: usize,
+    /// Read the selected message by screen line, without moving its cursor.
+    pub line_scroll: bool,
     pub flat: Vec<FlatLine>,
     pub first: Vec<usize>,
     pub last: Vec<usize>,
@@ -113,6 +115,9 @@ impl MsgList {
         if !self.dirty && self.flat_w == width {
             return;
         }
+        let inside = self
+            .scroll
+            .saturating_sub(self.first.get(self.cursor).copied().unwrap_or(0));
         let offset = self
             .first
             .get(self.cursor)
@@ -201,7 +206,11 @@ impl MsgList {
         } else {
             offset
         };
-        self.scroll = first.saturating_sub(back);
+        self.scroll = if self.line_scroll {
+            first.saturating_add(inside)
+        } else {
+            first.saturating_sub(back)
+        };
         self.align_top = false;
     }
 
@@ -212,6 +221,12 @@ impl MsgList {
         self.cursor = self.cursor.min(self.first.len() - 1);
         let first = self.first[self.cursor];
         let last = self.last[self.cursor];
+        if self.line_scroll {
+            self.scroll = self
+                .scroll
+                .clamp(first, (last + 1).saturating_sub(height).max(first));
+            return;
+        }
         if first < self.scroll {
             self.scroll = first;
         } else if last >= self.scroll + height {
@@ -222,6 +237,7 @@ impl MsgList {
     }
 
     pub fn move_cursor(&mut self, delta: isize) {
+        self.line_scroll = false;
         if self.msgs.is_empty() {
             return;
         }
@@ -3744,6 +3760,21 @@ impl App {
             }
             return;
         }
+        if self.focus == Focus::Msgs
+            && action == Some(Action::Open)
+            && matches!(k.code, KeyCode::Char('l') | KeyCode::Right)
+        {
+            if self.active_list().is_some_and(|list| list.line_scroll) {
+                self.open_raw();
+            } else if let Some(list) = self.active_list_mut() {
+                if list.selected().is_some() {
+                    list.line_scroll = true;
+                    list.scroll = list.first.get(list.cursor).copied().unwrap_or(0);
+                    self.status = "read message · j/k or arrows: one line · PgUp/PgDn: page · l: raw · Enter: thread · h/Esc: back".into();
+                }
+            }
+            return;
+        }
         match self.focus {
             Focus::Convs => self.on_conv_key(action),
             Focus::Msgs => self.on_msg_key(action),
@@ -3839,6 +3870,28 @@ impl App {
             return;
         }
         let height = self.msgs_height.max(2) as isize;
+        let line_height = self.msgs_height.max(1) as isize;
+        if let Some(list) = self.active_list_mut().filter(|l| l.line_scroll) {
+            let height = line_height;
+            let first = list.first.get(list.cursor).copied().unwrap_or(0);
+            let last = list.last.get(list.cursor).copied().unwrap_or(first);
+            let max = (last + 1).saturating_sub(height as usize).max(first);
+            let delta = match action {
+                Some(Action::Down) => Some(1),
+                Some(Action::Up) => Some(-1),
+                Some(Action::HalfPageDown) => Some(height / 2),
+                Some(Action::HalfPageUp) => Some(-height / 2),
+                Some(Action::PageDown) => Some(height - 1),
+                Some(Action::PageUp) => Some(1 - height),
+                Some(Action::First) => Some(-(list.scroll as isize)),
+                Some(Action::Last) => Some(max as isize),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                list.scroll = list.scroll.saturating_add_signed(delta).clamp(first, max);
+                return;
+            }
+        }
         let timeline = self.in_timeline();
         match action {
             Some(Action::Down) => {
@@ -4252,6 +4305,67 @@ mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn long_message_reads_by_line_before_raw_and_keeps_position() {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![json!({"id":"C1","name":"long","is_member":true})]);
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        let body = (0..100).map(|n| format!("line {n}\n")).collect::<String>();
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1, &body), msg(2, "next")], false);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let draw =
+            |app: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+                terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+            };
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        draw(&mut app, &mut terminal);
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(app.stack.is_empty());
+        let first = app.active_list().unwrap().first[0];
+        for n in 1..=12 {
+            app.on_key(key(KeyCode::Down));
+            draw(&mut app, &mut terminal);
+            assert_eq!(app.active_list().unwrap().scroll, first + n);
+            assert_eq!(app.active_list().unwrap().cursor, 0);
+        }
+        app.mark_all_dirty();
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, first + 12);
+        app.on_key(key(KeyCode::Char('k')));
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, first + 11);
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+        app.on_key(key(KeyCode::Esc));
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, first + 11);
+        app.on_key(key(KeyCode::End));
+        draw(&mut app, &mut terminal);
+        let end = app.active_list().unwrap().last[0] + 1 - app.msgs_height;
+        assert_eq!(app.active_list().unwrap().scroll, end);
+        app.on_key(key(KeyCode::Down));
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, end);
+        app.on_key(key(KeyCode::Home));
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, first);
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.open.is_none());
     }
 
     #[test]
