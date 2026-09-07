@@ -341,6 +341,7 @@ pub enum View {
     Image {
         files: Vec<crate::archive::FileInfo>,
         index: usize,
+        zoom: u16,
         /// The fitted encoding of the current image, built on first draw.
         shown: Option<(String, StatefulProtocol)>,
     },
@@ -470,6 +471,10 @@ pub struct App {
     /// What the keys do, loaded from and saved to `keys_path`.
     pub keymap: Keymap,
     pub keys_path: Option<PathBuf>,
+    pub pane_menu: Option<crate::conversations_pane::Menu>,
+    pane_settings: crate::conversations_pane::Settings,
+    pane_path: Option<PathBuf>,
+    pane_workspace: String,
 }
 
 impl App {
@@ -500,7 +505,27 @@ impl App {
                 format!("keys: {error}; using the default keys"),
             ),
         };
+        let pane_path = keys_path
+            .as_ref()
+            .or(palette_path.as_ref())
+            .and_then(|p| p.parent())
+            .map(|p| p.join("conversations-pane.json"));
+        let pane_workspace = corpus.workspace_url.clone();
+        let (pane_settings, keys_status) = match crate::conversations_pane::Settings::load(
+            pane_path.as_deref(),
+            &pane_workspace,
+        ) {
+            Ok(settings) => (settings, keys_status),
+            Err(e) => (
+                Default::default(),
+                format!("conversations-pane: {e}; showing everything"),
+            ),
+        };
         let mut app = App {
+            pane_menu: None,
+            pane_settings,
+            pane_path,
+            pane_workspace,
             corpus,
             tz,
             focus: Focus::Convs,
@@ -708,6 +733,10 @@ impl App {
             Some(Command::ColorPalette(preset)) => {
                 self.restore_filter(filter_before);
                 self.open_color_palette(&preset);
+            }
+            Some(Command::ConversationsPane) => {
+                self.restore_filter(filter_before);
+                self.open_conversations_pane();
             }
             Some(Command::Keys) => {
                 self.restore_filter(filter_before);
@@ -1711,7 +1740,9 @@ impl App {
             .filter(|&i| {
                 let c = &convs_all[i];
                 let twin = c.live_only && convs_all.iter().any(|x| !x.live_only && x.id == c.id);
-                !twin && (rank(&c.name).is_some() || c.id.to_lowercase() == needle)
+                !twin
+                    && self.pane_settings.visible(c)
+                    && (rank(&c.name).is_some() || c.id.to_lowercase() == needle)
             })
             .collect();
         let convs = &self.corpus.convs;
@@ -2890,6 +2921,7 @@ impl App {
         self.stack.push(View::Image {
             files,
             index: 0,
+            zoom: 100,
             shown: None,
         });
     }
@@ -3435,10 +3467,12 @@ impl App {
                 unreachable!("handled before opening a conversation")
             }
             Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
-            Some(View::Image { files, index, .. }) => {
+            Some(View::Image {
+                files, index, zoom, ..
+            }) => {
                 let f = &files[*index];
                 format!(
-                    "image {}/{} · {} · {}x{} · {}",
+                    "image {}/{} · {} · {}x{} · {} · {zoom}% · +/- zoom · 0 fit",
                     index + 1,
                     files.len(),
                     f.name,
@@ -3537,9 +3571,80 @@ impl App {
         }
     }
 
+    fn open_conversations_pane(&mut self) {
+        self.sync_muted();
+        self.pane_menu = Some(crate::conversations_pane::Menu::new(
+            self.pane_settings.clone(),
+            &self.corpus.convs,
+        ));
+        self.status.clear();
+    }
+
+    fn on_conversations_pane_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Esc {
+            self.pane_menu = None;
+            self.status.clear();
+            return;
+        }
+        if k.code == KeyCode::Enter {
+            let settings = self.pane_menu.as_ref().unwrap().settings.clone();
+            if let Err(e) = settings.save(self.pane_path.as_deref(), &self.pane_workspace) {
+                self.status = format!("conversations-pane: cannot save: {e}");
+                return;
+            }
+            self.pane_settings = settings;
+            self.pane_menu = None;
+            self.apply_filter();
+            if self
+                .open
+                .as_ref()
+                .is_some_and(|o| !self.filtered.contains(&o.conv))
+            {
+                self.open = None;
+                self.stack.clear();
+                self.focus = Focus::Convs;
+            }
+            self.status = format!("conversations-pane: {} visible", self.filtered.len());
+            self.mark_all_dirty();
+            return;
+        }
+        let menu = self.pane_menu.as_mut().unwrap();
+        let last = menu.rows().len().saturating_sub(1);
+        match k.code {
+            KeyCode::Up => menu.cursor = menu.cursor.saturating_sub(1),
+            KeyCode::Down => menu.cursor = (menu.cursor + 1).min(last),
+            KeyCode::PageUp => menu.cursor = menu.cursor.saturating_sub(10),
+            KeyCode::PageDown => menu.cursor = (menu.cursor + 10).min(last),
+            KeyCode::Home => menu.cursor = 0,
+            KeyCode::End => menu.cursor = last,
+            KeyCode::Char(' ') => menu.toggle(),
+            KeyCode::Backspace => {
+                menu.query.pop();
+                menu.cursor = 0;
+            }
+            KeyCode::Char('u') if ctrl(k) => {
+                menu.query.clear();
+                menu.cursor = 0;
+            }
+            KeyCode::Char(c)
+                if !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                menu.query.push(c);
+                menu.cursor = 0;
+            }
+            _ => {}
+        }
+    }
+
     // ----------------------------------------------------------------- keys
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        if self.pane_menu.is_some() {
+            self.on_conversations_pane_key(k);
+            return;
+        }
         if self.help {
             self.help = false;
             return;
@@ -3589,9 +3694,22 @@ impl App {
             files,
             index,
             shown,
+            zoom,
         }) = self.stack.last_mut()
         {
             match k.code {
+                KeyCode::Char('+' | '=') => {
+                    *zoom = (*zoom + 25).min(800);
+                    *shown = None;
+                }
+                KeyCode::Char('-' | '_') => {
+                    *zoom = zoom.saturating_sub(25).max(25);
+                    *shown = None;
+                }
+                KeyCode::Char('0') => {
+                    *zoom = 100;
+                    *shown = None;
+                }
                 KeyCode::Char('j')
                 | KeyCode::Down
                 | KeyCode::Char('l')
@@ -3599,6 +3717,7 @@ impl App {
                 | KeyCode::Char('n') => {
                     if *index + 1 < files.len() {
                         *index += 1;
+                        *zoom = 100;
                         *shown = None;
                     }
                 }
@@ -3609,6 +3728,7 @@ impl App {
                 | KeyCode::Char('p') => {
                     if *index > 0 {
                         *index -= 1;
+                        *zoom = 100;
                         *shown = None;
                     }
                 }
@@ -3707,6 +3827,7 @@ impl App {
                         "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
                 }
             }
+            Some(Action::ConversationsPane) => self.open_conversations_pane(),
             Some(Action::Keys) => self.open_keys(),
             _ => {}
         }
@@ -3848,6 +3969,7 @@ impl App {
                 }
             }
             Some(Action::OtherPane) => self.focus = Focus::Convs,
+            Some(Action::ConversationsPane) => self.open_conversations_pane(),
             Some(Action::Keys) => self.open_keys(),
             _ => {}
         }
@@ -3939,6 +4061,7 @@ enum Command {
     /// `colorpalette [name]`: edit and persist the semantic UI colors,
     /// starting from a named palette when one is given.
     ColorPalette(String),
+    ConversationsPane,
     /// `keys`: rebind what the lists' keys do.
     Keys,
     /// `version`: show the version in the corner, or hide it again.
@@ -3960,6 +4083,7 @@ fn parse_command(line: &str) -> Option<Command> {
         "mute" => Some(Command::Mute(true, rest.to_string())),
         "unmute" => Some(Command::Mute(false, rest.to_string())),
         "colorpalette" | "palette" | "colors" => Some(Command::ColorPalette(rest.to_string())),
+        "conversations-pane" if rest.is_empty() => Some(Command::ConversationsPane),
         "keys" | "keybindings" if rest.is_empty() => Some(Command::Keys),
         "version" if rest.is_empty() => Some(Command::Version),
         "upload" | "attach" => Some(Command::Upload(rest.to_string())),
@@ -4126,6 +4250,139 @@ mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn image_zoom_keys_accept_shifted_and_base_characters() {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.stack.push(View::Image {
+            files: vec![],
+            index: 0,
+            zoom: 100,
+            shown: None,
+        });
+        let zoom = |app: &App| match app.stack.last().unwrap() {
+            View::Image { zoom, .. } => *zoom,
+            _ => panic!(),
+        };
+        for c in ['=', '+'] {
+            app.on_key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ));
+        }
+        assert_eq!(zoom(&app), 150);
+        for c in ['-', '_'] {
+            app.on_key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ));
+        }
+        assert_eq!(zoom(&app), 100);
+        for _ in 0..40 {
+            app.on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        }
+        assert_eq!(zoom(&app), 800);
+        for _ in 0..40 {
+            app.on_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        }
+        assert_eq!(zoom(&app), 25);
+        app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert_eq!(zoom(&app), 100);
+    }
+
+    #[test]
+    fn conversations_pane_save_cancel_reset_and_shortcut() {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![
+            json!({"id":"C1", "name":"public", "is_member":true}),
+            json!({"id":"C2", "name":"private", "is_private":true, "is_member":true}),
+        ]);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(app.pane_menu.is_some());
+        app.pane_menu.as_mut().unwrap().settings.toggle_category(0);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.filtered.len(), 2);
+        app.run_command("conversations-pane", "");
+        app.pane_menu.as_mut().unwrap().settings.toggle_category(0);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.filtered.len(), 1);
+        app.open_conversations_pane();
+        assert_eq!(app.pane_menu.as_ref().unwrap().entries.len(), 2);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.filtered.len(), 2);
+        app.open_conv(app.filtered[0]);
+        app.open_conversations_pane();
+        let id = app.corpus.convs[app.open.as_ref().unwrap().conv].id.clone();
+        app.pane_menu
+            .as_mut()
+            .unwrap()
+            .settings
+            .overrides
+            .insert(id, false);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.open.is_none());
+        assert!(app.stack.is_empty());
+        app.open_conversations_pane();
+        app.pane_menu.as_mut().unwrap().settings = Default::default();
+        for category in 0..6 {
+            app.pane_menu
+                .as_mut()
+                .unwrap()
+                .settings
+                .toggle_category(category);
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.filtered.is_empty());
+        app.run_command("conversations-pane", "");
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().matching().len(), 2);
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().matching().len(), 1);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.filtered.is_empty());
+        app.open_conversations_pane();
+        app.on_key(key(KeyCode::Char(' ')));
+        // A directory is not a settings file: preserve active choices and keep
+        // the pending menu open when saving fails.
+        app.pane_path = Some(std::env::temp_dir());
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.pane_menu.is_some());
+        assert!(app.filtered.is_empty());
+        assert!(app.status.contains("cannot save"));
+        app.pane_path = None;
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.filtered.len(), 2);
     }
 
     #[test]

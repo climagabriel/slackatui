@@ -6,6 +6,7 @@ mod archive;
 mod auth;
 mod clip;
 mod complete;
+mod conversations_pane;
 mod edit;
 mod keys;
 mod live;
@@ -159,6 +160,17 @@ background the terminal already draws), and
 what the keys do in the two lists, one action per row; /version shows the
 version in the status line's right corner, and hides it again; /mute and /unmute keep a conversation at the end of
 the list, on top of the channels muted in Slack itself.
+/conversations-pane selects visible categories and individual conversations.
+Ctrl-Shift-P opens the same menu and /keys can rebind it. Terminals must report
+the Shift modifier separately; otherwise use the command or rebind the action.
+Space toggles, Enter saves, Esc cancels; type to search. Reset to default
+enables every category and removes individual overrides. Muted is an additional
+filter across types; individual show/hide overrides take precedence.
+Preferences persist per workspace in conversations-pane.json beside keys.json.
+In the image viewer, Ctrl-Shift-= / Ctrl-Shift-- zoom in/out; plain + / - also
+work, and 0 restores fit. Zoom is centered, from 25% to 800% of the fitted size.
+Terminal font shortcuts must be disabled or reassigned in terminal preferences
+if they intercept these keys before slack-tui receives them.
 
 exit codes
   0  ok        1  storage unavailable, or the conversation was not found
@@ -632,6 +644,21 @@ fn under_multiplexer() -> bool {
 
 fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    struct KeyboardGuard;
+    impl Drop for KeyboardGuard {
+        fn drop(&mut self) {
+            let _ =
+                ratatui::crossterm::execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
+        }
+    }
+    // Unsupported terminals ignore this; supporting terminals distinguish Ctrl-Shift-P.
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        event::PushKeyboardEnhancementFlags(
+            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    );
+    let keyboard_guard = KeyboardGuard;
     if !no_images {
         // The capability query asks which of kitty/Sixel/iTerm2 the terminal
         // speaks and falls back to half-blocks; its responses come back as
@@ -687,6 +714,7 @@ fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io:
             break Ok(());
         }
     };
+    drop(keyboard_guard);
     ratatui::restore();
     result
 }

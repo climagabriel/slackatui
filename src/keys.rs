@@ -24,6 +24,7 @@ pub enum Action {
     OtherPane,
     Command,
     Keys,
+    ConversationsPane,
     GoToDate,
     MyThreads,
     UnreadsFirst,
@@ -61,6 +62,7 @@ impl Action {
             Action::OtherPane => "the other pane",
             Action::Command => "a command line",
             Action::Keys => "this key editor",
+            Action::ConversationsPane => "choose visible conversations",
             Action::GoToDate => "go to a date",
             Action::MyThreads => "threads I took part in",
             Action::UnreadsFirst => "unread conversations on top",
@@ -98,6 +100,7 @@ impl Action {
             Action::OtherPane => "other_pane",
             Action::Command => "command",
             Action::Keys => "keys",
+            Action::ConversationsPane => "conversations_pane",
             Action::GoToDate => "go_to_date",
             Action::MyThreads => "my_threads",
             Action::UnreadsFirst => "unreads_first",
@@ -137,6 +140,7 @@ pub const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::OtherPane, &["tab"]),
     (Action::Command, &["/"]),
     (Action::Keys, &[]),
+    (Action::ConversationsPane, &["ctrl-shift-p"]),
     (Action::GoToDate, &["d"]),
     (Action::MyThreads, &["T"]),
     (Action::UnreadsFirst, &["U"]),
@@ -192,7 +196,12 @@ impl Chord {
                 | KeyCode::F(_)
         )
         .then_some(Chord {
-            code: event.code,
+            code: match event.code {
+                KeyCode::Char(c) if ctrl && event.modifiers.contains(KeyModifiers::SHIFT) => {
+                    KeyCode::Char(c.to_ascii_uppercase())
+                }
+                code => code,
+            },
             ctrl,
         })
     }
@@ -220,7 +229,11 @@ impl Chord {
             other => format!("{other:?}").to_lowercase(),
         };
         if self.ctrl {
-            format!("ctrl-{name}")
+            if matches!(self.code, KeyCode::Char(c) if c.is_ascii_uppercase()) {
+                format!("ctrl-shift-{}", name.to_ascii_lowercase())
+            } else {
+                format!("ctrl-{name}")
+            }
         } else {
             name
         }
@@ -228,6 +241,14 @@ impl Chord {
 
     pub fn parse(text: &str) -> Option<Chord> {
         let text = text.trim();
+        if let Some(name) = text.to_ascii_lowercase().strip_prefix("ctrl-shift-") {
+            let mut chars = name.chars();
+            let c = chars.next()?;
+            return (c.is_ascii_alphabetic() && chars.next().is_none()).then_some(Chord {
+                code: KeyCode::Char(c.to_ascii_uppercase()),
+                ctrl: true,
+            });
+        }
         let (ctrl, name) = match text.to_lowercase().strip_prefix("ctrl-") {
             // The name keeps its case: G and g are different keys.
             Some(_) => (true, &text[5..]),
@@ -506,6 +527,30 @@ mod tests {
         let partial = Keymap::load(Some(&path)).unwrap();
         assert_eq!(partial.text(Action::Quit), "ctrl-q");
         assert_eq!(partial.text(Action::Down), "j, down");
+
+        std::fs::write(&path, "{\"command\":[\"ctrl-shift-p\"]}").unwrap();
+        let custom = Keymap::load(Some(&path)).unwrap();
+        assert_eq!(
+            custom.action(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Some(Action::Command)
+        );
+        assert!(custom.chords(Action::ConversationsPane).is_empty());
+        let mut custom = custom;
+        custom.bind(
+            Action::ConversationsPane,
+            Chord::parse("f6").unwrap(),
+            false,
+        );
+        custom.save(Some(&path)).unwrap();
+        assert_eq!(
+            Keymap::load(Some(&path))
+                .unwrap()
+                .action(press(KeyCode::F(6), false)),
+            Some(Action::ConversationsPane)
+        );
 
         std::fs::write(&path, "{\"quit\":[\"meta-q\"]}\n").unwrap();
         let error = Keymap::load(Some(&path)).unwrap_err();

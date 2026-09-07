@@ -35,6 +35,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help {
         draw_help(frame, area, app);
     }
+    if let Some(menu) = &app.pane_menu {
+        let block = Block::bordered()
+            .title(" conversations-pane ")
+            .border_style(border(true, &app.palette));
+        let inner = block.inner(main);
+        frame.render_widget(Clear, main);
+        frame.render_widget(block, main);
+        let [help, list] =
+            Layout::vertical([Constraint::Length(5), Constraint::Min(1)]).areas(inner);
+        frame.render_widget(Paragraph::new(format!(
+            "↑/↓ select · Space toggle · Enter save · Esc cancel\nType to search · Backspace erase · Ctrl-U clear\nIndividuals cycle: category → show → hide. Muted is an additional filter.\nReset: select first row, Space, then Enter.\nSearch: {}", menu.query)), help);
+        let items: Vec<_> = menu.rows().into_iter().map(ListItem::new).collect();
+        let mut state = ListState::default().with_selected(Some(menu.cursor));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(app.palette.get(Role::Accent)),
+            ),
+            list,
+            &mut state,
+        );
+    }
 }
 
 /// The palette's background, or nothing when the terminal keeps its own.
@@ -544,9 +567,16 @@ fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
 }
 
 fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
-    let Some(View::Image { files, index, .. }) = app.stack.last() else {
+    let Some(View::Image {
+        files, index, zoom, ..
+    }) = app.stack.last()
+    else {
         return;
     };
+    let zoom = *zoom;
+    if inner.is_empty() {
+        return;
+    }
     let file = files[*index].clone();
     app.ensure_image(&file, true);
     let key = format!("{}:full", file.id);
@@ -560,10 +590,13 @@ fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
         frame.render_widget(Paragraph::new(Span::styled(text, dim)), inner);
         return;
     }
-    // Encode once per image: the fitted protocol is kept on the view and
-    // rebuilt only when the shown image changes.
+    let render_key = format!("{key}:{zoom}:{}:{}", inner.width, inner.height);
+    // Rebuild for zoom or terminal-size changes as well as image changes.
     let stale = match app.stack.last() {
-        Some(View::Image { shown, .. }) => shown.as_ref().map(|(k, _)| k != &key).unwrap_or(true),
+        Some(View::Image { shown, .. }) => shown
+            .as_ref()
+            .map(|(k, _)| k != &render_key)
+            .unwrap_or(true),
         _ => return,
     };
     if stale {
@@ -574,9 +607,16 @@ fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
         let Some(picker) = app.picker.as_ref() else {
             return;
         };
+        let font = picker.font_size();
+        let img = zoom_image(
+            &img,
+            u32::from(inner.width) * u32::from(font.width),
+            u32::from(inner.height) * u32::from(font.height),
+            zoom,
+        );
         let fresh = picker.new_resize_protocol(img);
         if let Some(View::Image { shown, .. }) = app.stack.last_mut() {
-            *shown = Some((key.clone(), fresh));
+            *shown = Some((render_key, fresh));
         }
     }
     if let Some(View::Image {
@@ -585,6 +625,58 @@ fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
     }) = app.stack.last_mut()
     {
         frame.render_stateful_widget(StatefulImage::new(), inner, proto);
+    }
+}
+
+/// Center-crop before resizing, so large zoom factors do not allocate an
+/// enormous intermediate bitmap. 100% is fit-to-pane, not native pixels.
+fn zoom_image(
+    img: &image::DynamicImage,
+    width: u32,
+    height: u32,
+    zoom: u16,
+) -> image::DynamicImage {
+    let width = width.clamp(1, 4096);
+    let height = height.clamp(1, 4096);
+    let scale = (width as f64 / img.width().max(1) as f64)
+        .min(height as f64 / img.height().max(1) as f64)
+        .min(1.0)
+        * f64::from(zoom)
+        / 100.0;
+    let crop_w = ((width as f64 / scale).round() as u32).clamp(1, img.width().max(1));
+    let crop_h = ((height as f64 / scale).round() as u32).clamp(1, img.height().max(1));
+    let cropped = img.crop_imm(
+        img.width().saturating_sub(crop_w) / 2,
+        img.height().saturating_sub(crop_h) / 2,
+        crop_w,
+        crop_h,
+    );
+    cropped.resize_exact(
+        ((crop_w as f64 * scale).round() as u32).clamp(1, width),
+        ((crop_h as f64 * scale).round() as u32).clamp(1, height),
+        image::imageops::FilterType::Triangle,
+    )
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    #[test]
+    fn zoom_scales_and_center_crops_within_viewport() {
+        use image::GenericImageView;
+        let img = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_fn(400, 200, |x, _| {
+            image::Rgba([if (150..250).contains(&x) { 255 } else { 0 }, 0, 0, 255])
+        }));
+        assert_eq!(
+            super::zoom_image(&img, 200, 100, 100).dimensions(),
+            (200, 100)
+        );
+        assert_eq!(
+            super::zoom_image(&img, 200, 100, 50).dimensions(),
+            (100, 50)
+        );
+        let close = super::zoom_image(&img, 200, 100, 800);
+        assert_eq!(close.dimensions(), (200, 100));
+        assert_eq!(close.get_pixel(0, 0)[0], 255);
     }
 }
 

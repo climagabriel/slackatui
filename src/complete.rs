@@ -13,6 +13,11 @@ pub struct Cmd {
 /// (`s`, `palette`, ...) still parse; only these complete.
 pub const COMMANDS: &[Cmd] = &[
     Cmd {
+        name: "conversations-pane",
+        args: "",
+        help: "choose visible categories and individual conversations",
+    },
+    Cmd {
         name: "find",
         args: "TEXT",
         help: "filter the conversation list, or search the open conversation",
@@ -250,8 +255,15 @@ mod tests {
 
     #[test]
     fn several_matches_extend_then_cycle() {
-        // cache and colorpalette share only "c", which the token already is.
-        assert_eq!(apply("/c", &convs()).as_deref(), Some("/cache"));
+        // The three commands share only "c", which the token already is.
+        assert_eq!(
+            apply("/c", &convs()).as_deref(),
+            Some("/conversations-pane")
+        );
+        assert_eq!(
+            apply("/conversations-p", &convs()).as_deref(),
+            Some("/conversations-pane")
+        );
         // start and stop share "st"; a further Tab walks them.
         assert_eq!(
             apply("/cache st", &convs()).as_deref(),
