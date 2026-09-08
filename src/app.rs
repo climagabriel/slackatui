@@ -724,6 +724,8 @@ impl App {
 
     /// Enter in the command prompt.
     fn run_command(&mut self, line: &str, filter_before: &str) {
+        let name = line.split_whitespace().next().unwrap_or("").trim_start_matches('/');
+        crate::session_log::record("command", serde_json::json!({"name":complete::COMMANDS.iter().find(|c|c.name == name).map(|c|c.name).unwrap_or("unknown")}));
         match parse_command(line) {
             None => {
                 if self.focus == Focus::Convs {

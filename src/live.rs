@@ -98,6 +98,21 @@ pub enum JobKind {
     SetStarred,
 }
 
+impl JobKind {
+    fn log_name(&self) -> &'static str {
+        match self {
+            Self::Refresh {..} => "refresh", Self::Thread {..} => "thread", Self::Search {..} => "search",
+            Self::ArchiveNew {..} => "archive", Self::Auth => "auth", Self::Tail {..} => "tail",
+            Self::Older {..} => "older", Self::Newer {..} => "newer", Self::Conversations => "conversations",
+            Self::Profiles => "profiles", Self::Usergroups => "usergroups", Self::Counts {..} => "counts",
+            Self::File {..} => "file", Self::Mark {..} => "mark", Self::Send {..} => "send", Self::Upload {..} => "upload",
+            Self::Delete {..} => "delete", Self::React {..} => "reaction", Self::Leave {..} => "leave",
+            Self::EmojiList => "emoji_list", Self::MutedChannels {..} => "muted_channels", Self::SetMuted => "set_muted",
+            Self::StarredChannels {..} => "starred_channels", Self::SetStarred => "set_starred",
+        }
+    }
+}
+
 pub enum Done {
     Refreshed,
     Thread(PathBuf),
@@ -159,8 +174,13 @@ fn spawn(
     work: impl FnOnce() -> Result<Done, String> + Send + 'static,
 ) -> Job {
     let (tx, rx) = mpsc::channel();
+    let log = crate::session_log::JobLog::start(kind.log_name());
     std::thread::spawn(move || {
-        let _ = tx.send(work());
+        let result = work();
+        let id = log.complete(result.as_ref().err().map(String::as_str));
+        if tx.send(result).is_err() {
+            crate::session_log::record("job_delivery_dropped", serde_json::json!({"id":id}));
+        }
     });
     Job {
         navigate_on_completion: true,

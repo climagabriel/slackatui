@@ -657,8 +657,13 @@ struct Job {
 }
 fn spawn(work: impl FnOnce() -> Result<Loaded, String> + Send + 'static) -> Job {
     let (send, receive) = mpsc::channel();
+    let log = crate::session_log::JobLog::start("channel_browser");
     std::thread::spawn(move || {
-        let _ = send.send(work());
+        let result = work();
+        let id = log.complete(result.as_ref().err().map(String::as_str));
+        if send.send(result).is_err() {
+            crate::session_log::record("job_delivery_dropped", serde_json::json!({"id":id}));
+        }
     });
     Job { receive }
 }
@@ -695,6 +700,14 @@ pub struct Browser {
     pub picture: Option<Picture>,
 }
 impl Browser {
+    pub fn log_state(&self) -> Value {
+        serde_json::json!({"channel":self.channel,"tab_cursor":self.cursor,"entry_cursor":self.entry_cursor,
+            "entry_scroll":self.entry_scroll,"entries":self.entries.as_ref().map(Vec::len),"canvas":self.document.as_ref().map(|d|&d.id),
+            "section":self.section,"editing":self.draft.is_some(),"insert":self.draft.as_ref().is_some_and(|d|d.insert),
+            "command":self.draft.as_ref().is_some_and(|d|d.command.is_some()),"history":self.history.is_some(),
+            "picture":self.picture.as_ref().map(|p|&p.file.id),"loading":self.job.is_some()})
+    }
+
     pub fn escape_edits(&self) -> bool {
         self.draft.as_ref().is_some_and(|draft| draft.insert || draft.command.is_some())
     }

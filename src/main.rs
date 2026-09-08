@@ -19,6 +19,7 @@ mod word_highlights;
 mod profiles;
 mod render;
 mod storage;
+mod session_log;
 mod ui;
 
 use std::path::PathBuf;
@@ -111,6 +112,9 @@ environment
                        (default /var/lock/slackdump-sync.lock)
   SLACK_TUI_CACHE      where fetched threads and user profiles live
                        (default $XDG_CACHE_HOME/slack-tui/live, i.e. ~/.cache/...)
+  SLACK_TUI_SESSION_LOG_DIR
+                      session logs (default $XDG_CACHE_HOME/slack-tui/sessions,
+                      or $HOME/.cache/slack-tui/sessions)
   SLACK_TUI_PALETTE    where /colorpalette saves UI colors, the vintage
                        palette included (default
                        $XDG_CONFIG_HOME/slack-tui/palette.json, or ~/.config/...)
@@ -213,6 +217,20 @@ In the image viewer, Ctrl-Shift-= / Ctrl-Shift-- zoom in/out; plain + / - also
 work, and 0 restores fit. Zoom is centered, from 25% to 800% of the fitted size.
 Terminal font shortcuts must be disabled or reassigned in terminal preferences
 if they intercept these keys before slack-tui receives them.
+
+Session logs: each interactive run creates a UTC date_time.log with a unique
+suffix on collision. Owner-only JSON lines record received keys (including
+ordinary typed characters), navigation, commands, job timing and outcomes,
+terminal events, slow draw/tick operations, best-effort panic locations and
+normal-return exit status. Image negotiation reads input inside a library;
+its start/end are logged, but keys consumed there are unavailable.
+Paste events record lengths only; terminals may send pasted text as keys.
+Structured diagnostics omit credentials, fetched contents, command arguments
+and arbitrary error bodies; known Slack error codes are recorded. Key records
+retain whatever you type. Logs are kept until removed. A missing session_end
+means abrupt termination or a logging failure.
+A log creation failure stops startup; a write failure is shown in the status
+line and on exit. Logs cover input received by slack-tui, not other programs.
 
 exit codes
   0  ok        1  storage unavailable, or the conversation was not found
@@ -390,7 +408,9 @@ fn parse_args() -> Result<Opts, String> {
 }
 
 fn main() {
-    std::process::exit(run());
+    let code = run();
+    session_log::finish(code);
+    std::process::exit(code);
 }
 
 /// Timing breadcrumbs appended to `$SLACK_TUI_TRACE` when it is set.
@@ -433,6 +453,16 @@ fn run() -> i32 {
             return 2;
         }
     };
+    let interactive = !opts.list && opts.dump.is_none() && !opts.auth_check && opts.fetch_file.is_none()
+        && opts.delete_message.is_none() && opts.call.is_none() && opts.dump_canvas.is_none();
+    if interactive {
+        match session_log::start() {
+            Ok(path) => eprintln!("slack-tui: session log {}", path.display()),
+            Err(error) => { eprintln!("slack-tui: cannot start session logging: {error}"); return 1; }
+        }
+        session_log::record("configuration", serde_json::json!({"live":!opts.no_live,"poll_seconds":opts.poll,
+            "images":!opts.no_images,"image_query":opts.image_protocol,"multiplexer":under_multiplexer(),"terminal":std::env::var("TERM").ok()}));
+    }
     // Own variable first: XDG_CACHE_HOME also moves slackdump's credential
     // store, so it cannot serve as a test knob.
     let cache_dir = std::env::var_os("SLACK_TUI_CACHE")
@@ -448,6 +478,7 @@ fn run() -> i32 {
     let root = match storage::resolve_root(&opts.root) {
         Ok(root) => root,
         Err(error) => {
+            session_log::record("startup_error", serde_json::json!({"stage":"storage"}));
             eprintln!("slack-tui: {error}");
             return 1;
         }
@@ -455,6 +486,7 @@ fn run() -> i32 {
     let corpus = match Corpus::open(&root, opts.half_life, Some(cache_dir.join("stats.json"))) {
         Ok(c) => c,
         Err(e) => {
+            session_log::record("startup_error", serde_json::json!({"stage":"archives"}));
             eprintln!("slack-tui: {e}");
             return 1;
         }
@@ -698,6 +730,7 @@ fn under_multiplexer() -> bool {
 
 fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    let mut last_state = serde_json::Value::Null;
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::terminal::SetTitle("slack-tui")
@@ -725,10 +758,12 @@ fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io:
         // on request.
         let query = image_protocol.unwrap_or_else(|| !under_multiplexer());
         app.picker = Some(if query {
+            session_log::record("capability_query_start", serde_json::json!({"input_capture":"library-owned; not logged"}));
             let p = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+            session_log::record("capability_query_end", serde_json::json!({"protocol":format!("{:?}",p.protocol_type())}));
             let cap = std::time::Instant::now() + Duration::from_millis(1000);
             while event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                let _ = event::read();
+                if let Ok(input) = event::read() { session_log::input(&input, "capability_drain"); }
                 if std::time::Instant::now() >= cap {
                     break;
                 }
@@ -742,22 +777,35 @@ fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io:
     if app.open.is_none() {
         app.focus = Focus::Convs;
     }
+    if let Ok(size) = terminal.size() {
+        session_log::record("terminal_ready", serde_json::json!({"width":size.width,"height":size.height,"image_font":app.image_font(),"image_protocol":app.picker.as_ref().map(|p|format!("{:?}",p.protocol_type()))}));
+    }
     let result = loop {
         let t0 = std::time::Instant::now();
         if let Err(e) = terminal.draw(|frame| ui::draw(frame, app)) {
             break Err(e);
         }
-        if t0.elapsed().as_millis() > 50 {
-            trace(&format!("draw {} ms", t0.elapsed().as_millis()));
+        let draw_elapsed = t0.elapsed();
+        session_log::observe(app, &mut last_state, "draw");
+        if draw_elapsed.as_millis() > 50 {
+            session_log::record("slow_draw", serde_json::json!({"duration_ms":draw_elapsed.as_millis()}));
+            trace(&format!("draw {} ms", draw_elapsed.as_millis()));
         }
         match event::poll(Duration::from_millis(250)) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
-                    let t = std::time::Instant::now();
-                    app.on_key(k);
-                    trace(&format!("key {:?} {} ms", k.code, t.elapsed().as_millis()));
+                Ok(input) => {
+                    session_log::input(&input, "event_loop");
+                    if let Event::Key(k) = input {
+                        if k.kind == KeyEventKind::Press {
+                            let binding = app.keymap.action(k).map(|action|format!("{action:?}"));
+                            let t = std::time::Instant::now();
+                            app.on_key(k);
+                            session_log::record("key_dispatch", serde_json::json!({"duration_ms":t.elapsed().as_millis(),"configured_binding":binding}));
+                            session_log::observe(app, &mut last_state, "key");
+                            trace(&format!("key {:?} {} ms", k.code, t.elapsed().as_millis()));
+                        }
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => break Err(e),
             },
             Ok(false) => {}
@@ -765,13 +813,18 @@ fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io:
         }
         let t = std::time::Instant::now();
         app.tick();
-        if t.elapsed().as_millis() > 50 {
-            trace(&format!("tick {} ms", t.elapsed().as_millis()));
+        let tick_elapsed = t.elapsed();
+        session_log::observe(app, &mut last_state, "tick");
+        if let Some(failure) = session_log::take_failure() { app.status = failure; }
+        if tick_elapsed.as_millis() > 50 {
+            session_log::record("slow_tick", serde_json::json!({"duration_ms":tick_elapsed.as_millis()}));
+            trace(&format!("tick {} ms", tick_elapsed.as_millis()));
         }
         if app.quit {
             break Ok(());
         }
     };
+    if let Err(error) = &result { session_log::record("terminal_error", serde_json::json!({"kind":format!("{:?}",error.kind())})); }
     drop(keyboard_guard);
     ratatui::restore();
     result
