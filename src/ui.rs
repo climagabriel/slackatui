@@ -101,7 +101,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     };
     let block = Block::bordered()
-        .title(title)
+        .title(app.palette.highlight_line(Line::from(title)))
         .border_style(border(focused, &app.palette));
     let inner = block.inner(area);
     let width = inner.width as usize;
@@ -140,8 +140,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
                     },
                 );
             }
-            let name = clip(&name, room);
-            let pad = room.saturating_sub(name.width());
+            let pad = room.saturating_sub(clip(&name, room).width());
             let mut name_style = if c.unread {
                 Style::new()
                     .fg(app.palette.get(Role::Unread))
@@ -156,11 +155,14 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             if Some(i) == open_idx {
                 name_style = name_style.add_modifier(Modifier::BOLD);
             }
-            Line::from(vec![
-                Span::styled(name, name_style),
-                Span::raw(" ".repeat(pad + gap)),
-                Span::styled(count, dim),
-            ])
+            let selected = app.filtered.get(app.conv_cursor) == Some(&i);
+            let mut name_line = Line::from(Span::styled(name, name_style));
+            if selected { name_line = on_cursor(name_line, focused, &app.palette); }
+            let mut line = clip_line(app.palette.highlight_line(name_line), room);
+            let mut tail = Line::from(vec![Span::raw(" ".repeat(pad + gap)), Span::styled(count, dim)]);
+            if selected { tail = on_cursor(tail, focused, &app.palette); }
+            line.spans.extend(tail.spans);
+            line
         })
         .collect();
     // The cursor's row is rewritten with the palette's selection colors rather
@@ -169,11 +171,6 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         .into_iter()
         .enumerate()
         .map(|(k, line)| {
-            let line = if k == app.conv_cursor {
-                on_cursor(line, focused, &app.palette)
-            } else {
-                line
-            };
             let boundary = k > 0
                 && app.starred.contains(&app.conv(app.filtered[k - 1]).id)
                 && !app.starred.contains(&app.conv(app.filtered[k]).id);
@@ -240,9 +237,9 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.title()
     };
-    let title = format!(" {} ", clip(&label, area.width.saturating_sub(4) as usize));
+    let title = clip_line(app.palette.highlight_line(Line::from(format!(" {label} "))), area.width.saturating_sub(2) as usize);
     let block = Block::bordered()
-        .title(title)
+        .title(app.palette.highlight_line(Line::from(title)))
         .border_style(border(focused, &app.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -356,7 +353,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         spans.extend(fl.line.spans.iter().cloned());
         let mut line = Line::from(spans);
         if selected && header_line == Some(i) {
-            line = on_cursor(line, focused, palette);
+            line = palette.highlight_line(on_cursor(line, focused, palette));
         }
         shown.push(line);
     }
@@ -621,13 +618,14 @@ fn draw_keys(frame: &mut Frame, app: &App, inner: Rect) {
 }
 
 fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
-    let Some(View::ColorPalette { cursor, .. }) = app.stack.last() else {
+    let Some(View::ColorPalette { cursor, highlights, .. }) = app.stack.last() else {
         return;
     };
+    if let Some(menu) = highlights { menu.draw(frame, inner, &app.palette); return; }
     let visible = inner.height.saturating_sub(3) as usize;
     let first = cursor
         .saturating_sub(visible / 2)
-        .min(ROLES.len().saturating_sub(visible));
+        .min((ROLES.len() + 1).saturating_sub(visible));
     let mut lines = vec![Line::from(Span::styled(
         " semantic role                 preview   color",
         Style::new().add_modifier(Modifier::DIM),
@@ -666,9 +664,15 @@ fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
             ),
         ]));
     }
+    if first + visible > ROLES.len() {
+        lines.push(Line::from(Span::styled(
+            format!(" {} Word highlights →", if *cursor == ROLES.len() { "›" } else { " " }),
+            Style::new().fg(app.palette.get(Role::Accent)),
+        )));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " j/k role · h/l color · d reset role · D reset all · Enter save · Esc cancel",
+        " j/k select · h/l color · W word highlights · e type color · d/D reset · Enter save · Esc cancel",
         Style::new().add_modifier(Modifier::DIM),
     )));
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1077,6 +1081,24 @@ pub fn human_count(n: i64) -> String {
     }
 }
 
+fn clip_line(mut line: Line<'static>, width: usize) -> Line<'static> {
+    let text = line.to_string();
+    let clipped = clip(&text, width);
+    if clipped == text { return line; }
+    let mut remaining = clipped.strip_suffix('…').unwrap_or(&clipped).len();
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if remaining == 0 { break; }
+        let count = remaining.min(span.content.len());
+        spans.push(Span::styled(span.content[..count].to_string(), span.style));
+        remaining -= count;
+    }
+    let style = spans.last().map(|span| span.style).unwrap_or_default();
+    spans.push(Span::styled("…", style));
+    line.spans = spans;
+    line
+}
+
 pub fn clip(s: &str, width: usize) -> String {
     if s.width() <= width {
         return s.to_string();
@@ -1116,4 +1138,20 @@ pub fn dump(app: &mut App, width: usize) -> String {
         .map(|fl| render::line_text(&fl.line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+    #[test]
+    fn a_clipped_match_keeps_its_color_and_selection_background() {
+        let palette = Palette::default();
+        let line = on_cursor(Line::from("#nginx"), true, &palette);
+        let line = clip_line(palette.highlight_line(line), 4);
+        assert_eq!(line.to_string(), "#ng…");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(4, 1)).unwrap();
+        terminal.draw(|frame| frame.render_widget(Paragraph::new(line.clone()), frame.area())).unwrap();
+        assert_eq!(terminal.backend().buffer()[(1,0)].fg, Color::Green);
+        assert_eq!(terminal.backend().buffer()[(1,0)].bg, palette.get(Role::SelectionBackground));
+    }
 }

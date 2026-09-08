@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use ratatui::style::Color;
+use ratatui::text::{Line, Span};
 use serde_json::{Map, Value};
 
 pub const ROLE_COUNT: usize = 15;
@@ -168,7 +169,14 @@ pub const PRESETS: &[Preset] = &[
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Highlight {
+    pub word: String,
+    pub color: Color,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Palette {
+    pub highlights: Vec<Highlight>,
     colors: [Color; ROLE_COUNT],
 }
 
@@ -178,7 +186,13 @@ impl Default for Palette {
         for role in ROLES {
             colors[role as usize] = role.default_color();
         }
-        Self { colors }
+        Self {
+            colors,
+            highlights: vec![Highlight {
+                word: "nginx".into(),
+                color: Color::Green,
+            }],
+        }
     }
 }
 
@@ -249,7 +263,104 @@ impl Palette {
                 .ok_or_else(|| format!("{}: unknown color {name:?}", path.display()))?;
             palette.set(role, color);
         }
+        if let Some(rules) = object.get("highlights") {
+            let rules = rules.as_array().ok_or("highlights must be a list")?;
+            palette.highlights.clear();
+            for rule in rules {
+                let word = rule
+                    .get("word")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("highlight word must be nonempty text")?;
+                let color = rule
+                    .get("color")
+                    .and_then(Value::as_str)
+                    .and_then(parse_color)
+                    .ok_or("highlight color must be a color name or hex")?;
+                palette.highlights.push(Highlight {
+                    word: word.to_string(),
+                    color,
+                });
+            }
+        }
         Ok(palette)
+    }
+
+    /// Literal, case-insensitive substrings; the first rule wins overlaps.
+    /// Keep the original bytes and styles, even across span boundaries.
+    pub fn highlight_line<'a>(&self, mut line: Line<'a>) -> Line<'a> {
+        if self.highlights.is_empty() {
+            return line;
+        }
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let mut folded = String::new();
+        let mut boundaries = vec![Some(0)];
+        for (offset, character) in text.char_indices() {
+            folded.extend(
+                character
+                    .to_lowercase()
+                    .map(|c| if c == 'ς' { 'σ' } else { c }),
+            );
+            boundaries.resize(folded.len() + 1, None);
+            boundaries[folded.len()] = Some(offset + character.len_utf8());
+        }
+        let mut colors = vec![None; text.len()];
+        for rule in &self.highlights {
+            let needle: String = rule
+                .word
+                .chars()
+                .flat_map(char::to_lowercase)
+                .map(|c| if c == 'ς' { 'σ' } else { c })
+                .collect();
+            if needle.is_empty() {
+                continue;
+            }
+            // Search from every character boundary so repeated matches can overlap.
+            for (start, _) in folded.char_indices() {
+                if !folded[start..].starts_with(&needle) {
+                    continue;
+                }
+                if let (Some(start), Some(end)) =
+                    (boundaries[start], boundaries[start + needle.len()])
+                {
+                    for color in &mut colors[start..end] {
+                        color.get_or_insert(rule.color);
+                    }
+                }
+            }
+        }
+        if colors.iter().all(Option::is_none) {
+            return line;
+        }
+        let mut spans = Vec::new();
+        let mut offset = 0;
+        for span in line.spans {
+            let content = span.content.as_ref();
+            let mut start = 0;
+            while start < content.len() {
+                let color = colors[offset + start];
+                let end = content[start..]
+                    .char_indices()
+                    .skip(1)
+                    .find_map(|(index, _)| {
+                        (colors[offset + start + index] != color).then_some(start + index)
+                    })
+                    .unwrap_or(content.len());
+                let mut style = span.style;
+                if let Some(color) = color {
+                    style = style.fg(color);
+                }
+                spans.push(Span::styled(content[start..end].to_string(), style));
+                start = end;
+            }
+            offset += content.len();
+        }
+        line.spans = spans;
+        line
     }
 
     pub fn save(&self, path: Option<&Path>) -> Result<PathBuf, String> {
@@ -268,6 +379,9 @@ impl Palette {
         for role in ROLES {
             object.insert(role.key().to_string(), Value::from(self.color_name(role)));
         }
+        object.insert("highlights".into(), Value::Array(self.highlights.iter().map(|rule|
+            serde_json::json!({"word": rule.word, "color": color_name(rule.color)})
+        ).collect()));
         let text = serde_json::to_string_pretty(&object).map_err(|error| error.to_string())?;
         let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&temporary, format!("{text}\n"))
@@ -340,6 +454,89 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn greek_sigma_uses_the_same_folding_in_rules_and_messages() {
+        let mut palette = Palette::default();
+        palette.highlights = vec![Highlight {
+            word: "ΟΣ".into(),
+            color: Color::Green,
+        }];
+        let line = palette.highlight_line(Line::from("ΟΣ ος οσ"));
+        assert_eq!(line.to_string(), "ΟΣ ος οσ");
+        let green: String = line
+            .spans
+            .iter()
+            .filter(|span| span.style.fg == Some(Color::Green))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(green, "ΟΣοςοσ");
+    }
+
+    #[test]
+    fn highlights_preserve_text_unicode_styles_and_span_boundaries() {
+        use ratatui::style::{Modifier, Style};
+        let mut palette = Palette::default();
+        palette.highlights.push(Highlight {
+            word: "écho".into(),
+            color: Color::Red,
+        });
+        let style = Style::new().bg(Color::White).add_modifier(Modifier::BOLD);
+        let input = Line::from(vec![
+            Span::styled("İ #team-NG", style),
+            Span::styled("INX-fork ÉCHO nginx", style),
+        ]);
+        let output = palette.highlight_line(input.clone());
+        assert_eq!(output.to_string(), input.to_string());
+        for span in &output.spans {
+            assert_eq!(span.style.bg, Some(Color::White));
+            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        }
+        let green: String = output
+            .spans
+            .iter()
+            .filter(|s| s.style.fg == Some(Color::Green))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(green, "NGINXnginx");
+        let red: String = output
+            .spans
+            .iter()
+            .filter(|s| s.style.fg == Some(Color::Red))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(red, "ÉCHO");
+        palette.highlights.insert(
+            0,
+            Highlight {
+                word: "ng".into(),
+                color: Color::Blue,
+            },
+        );
+        let output = palette.highlight_line(Line::from("nginx"));
+        assert_eq!(output.spans[0].content, "ng");
+        assert_eq!(output.spans[0].style.fg, Some(Color::Blue));
+        assert_eq!(output.spans[1].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn highlights_migrate_old_config_and_preserve_explicit_empty_rules() {
+        let path = temporary_file("highlights");
+        std::fs::write(&path, "{}").unwrap();
+        let mut palette = Palette::load(Some(&path)).unwrap();
+        assert_eq!(palette.highlights[0].word, "nginx");
+        assert_eq!(palette.highlights[0].color, Color::Green);
+        palette.highlights.push(Highlight {
+            word: "ÉCHO".into(),
+            color: Color::Rgb(1, 2, 3),
+        });
+        palette.save(Some(&path)).unwrap();
+        assert_eq!(palette, Palette::load(Some(&path)).unwrap());
+        palette.highlights.clear();
+        palette.save(Some(&path)).unwrap();
+        assert!(Palette::load(Some(&path)).unwrap().highlights.is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

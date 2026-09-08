@@ -257,6 +257,7 @@ impl Ctx<'_> {
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Sty {
+    pub highlight: Option<ratatui::style::Color>,
     pub bold: bool,
     pub italic: bool,
     pub strike: bool,
@@ -350,6 +351,7 @@ fn style_of(s: Sty, palette: &Palette) -> Style {
     if s.dim {
         st = st.add_modifier(Modifier::DIM);
     }
+    if let Some(color) = s.highlight { st = st.fg(color); }
     st
 }
 
@@ -1011,6 +1013,29 @@ fn is_blank(line: &Line) -> bool {
 /// Greedy word-wrap. A word wider than the line stays whole on its own line
 /// (a long URL is clipped, never split, so it stays clickable).
 pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<Line<'static>> {
+    // Match source text before word wrapping, retaining each segment's semantics.
+    let highlighted = palette.highlight_line(Line::from(segs.iter().map(|seg| Span::raw(seg.text.clone())).collect::<Vec<_>>()));
+    let mut source = segs.iter().filter(|seg| !seg.text.is_empty());
+    let mut current = source.next();
+    let mut consumed = 0;
+    let mut painted = Vec::new();
+    for span in highlighted.spans {
+        if span.content.is_empty() { continue; }
+        let Some(seg) = current else { break; };
+        // Preformatted segments must remain whole: items() treats each as a
+        // verbatim unit. Highlight each verbatim word after tokenization.
+        if seg.sty.pre {
+            if consumed == 0 { painted.push(seg.clone()); }
+            consumed += span.content.len();
+        } else {
+            let mut style = seg.sty;
+            style.highlight = span.style.fg;
+            consumed += span.content.len();
+            painted.push(Seg::new(span.content.into_owned(), style));
+        }
+        if consumed == seg.text.len() { current = source.next(); consumed = 0; }
+    }
+    let segs = painted.as_slice();
     let avail = width.saturating_sub(indent.width()).max(8);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
@@ -1043,9 +1068,10 @@ pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<
                     cur.push(Span::raw(" "));
                     cur_w += 1;
                 }
-                for (t, s) in parts {
-                    cur.push(Span::styled(t, style_of(s, palette)));
-                }
+                let preformatted = parts.first().is_some_and(|(_, style)| style.pre);
+                let word = Line::from(parts.into_iter().map(|(text, style)| Span::styled(text, style_of(style, palette))).collect::<Vec<_>>());
+                let word = if preformatted { palette.highlight_line(word) } else { word };
+                cur.extend(word.spans);
                 cur_w += w;
             }
         }
@@ -1198,7 +1224,9 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
         .add_modifier(Modifier::BOLD);
     spans[2] = Span::styled(author, author_style);
     lines.push(Line::from(spans));
+    let body_start = lines.len();
     lines.extend(wrap(&body(m, ctx), width, "  ", ctx.palette));
+    let body_end = lines.len();
     for f in m.files() {
         let kind = match f.mode.as_str() {
             "snippet" => "snippet",
@@ -1273,6 +1301,9 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
             Style::new().fg(ctx.palette.get(Role::ThreadInfo)),
         )));
     }
+    let lines = lines.into_iter().enumerate().map(|(index, line)| {
+        if (body_start..body_end).contains(&index) { line } else { ctx.palette.highlight_line(line) }
+    }).collect();
     Rendered { lines, images }
 }
 
@@ -1302,6 +1333,22 @@ pub fn line_text(l: &Line) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn highlights_survive_wrapping_without_changing_preformatted_spacing() {
+        let mut palette = Palette::default();
+        palette.highlights.push(crate::palette::Highlight { word: "upstream timeout".into(), color: ratatui::style::Color::Red });
+        palette.highlights.push(crate::palette::Highlight { word: "timeout".into(), color: ratatui::style::Color::Green });
+        let segments = vec![Seg::new("upstream timeout", Sty::default())];
+        for width in [8, 16, 80] {
+            let lines = wrap(&segments, width, "", &palette);
+            let red: String = lines.iter().flat_map(|line| &line.spans).filter(|span| span.style.fg == Some(ratatui::style::Color::Red)).map(|span| span.content.as_ref()).collect();
+            assert_eq!(red, "upstreamtimeout");
+        }
+        let segments = vec![Seg::new("  nginx   -t\nNGINX", Sty { pre: true, ..Sty::default() })];
+        let lines = wrap(&segments, 8, "", &palette);
+        assert_eq!(lines.iter().map(Line::to_string).collect::<Vec<_>>(), vec!["  nginx   -t", "NGINX"]);
+    }
+
     #[test]
     fn usergroup_mentions_resolve_both_formats_and_keep_fallbacks() {
         let a = Archive::stub(&[], &[]);

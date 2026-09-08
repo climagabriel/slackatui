@@ -13,6 +13,7 @@ mod edit;
 mod keys;
 mod live;
 mod palette;
+mod word_highlights;
 mod profiles;
 mod render;
 mod storage;

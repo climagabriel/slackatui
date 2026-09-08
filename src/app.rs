@@ -341,6 +341,7 @@ pub enum View {
     },
     /// `/colorpalette`: edit semantic UI colors with a live preview.
     ColorPalette {
+        highlights: Option<crate::word_highlights::Menu>,
         cursor: usize,
         original: Palette,
         return_focus: Focus,
@@ -806,13 +807,15 @@ impl App {
         };
         let return_focus = self.focus;
         self.stack.push(View::ColorPalette {
+            highlights: None,
             cursor: 0,
             original: self.palette.clone(),
             return_focus,
         });
         self.focus = Focus::Msgs;
         let status = match applied {
-            Some(palette) => {
+            Some(mut palette) => {
+                palette.highlights = self.palette.highlights.clone();
                 self.palette = palette;
                 self.mark_all_dirty();
                 format!(
@@ -990,12 +993,29 @@ impl App {
     }
 
     fn on_palette_key(&mut self, key: KeyEvent, control: bool) {
+        let editing_word = matches!(self.stack.last(), Some(View::ColorPalette { highlights: Some(menu), .. }) if menu.editing());
+        if (control && key.code == KeyCode::Char('c')) || (!control && !editing_word && key.code == KeyCode::Char('q')) { self.quit = true; return; }
+        if let Some(View::ColorPalette { highlights: Some(menu), .. }) = self.stack.last_mut() {
+            let back = menu.key(key, &mut self.palette);
+            if back {
+                if let Some(View::ColorPalette { highlights, cursor, .. }) = self.stack.last_mut() { *highlights = None; *cursor = 0; }
+            }
+            self.mark_all_dirty();
+            return;
+        }
+        let words_selected = matches!(self.stack.last(), Some(View::ColorPalette { cursor, .. }) if *cursor == ROLES.len());
+        if !control && (key.code == KeyCode::Char('W') || (words_selected && matches!(key.code, KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')))) {
+            if let Some(View::ColorPalette { highlights, .. }) = self.stack.last_mut() {
+                *highlights = Some(crate::word_highlights::Menu::default());
+            }
+            return;
+        }
         match (key.code, control) {
             (KeyCode::Char('c'), true) | (KeyCode::Char('q'), false) => self.quit = true,
             (KeyCode::Char('?'), false) | (KeyCode::Char('H'), false) => self.help = true,
             (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
                 if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
-                    *cursor = (*cursor + 1).min(ROLES.len() - 1);
+                    *cursor = (*cursor + 1).min(ROLES.len());
                 }
             }
             (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
@@ -1010,7 +1030,7 @@ impl App {
             }
             (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
                 if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
-                    *cursor = ROLES.len() - 1;
+                    *cursor = ROLES.len();
                 }
             }
             (KeyCode::Char('h'), false) | (KeyCode::Left, _) => {
@@ -1045,15 +1065,16 @@ impl App {
                 self.mark_all_dirty();
             }
             (KeyCode::Enter, _) => {
+                let path = match self.palette.save(self.palette_path.as_deref()) {
+                    Ok(path) => path,
+                    Err(error) => { self.status = format!("palette: {error}"); return; }
+                };
                 let return_focus = match self.stack.pop() {
                     Some(View::ColorPalette { return_focus, .. }) => return_focus,
                     _ => return,
                 };
                 self.focus = return_focus;
-                self.status = match self.palette.save(self.palette_path.as_deref()) {
-                    Ok(path) => format!("color palette saved to {}", path.display()),
-                    Err(error) => format!("palette: {error}"),
-                };
+                self.status = format!("color palette saved to {}", path.display());
             }
             (KeyCode::Esc, _) => {
                 let (original, return_focus) = match self.stack.pop() {
@@ -4523,6 +4544,70 @@ mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn word_menu_quit_keys_reach_the_application() {
+        let mut app = mute_test_app();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.open_color_palette("");
+        app.on_key(key(KeyCode::Char('W')));
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.quit);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+        app.quit = false;
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn word_highlights_render_in_selected_conversation_messages_and_title() {
+        let mut app = mute_test_app();
+        let index = app.corpus.convs.iter().position(|conv| conv.id == "C1").unwrap();
+        app.corpus.convs[index].name = "#NGINX-chat".into();
+        app.open_conv(index);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1, "nginx and *NGINX* with nginx-fork")], false);
+        app.conv_cursor = app.filtered.iter().position(|i| *i == index).unwrap();
+        app.focus = Focus::Convs;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut hits = 0;
+        for y in 0..20 {
+            for x in 0..116 {
+                let text: String = (x..x + 5).map(|column| buffer[(column,y)].symbol()).collect();
+                if text.eq_ignore_ascii_case("nginx") {
+                    hits += 1;
+                    for column in x..x + 5 { assert_eq!(buffer[(column,y)].fg, ratatui::style::Color::Green, "{x},{y}"); }
+                }
+            }
+        }
+        assert!(hits >= 5, "conversation name, title, and three body matches: {hits}; {}", buffer.content.iter().map(|cell| cell.symbol()).collect::<String>());
+    }
+
+    #[test]
+    fn palette_word_menu_is_nested_and_cancel_restores_rules() {
+        let mut app = mute_test_app();
+        let original = app.palette.clone();
+        app.open_color_palette("");
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_palette_key(key(KeyCode::Char('G')), false);
+        app.on_palette_key(key(KeyCode::Enter), false);
+        assert!(matches!(app.stack.last(), Some(View::ColorPalette { highlights: Some(_), .. })));
+        app.on_palette_key(key(KeyCode::Char('d')), false);
+        assert!(app.palette.highlights.is_empty());
+        app.on_palette_key(key(KeyCode::Esc), false);
+        assert!(matches!(app.stack.last(), Some(View::ColorPalette { highlights: None, .. })));
+        app.on_palette_key(key(KeyCode::Esc), false);
+        assert_eq!(app.palette, original);
+        app.palette.highlights.clear();
+        app.open_color_palette("vintage");
+        assert!(app.palette.highlights.is_empty());
     }
 
     #[test]
