@@ -19,6 +19,7 @@ mod profiles;
 mod render;
 mod raw;
 mod saved;
+mod sent;
 mod storage;
 mod session_log;
 mod ui;
@@ -73,6 +74,8 @@ selection. PgUp/PgDn scroll long values; g/G select the first/last value or link
 Ctrl-S or /save saves the selected message to Slack Later; Ctrl-Shift-S or /unsave
 removes it from Later. SAVED above starred conversations opens active saved messages;
 r refreshes the list. Terminals that report shortcuts alike can use /unsave.
+SENT below SAVED shows sent messages newest first, using Slack search.
+Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.
 
 Conversations default to recent order: newest message first. Starred, muted,
 unread and search-match grouping take precedence. Press s to cycle recent,

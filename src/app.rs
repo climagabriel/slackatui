@@ -370,7 +370,16 @@ pub struct Open {
     pub api_only: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopSection { Saved, Sent }
+
+impl TopSection {
+    pub fn label(self) -> &'static str { match self { Self::Saved => "SAVED", Self::Sent => "SENT" } }
+    pub fn row(self) -> usize { match self { Self::Saved => 0, Self::Sent => 1 } }
+}
+
 pub enum View {
+    Sent { list: MsgList, next_cursor: Option<String>, generation: u64 },
     Saved { list: MsgList },
     Thread {
         root: i64,
@@ -458,7 +467,8 @@ pub struct App {
     pub filter: String,
     pub filtered: Vec<usize>,
     pub conv_cursor: usize,
-    pub saved_selected: bool,
+    pub top_section: Option<TopSection>,
+    sent_generation: u64,
     pub saved_messages: Vec<Msg>,
     pub open: Option<Open>,
     pub stack: Vec<View>,
@@ -606,7 +616,8 @@ impl App {
             filter: String::new(),
             filtered: Vec::new(),
             conv_cursor: 0,
-            saved_selected: false,
+            top_section: None,
+            sent_generation: 0,
             saved_messages: Vec::new(),
             open: None,
             stack: Vec::new(),
@@ -685,7 +696,12 @@ impl App {
     /// threads hit replies in the hit's thread, a timeline posts to its
     /// conversation, the list posts to the highlighted conversation.
     fn compose_target(&self) -> Result<Compose, String> {
-        if self.focus == Focus::Convs && self.saved_selected { return Err("Select a message or conversation first".into()); }
+        if self.focus == Focus::Convs {
+            if self.top_section.is_some() { return Err("Select a message or conversation first".into()); }
+            let conv = *self.filtered.get(self.conv_cursor).ok_or("nothing highlighted")?;
+            let channel = &self.corpus.convs[conv];
+            return Ok(Compose { conv, cid: channel.id.clone(), thread: None, label: format!("message to {}",channel.name) });
+        }
         let known = |cid: &str| -> Result<usize, String> {
             self.corpus
                 .conv_by_channel(cid)
@@ -710,7 +726,7 @@ impl App {
                     label: format!("reply in this thread in {name}"),
                 })
             }
-            Some(View::Search { .. }) | Some(View::Threads { .. }) | Some(View::Saved { .. }) => {
+            Some(View::Search { .. }) | Some(View::Threads { .. }) | Some(View::Saved { .. }) | Some(View::Sent { .. }) => {
                 let m = self.selected().ok_or("no message selected")?;
                 let conv = known(&m.channel_id)?;
                 let name = self.corpus.convs[conv].name.clone();
@@ -1174,7 +1190,7 @@ impl App {
     }
 
     fn target_conv(&self, name: &str) -> Result<usize, String> {
-        if name.is_empty() && ((self.focus == Focus::Convs && self.saved_selected) || (self.focus == Focus::Msgs && self.open.is_none())) { return Err("Select a conversation first".into()); }
+        if name.is_empty() && ((self.focus == Focus::Convs && self.top_section.is_some()) || (self.focus == Focus::Msgs && self.open.is_none())) { return Err("Select a conversation first".into()); }
         if !name.is_empty() {
             return self
                 .corpus
@@ -1333,6 +1349,51 @@ impl App {
         }
     }
 
+    fn open_sent(&mut self) {
+        self.invalidate_thread_jobs();
+        if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
+        self.sent_generation = self.sent_generation.wrapping_add(1);
+        self.open = None;
+        self.stack.clear();
+        self.stack.push(View::Sent { list: MsgList::new(Vec::new(), false), next_cursor: None, generation: self.sent_generation });
+        self.top_section = Some(TopSection::Sent);
+        self.focus = Focus::Msgs;
+        self.fetch_sent(false);
+    }
+
+    fn fetch_sent(&mut self, append: bool) {
+        if self.job.is_some() { self.status = "A request is running; retry when it finishes".into(); return; }
+        let Some(client) = self.api.clone() else { self.status = "SENT needs a Slack sign-in; r refreshes after signing in".into(); return; };
+        let Some(View::Sent { next_cursor, generation, .. }) = self.stack.last_mut() else { return; };
+        let cursor = if append {
+            let Some(cursor) = next_cursor.clone() else { return; }; cursor
+        } else { "*".into() };
+        self.sent_generation = self.sent_generation.wrapping_add(1);
+        *generation = self.sent_generation;
+        self.job = Some(live::spawn(JobKind::Sent { generation: *generation, append }, "loading sent messages".into(), move || {
+            crate::sent::fetch(&client, &cursor).map(Done::SentPage)
+        }));
+        self.status = "Loading sent messages from Slack…".into();
+    }
+
+    fn apply_sent(&mut self, generation: u64, append: bool, mut page: crate::sent::Page) {
+        for message in &mut page.messages {
+            message.channel_name = self.corpus.conv_by_channel(&message.channel_id).map(|index| self.corpus.convs[index].name.clone())
+                .or_else(|| self.corpus.channel_names.get(&message.channel_id).cloned())
+                .or_else(|| message.channel_name.clone()).or_else(|| Some(message.channel_id.clone()));
+        }
+        let Some(View::Sent { list, next_cursor, .. }) = self.stack.iter_mut().find(|view| matches!(view,View::Sent {generation: current,..} if *current == generation)) else { return; };
+        let selected = list.selected().map(|m| (m.channel_id.clone(),m.id));
+        let mut messages = if append { list.msgs.clone() } else { Vec::new() };
+        let mut seen: HashSet<(String,i64)> = messages.iter().map(|m|(m.channel_id.clone(),m.id)).collect();
+        messages.extend(page.messages.into_iter().filter(|m|seen.insert((m.channel_id.clone(),m.id))));
+        messages.sort_by_key(|m|std::cmp::Reverse(m.id));
+        *list = MsgList::new(messages,false);
+        if append { list.cursor = selected.and_then(|(cid,id)|list.msgs.iter().position(|m|m.channel_id==cid && m.id==id)).unwrap_or(0); }
+        *next_cursor = page.next_cursor;
+        self.status = format!("{} sent messages loaded{}",list.len(),if next_cursor.is_some() { "; j at end loads older" } else { "" });
+    }
+
     fn open_saved(&mut self) {
         self.invalidate_thread_jobs();
         if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
@@ -1341,7 +1402,7 @@ impl App {
         self.stack.clear();
         self.stack.push(View::Saved { list: MsgList::new(self.saved_messages.clone(), false) });
         self.focus = Focus::Msgs;
-        self.saved_selected = true;
+        self.top_section = Some(TopSection::Saved);
     }
 
     fn change_saved(&mut self, save: bool) {
@@ -1357,7 +1418,7 @@ impl App {
         let mut known = self.saved_messages.clone();
         if let Some(open) = &self.open { known.extend(open.list.msgs.clone()); }
         for view in &self.stack {
-            if let View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } = view { known.extend(list.msgs.clone()); }
+            if let View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } | View::Sent { list, .. } = view { known.extend(list.msgs.clone()); }
         }
         if let Some((message, _)) = &change { known.push(message.clone()); }
         let sources = self.corpus.convs.iter().filter(|conv| !conv.live_only).map(|conv| {
@@ -1532,7 +1593,7 @@ impl App {
         }
         for view in self.stack.iter_mut() {
             match view {
-                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } => {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } | View::Sent { list, .. } => {
                     lists.push(list)
                 }
                 _ => {}
@@ -1832,7 +1893,7 @@ impl App {
 
     pub fn open_conv(&mut self, idx: usize) -> bool {
         self.invalidate_thread_jobs();
-        self.saved_selected = false;
+        self.top_section = None;
         let conv = &self.corpus.convs[idx];
         let cid = conv.id.clone();
         if conv.live_only {
@@ -2081,7 +2142,7 @@ impl App {
         // A fetch belongs to the view that requested it, even if a new view has
         // the same root timestamp. Cancel navigation, never the cache write.
         for slot in [&mut self.job, &mut self.bg] {
-            if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. })) { *slot = None; }
+            if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. } | JobKind::Sent { .. })) { *slot = None; }
         }
     }
 
@@ -2285,7 +2346,7 @@ impl App {
     /// Open a message's thread wherever it lives: this conversation, another
     /// archived one (switched to underneath the search view), or Slack.
     fn open_hit(&mut self, cid: String, root: i64, focus: i64) {
-        if matches!(self.stack.last(), Some(View::Saved { .. })) {
+        if matches!(self.stack.last(), Some(View::Saved { .. } | View::Sent { .. })) {
             self.open_thread_in(cid, root, focus);
             return;
         }
@@ -2818,7 +2879,7 @@ impl App {
         }
         for v in &mut self.stack {
             match v {
-                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } => {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } | View::Sent { list, .. } => {
                     list.mark_dirty()
                 }
                 _ => {}
@@ -2998,10 +3059,8 @@ impl App {
         self.mark_with(idx, id);
     }
 
-    /// `M`: the marker moves to the message before the one under the cursor,
-    /// so that one and everything after it read as unread. When the previous
-    /// message is not loaded, the timestamp one microsecond earlier stands in;
-    /// from the list, the conversation's newest known message becomes unread.
+    /// `M`: put the read marker one microsecond before the selected message,
+    /// independent of list order; from the sidebar use the newest known message.
     fn mark_unread(&mut self) {
         let (idx, sel) = match self.mark_target() {
             Ok(t) => t,
@@ -3011,17 +3070,7 @@ impl App {
             }
         };
         let id = match sel {
-            Some(m) => {
-                let previous = self.active_list().and_then(|l| {
-                    let at = l.msgs.iter().position(|x| x.id == m.id)?;
-                    l.msgs[..at]
-                        .iter()
-                        .rev()
-                        .find(|x| x.channel_id == m.channel_id)
-                        .map(|x| x.id)
-                });
-                previous.unwrap_or(m.id - 1)
-            }
+            Some(m) => m.id - 1,
             None => self.corpus.convs[idx].last_id - 1,
         };
         self.mark_with(idx, id);
@@ -3056,7 +3105,7 @@ impl App {
         }).flatten().collect();
         for key in image_keys { self.release_picture(&key); }
         self.go_home();
-        if at_home { self.conv_cursor = 0; self.conv_offset = 0; self.saved_selected = true; }
+        if at_home { self.conv_cursor = 0; self.conv_offset = 0; self.top_section = Some(TopSection::Saved); }
     }
 
     fn go_home(&mut self) {
@@ -3504,6 +3553,7 @@ impl App {
                 );
             }
             (JobKind::Saved, Done::Saved(messages)) => self.apply_saved(messages),
+            (JobKind::Sent { generation, append }, Done::SentPage(page)) => self.apply_sent(generation, append, page),
             (JobKind::MessageLink { raw_id, link }, Done::ThreadMsgs(messages)) => {
                 self.show_linked_message(raw_id, &link, messages);
             }
@@ -3664,7 +3714,7 @@ impl App {
         }) {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
-            | Some(View::Threads { list }) | Some(View::Saved { list }) => Some(list),
+            | Some(View::Threads { list }) | Some(View::Saved { list }) | Some(View::Sent { list, .. }) => Some(list),
             _ => self.open.as_ref().map(|o| &o.list),
         }
     }
@@ -3681,7 +3731,7 @@ impl App {
         }) {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
-            | Some(View::Threads { list }) | Some(View::Saved { list }) => Some(list),
+            | Some(View::Threads { list }) | Some(View::Saved { list }) | Some(View::Sent { list, .. }) => Some(list),
             _ => self.open.as_mut().map(|o| &mut o.list),
         }
     }
@@ -3716,6 +3766,7 @@ impl App {
             Some(View::ColorPalette { .. }) | Some(View::Keys { .. }) => {
                 unreachable!("handled before opening a conversation")
             }
+            Some(View::Sent { list, next_cursor, .. }) => format!("SENT · {} loaded{} · r: refresh", list.len(), if next_cursor.is_some() { " · j at end: older" } else { "" }),
             Some(View::Saved { list }) => format!("SAVED · {} messages · r: refresh · /unsave", list.len()),
             Some(View::Raw { title, .. }) => title.clone(),
             Some(View::Reactions { title, .. }) => title.clone(),
@@ -3936,7 +3987,7 @@ impl App {
             self.change_saved(action == Some(Action::Save));
             return;
         }
-        if action == Some(Action::ChannelTabs) && self.focus == Focus::Convs && self.saved_selected {
+        if action == Some(Action::ChannelTabs) && self.focus == Focus::Convs && self.top_section.is_some() {
             self.status = "Select a channel first".into(); return;
         }
         if action == Some(Action::ChannelTabs) {
@@ -4186,13 +4237,20 @@ impl App {
             Some(Action::First) => Some(isize::MIN), Some(Action::Last) => Some(isize::MAX), _ => None,
         };
         if let Some(delta) = delta {
-            let row = if self.saved_selected { 0 } else { self.conv_cursor + 1 };
-            let row = row.saturating_add_signed(delta).min(self.filtered.len());
-            self.saved_selected = row == 0; self.conv_cursor = row.saturating_sub(1); return;
+            let row = self.top_section.map(TopSection::row).unwrap_or(if self.filtered.is_empty() { 0 } else { self.conv_cursor + 2 });
+            let row = row.saturating_add_signed(delta).min(self.filtered.len() + 1);
+            self.top_section = match row { 0 => Some(TopSection::Saved), 1 => Some(TopSection::Sent), _ => None };
+            self.conv_cursor = row.saturating_sub(2); return;
         }
-        if (self.saved_selected || self.filtered.is_empty()) && action == Some(Action::Open) { self.open_saved(); return; }
-        if self.saved_selected && matches!(action, Some(Action::Compose | Action::MarkRead | Action::MarkUnread | Action::React | Action::Archive)) {
-            self.status = "Open SAVED and select a message first".into(); return;
+        if action == Some(Action::Open) {
+            match self.top_section.or_else(|| self.filtered.is_empty().then_some(TopSection::Saved)) {
+                Some(TopSection::Saved) => { self.open_saved(); return; }
+                Some(TopSection::Sent) => { self.open_sent(); return; }
+                None => {}
+            }
+        }
+        if self.top_section.is_some() && matches!(action, Some(Action::Compose | Action::MarkRead | Action::MarkUnread | Action::React | Action::Archive)) {
+            self.status = "Open a section and select a message first".into(); return;
         }
         match action {
             Some(Action::Open) => {
@@ -4266,6 +4324,10 @@ impl App {
             }
         }
         let timeline = self.in_timeline();
+        if matches!(action, Some(Action::Down | Action::PageDown | Action::HalfPageDown | Action::Last))
+            && matches!(self.stack.last(), Some(View::Sent { list, next_cursor: Some(_), .. }) if list.cursor + 1 >= list.len()) {
+            self.fetch_sent(true); return;
+        }
         match action {
             Some(Action::Down) => {
                 let at_end = self
@@ -4367,6 +4429,7 @@ impl App {
                     previous: String::new(),
                 };
             }
+            Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Sent { .. })) => self.fetch_sent(false),
             Some(Action::Reload) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
             Some(Action::Refresh) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
             Some(Action::Reload) => self.reload(),
@@ -4985,7 +5048,7 @@ pub(crate) mod tests {
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
             (1..29)
-                .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
                 .collect::<String>()
         };
         assert!(row(&terminal).ends_with("123"));
@@ -5416,17 +5479,83 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn sent_compose_respects_sidebar_and_unread_marker_precedes_selection() {
+        let mut app=mute_test_app();app.open_sent();let generation=app.sent_generation;
+        let mut newer=msg(3,"newer");newer.channel_id="C1".into();
+        let mut selected=msg(2,"selected");selected.channel_id="C1".into();
+        app.apply_sent(generation,false,crate::sent::Page {messages:vec![newer,selected],next_cursor:None});
+        app.active_list_mut().unwrap().cursor=1;
+        app.api=Some(Arc::new(Client::for_test(|method,params| {
+            assert_eq!(method,"conversations.mark");assert!(params.contains(&("ts","1.999999")));Ok(json!({"ok":true}))
+        })));
+        app.mark_unread();assert!(matches!(app.job.as_ref().map(|j|&j.kind),Some(JobKind::Mark {id:1_999_999,..})));
+        app.focus=Focus::Convs;app.top_section=None;app.conv_cursor=1;
+        let target=app.compose_target().unwrap();
+        assert_eq!(target.cid,app.corpus.convs[app.filtered[1]].id);assert!(target.thread.is_none());
+        for section in [TopSection::Saved,TopSection::Sent] {app.top_section=Some(section);assert!(app.compose_target().is_err());}
+    }
+
+    #[test]
+    fn sent_navigation_pagination_refresh_and_late_results() {
+        let mut app = mute_test_app();
+        app.on_conv_key(Some(Action::First));
+        app.on_conv_key(Some(Action::Down));
+        assert_eq!(app.top_section,Some(TopSection::Sent));
+        assert!(app.target_conv("").is_err()); assert!(app.compose_target().is_err());
+        app.on_conv_key(Some(Action::Open));
+        assert!(app.open.is_none()); assert!(app.status.contains("sign-in"));
+        assert!(app.target_conv("").is_err());
+        let generation=app.sent_generation;
+        let mut reply=msg(3,"sent reply");reply.channel_id="C1".into();reply.parent_id=Some(1_000_000);
+        let mut older=msg(2,"older sent");older.channel_id="D1".into();
+        app.job=Some(Job::completed_for_test(JobKind::Sent {generation,append:false},Ok(Done::SentPage(crate::sent::Page {messages:vec![reply.clone()],next_cursor:Some("next".into())}))));
+        app.tick();assert_eq!(app.selected().unwrap().text,"sent reply");
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let buffer=terminal.backend().buffer();
+        for (y,name) in [(1,"SAVED"),(2,"SENT")] {let row:String=(1..20).map(|x|buffer[(x,y)].symbol()).collect();assert!(row.starts_with(name));}
+        let text:String=buffer.content.iter().map(|cell|cell.symbol()).collect();assert!(text.contains("sent reply"));
+        app.apply_sent(generation,true,crate::sent::Page {messages:vec![reply.clone(),older.clone()],next_cursor:None});
+        assert_eq!(app.active_list().unwrap().len(),2);assert_eq!(app.selected().unwrap().id,reply.id);
+        app.on_msg_key(Some(Action::Open));assert!(matches!(app.stack.last(),Some(View::Thread {root:1_000_000,..})));
+        app.on_msg_key(Some(Action::Back));assert!(matches!(app.stack.last(),Some(View::Sent {..})));
+        assert_eq!(app.selected().unwrap().id,reply.id);
+        app.on_msg_key(Some(Action::Back));assert!(app.focus==Focus::Convs);
+        app.apply_sent(generation,false,crate::sent::Page {messages:vec![older.clone()],next_cursor:None});assert!(app.stack.is_empty());
+        app.open_sent();let current=app.sent_generation;
+        app.apply_sent(generation,false,crate::sent::Page {messages:vec![reply],next_cursor:None});assert!(app.active_list().unwrap().msgs.is_empty());
+        app.apply_sent(current,false,crate::sent::Page {messages:vec![older],next_cursor:Some("next".into())});
+        // A failed older-page request preserves the list and cursor for retry.
+        app.job=Some(Job::completed_for_test(JobKind::Sent {generation:current,append:true},Err("offline".into())));app.tick();
+        assert_eq!(app.active_list().unwrap().len(),1);
+        app.api=Some(Arc::new(Client::for_test(|method,params| {
+            assert_eq!(method,"search.messages");assert!(params.contains(&("cursor","next")));
+            Ok(json!({"messages":{"matches":[]}}))
+        })));
+        app.on_msg_key(Some(Action::Down));assert!(matches!(app.job.as_ref().map(|j|&j.kind),Some(JobKind::Sent {append:true,..})));
+        app.on_msg_key(Some(Action::Back));assert!(app.job.is_none());
+        app.on_conv_key(Some(Action::Down));assert!(app.top_section.is_none());assert_eq!(app.conv_cursor,0);
+        app.api=None;app.corpus.convs.clear();app.filtered.clear();
+        app.on_conv_key(Some(Action::Last));assert_eq!(app.top_section,Some(TopSection::Sent));app.on_conv_key(Some(Action::Open));
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        app.escape_home();app.escape_home();assert_eq!(app.top_section,Some(TopSection::Saved));
+    }
+
+    #[test]
     fn saved_row_navigation_rendering_commands_and_async_results() {
         let mut app = mute_test_app();
         let key = |code| KeyEvent::new(code,KeyModifiers::NONE);
         app.on_key(key(KeyCode::Char('g')));
-        assert!(app.saved_selected);
+        assert!(app.top_section.is_some());
         assert!(app.target_conv("").is_err());
         assert!(app.compose_target().is_err());
         app.on_key(key(KeyCode::Char('j')));
-        assert!(!app.saved_selected); assert_eq!(app.conv_cursor,0);
+        assert_eq!(app.top_section,Some(TopSection::Sent));
+        app.on_key(key(KeyCode::Char('j')));
+        assert!(app.top_section.is_none()); assert_eq!(app.conv_cursor,0);
         app.on_key(key(KeyCode::Char('k')));
-        assert!(app.saved_selected);
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.top_section,Some(TopSection::Saved));
         app.on_key(key(KeyCode::Enter));
         assert!(app.open.is_none()); assert!(matches!(app.stack.last(),Some(View::Saved {..})));
         assert!(app.target_conv("").is_err());
@@ -5455,11 +5584,11 @@ pub(crate) mod tests {
         app.on_key(key(KeyCode::Esc));
         app.job=Some(Job::completed_for_test(JobKind::Saved,Ok(Done::Saved(vec![message]))));app.tick();
         assert!(app.stack.is_empty());assert!(app.open.is_none()); // No late navigation.
-        app.on_key(key(KeyCode::Esc));assert!(app.saved_selected);assert_eq!(app.conv_cursor,0);
+        app.on_key(key(KeyCode::Esc));assert!(app.top_section.is_some());assert_eq!(app.conv_cursor,0);
         app.open_saved();app.apply_saved(vec![]);assert_eq!(app.active_list().unwrap().len(),0);
         app.on_key(key(KeyCode::Char('h')));assert!(app.stack.is_empty());
         assert!(app.focus == Focus::Convs);
-        app.on_key(key(KeyCode::Char('j'))); assert!(!app.saved_selected);
+        app.on_key(key(KeyCode::Char('j'))); assert_eq!(app.top_section,Some(TopSection::Sent));
         app.corpus.convs.clear(); app.filtered.clear();app.open_saved();
         terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap(); // Empty workspaces need no fake conversation.
     }

@@ -155,7 +155,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             if Some(i) == open_idx {
                 name_style = name_style.add_modifier(Modifier::BOLD);
             }
-            let selected = !app.saved_selected && app.filtered.get(app.conv_cursor) == Some(&i);
+            let selected = app.top_section.is_none() && app.filtered.get(app.conv_cursor) == Some(&i);
             let mut name_line = Line::from(Span::styled(name, name_style));
             if selected { name_line = on_cursor(name_line, focused, &app.palette); }
             let mut line = clip_line(app.palette.highlight_line(name_line), room);
@@ -182,16 +182,20 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let mut items = items;
-    let mut saved = Line::from(Span::styled("SAVED", Style::new().add_modifier(Modifier::BOLD)));
-    if app.saved_selected { saved = on_cursor(saved, focused, &app.palette); }
-    items.insert(0, ListItem::new(vec![saved, Line::from(Span::styled("─".repeat(width), dim))]));
+    for section in [crate::app::TopSection::Sent, crate::app::TopSection::Saved] {
+        let mut line = Line::from(Span::styled(section.label(), Style::new().add_modifier(Modifier::BOLD)));
+        if app.top_section == Some(section) { line = on_cursor(line, focused, &app.palette); }
+        let mut lines = vec![line];
+        if section == crate::app::TopSection::Sent { lines.push(Line::from(Span::styled("─".repeat(width), dim))); }
+        items.insert(0, ListItem::new(lines));
+    }
     let list = List::new(items).block(block);
     // The offset carries over from the last frame: rebuilt at zero, ratatui
     // would rescroll to the minimum that shows the cursor, pinning it to the
     // bottom row and moving the whole pane on every step upward.
     let mut state = ListState::default()
-        .with_offset(app.conv_offset.min(app.filtered.len()))
-        .with_selected(Some(if app.saved_selected || app.filtered.is_empty() { 0 } else { app.conv_cursor + 1 }));
+        .with_offset(app.conv_offset.min(app.filtered.len() + 1))
+        .with_selected(Some(app.top_section.map(crate::app::TopSection::row).unwrap_or(if app.filtered.is_empty() { 0 } else { app.conv_cursor + 2 })));
     frame.render_stateful_widget(list, area, &mut state);
     app.conv_offset = state.offset();
 }
@@ -305,7 +309,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         palette,
         ..
     } = app;
-    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. })) {
+    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Sent { .. })) {
         let hint = Line::from(Span::styled(
             "  select a conversation and press Enter",
             Style::new().add_modifier(Modifier::DIM),
@@ -321,7 +325,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         .find(|v| !matches!(v, View::Raw { .. }))
     {
         Some(View::Thread { list, live, .. }) => (list, live.as_deref().or(conv_archive)),
-        Some(View::Saved { list }) => (list, None),
+        Some(View::Saved { list }) | Some(View::Sent { list, .. }) => (list, None),
         Some(View::Search { list, .. }) | Some(View::Threads { list }) => (list, conv_archive),
         _ => { let Some(open) = open.as_mut() else { return }; (&mut open.list, conv_archive) },
     };

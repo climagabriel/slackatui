@@ -17,6 +17,7 @@ use crate::archive::Msg;
 use crate::auth;
 
 pub enum JobKind {
+    Sent { generation: u64, append: bool },
     Saved,
     MessageLink { raw_id: u64, link: crate::raw::Link },
     /// Resume one archive directory; `conv` is the conversation to reload.
@@ -97,6 +98,7 @@ impl JobKind {
         match self {
             Self::MessageLink {..} => "message_link",
             Self::Saved => "saved_messages",
+            Self::Sent { .. } => "sent_messages",
             Self::Refresh {..} => "refresh", Self::Thread {..} => "thread", Self::Search {..} => "search",
             Self::ArchiveNew {..} => "archive", Self::Auth => "auth", Self::Tail {..} => "tail",
             Self::Older {..} => "older", Self::Newer {..} => "newer", Self::Conversations => "conversations",
@@ -110,6 +112,7 @@ impl JobKind {
 }
 
 pub enum Done {
+    SentPage(crate::sent::Page),
     Saved(Vec<Msg>),
     Refreshed,
     Thread(PathBuf),
