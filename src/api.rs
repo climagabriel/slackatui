@@ -370,12 +370,12 @@ impl Client {
             .unwrap_or_default())
     }
 
-    /// The workspace's custom emoji names.
-    pub fn emoji_list(&self) -> Result<Vec<String>, String> {
+    /// The workspace's custom emoji image URLs and aliases.
+    pub fn emoji_list(&self) -> Result<crate::custom_emoji::Catalog, String> {
         let v = self.call("emoji.list", &[])?;
         Ok(v.get("emoji")
             .and_then(Value::as_object)
-            .map(|m| m.keys().cloned().collect())
+            .map(|m| m.iter().filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.to_string()))).collect())
             .unwrap_or_default())
     }
 

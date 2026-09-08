@@ -386,6 +386,11 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
     else {
         return;
     };
+    let selected_custom = matches.get(*cursor).and_then(|&index| app.emoji_table.get(index))
+        .filter(|(name, _)| crate::custom_emoji::url(&app.custom_emoji, name).is_some())
+        .map(|(name, _)| name.clone());
+    let preview = (app.picker.is_some() && selected_custom.is_some() && inner.width >= 56 && inner.height >= 10)
+        .then(|| Rect::new(inner.right() - 26, inner.y + 2, 24, inner.height.saturating_sub(2).min(12)));
     let mut lines: Vec<Line> = editor_lines(
         query,
         Span::styled(
@@ -393,7 +398,9 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
             Style::new().fg(app.palette.get(Role::Accent)),
         ),
     );
-    let rows = inner.height.saturating_sub(1) as usize;
+    let row_height = if app.picker.is_some() && !app.custom_emoji.is_empty() { 2 } else { 1 };
+    let rows = inner.height.saturating_sub(1) as usize / row_height;
+    let mut thumbnails = Vec::new();
     if matches.is_empty() {
         let q = query.text.trim().trim_matches(':');
         let hint = if q.is_empty() {
@@ -418,13 +425,40 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
             } else {
                 Style::new()
             };
+            let custom = app.picker.is_some() && app.custom_emoji.contains_key(name);
+            if custom {
+                thumbnails.push((name.clone(), lines.len() as u16));
+            }
             lines.push(Line::from(Span::styled(
-                format!("  {glyph:<4} {name}"),
+                if custom { format!("        {name}") } else { format!("  {glyph:<4} {name}") },
                 style,
             )));
+            if row_height == 2 { lines.push(Line::from("")); }
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    let list_area = if preview.is_some() { Rect { width: inner.width - 28, ..inner } } else { inner };
+    frame.render_widget(Paragraph::new(lines), list_area);
+    for (name, row) in thumbnails {
+        let area = Rect::new(inner.x + 2, inner.y + row, inner.width.saturating_sub(2).min(4), inner.height.saturating_sub(row).min(2));
+        if area.width == 0 || area.height == 0 { continue; }
+        let Some(key) = app.ensure_emoji(&name) else {
+            frame.render_widget(Paragraph::new("!"), area);
+            continue;
+        };
+        if let Some(protocol) = app.inline_protocol(&key, area.width, area.height) {
+            frame.render_widget(Image::new(protocol).allow_clipping(true), area);
+        } else {
+            let symbol = if matches!(app.images.get(&key), Some(ImageState::Failed(_))) { "!" } else { "…" };
+            frame.render_widget(Paragraph::new(symbol), area);
+        }
+    }
+    if let (Some(area), Some(name)) = (preview, selected_custom) {
+        if let Some(key) = app.ensure_emoji(&name) {
+            if let Some(protocol) = app.inline_protocol(&key, area.width, area.height) {
+                frame.render_widget(Image::new(protocol).allow_clipping(true), area);
+            }
+        }
+    }
 }
 
 /// The cursor's row uses the palette's active or inactive selection background,

@@ -106,6 +106,7 @@ pub enum Done {
     Usergroups(Vec<Value>, Option<String>),
     Counts(Value),
     File(PathBuf),
+    EmojiImage(image::DynamicImage),
     Marked,
     Sent(Box<Msg>),
     /// A file reached Slack; the name it went up under.
@@ -114,7 +115,7 @@ pub enum Done {
     Deleted,
     Reacted,
     Left,
-    EmojiList(Vec<String>),
+    EmojiList(crate::custom_emoji::Catalog),
     MutedChannels(Vec<String>),
 }
 
@@ -369,6 +370,19 @@ pub fn fetch_file(client: Arc<Client>, id: String, url: String, dest: PathBuf) -
         std::fs::write(&part, &bytes).map_err(|e| e.to_string())?;
         std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
         Ok(Done::File(dest))
+    })
+}
+
+pub fn fetch_emoji(id: String, url: String, dest: PathBuf) -> Job {
+    spawn(JobKind::File { id }, String::new(), move || {
+        let bytes = crate::custom_emoji::download(&url)?;
+        if let Some(directory) = dest.parent() {
+            std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+        }
+        let part = dest.with_extension(format!("{}.part", std::process::id()));
+        std::fs::write(&part, bytes).map_err(|e| e.to_string())?;
+        std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
+        Ok(Done::EmojiImage(crate::custom_emoji::decode(&dest)?))
     })
 }
 

@@ -6,6 +6,7 @@ mod archive;
 mod auth;
 mod clip;
 mod complete;
+mod custom_emoji;
 mod conversations_pane;
 mod edit;
 mod keys;

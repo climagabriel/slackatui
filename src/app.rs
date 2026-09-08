@@ -469,6 +469,9 @@ pub struct App {
     pub pending_delete: Option<PendingDelete>,
     /// (name, glyph) for the picker: Unicode emoji, then the workspace's custom ones as `:name:`.
     pub emoji_table: Vec<(String, String)>,
+    pub custom_emoji: crate::custom_emoji::Catalog,
+    emoji_job: Option<live::Job>,
+    emoji_pending: bool,
     /// Muted conversation ids: `<cache>/muted.json` plus the channels muted
     /// in Slack itself, fetched once per run.
     pub muted: HashSet<String>,
@@ -588,6 +591,9 @@ impl App {
             react: None,
             pending_delete: None,
             emoji_table: Vec::new(),
+            custom_emoji: Default::default(),
+            emoji_job: None,
+            emoji_pending: false,
             muted: HashSet::new(),
             muted_in_slack: HashSet::new(),
             muted_loaded: false,
@@ -1235,13 +1241,22 @@ impl App {
     }
 
     /// The workspace's custom emoji, cached for the next run.
-    fn take_emoji_list(&mut self, names: Vec<String>) {
-        if let Ok(t) = serde_json::to_string(&names) {
+    fn emoji_catalog_path(&self) -> PathBuf {
+        self.cache_dir.join(format!("{}-catalog.json", crate::custom_emoji::image_key(&self.pane_workspace)))
+    }
+
+    fn take_emoji_list(&mut self, catalog: crate::custom_emoji::Catalog) {
+        self.custom_emoji = catalog.clone();
+        if let Ok(t) = serde_json::to_string(&catalog) {
             let _ = std::fs::create_dir_all(&self.cache_dir);
-            let _ = std::fs::write(self.cache_dir.join("emoji.json"), t);
+            let path = self.emoji_catalog_path();
+            let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+            if std::fs::write(&temporary, t).is_ok() {
+                let _ = std::fs::rename(&temporary, &path);
+            }
         }
         if !self.emoji_table.is_empty() {
-            self.add_custom_emoji(names);
+            self.add_custom_emoji(catalog.keys().cloned().collect());
         }
     }
 
@@ -1426,6 +1441,7 @@ impl App {
     /// names from the cache file; the file is fetched once when missing.
     fn build_emoji_table(&mut self) {
         if !self.emoji_table.is_empty() {
+            if self.custom_emoji.is_empty() { self.emoji_pending = true; }
             return;
         }
         for e in emojis::iter() {
@@ -1434,18 +1450,19 @@ impl App {
                     .push((sc.to_string(), e.as_str().to_string()));
             }
         }
-        let path = self.cache_dir.join("emoji.json");
-        match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
-        {
-            Some(names) => self.add_custom_emoji(names),
-            None => {
-                if let (Some(c), true) = (self.api.clone(), self.bg.is_none()) {
-                    self.bg = Some(live::api_emoji_list(c));
-                }
+        let catalog = std::fs::read_to_string(self.emoji_catalog_path()).ok()
+            .and_then(|text| serde_json::from_str::<crate::custom_emoji::Catalog>(&text).ok());
+        if let Some(catalog) = catalog {
+            self.add_custom_emoji(catalog.keys().cloned().collect());
+            self.custom_emoji = catalog;
+        } else {
+            // Keep old name-only caches useful until the catalog arrives.
+            if let Some(names) = std::fs::read_to_string(self.cache_dir.join("emoji.json")).ok()
+                .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok()) {
+                self.add_custom_emoji(names);
             }
         }
+        self.emoji_pending = true;
     }
 
     fn add_custom_emoji(&mut self, names: Vec<String>) {
@@ -2789,22 +2806,44 @@ impl App {
         if self.file_job.is_some() {
             return;
         }
-        let Some(client) = self.api.clone() else {
-            return;
-        };
         let next = self.images.iter().find_map(|(k, s)| match s {
-            ImageState::Queued { url, dest } => Some((k.clone(), url.clone(), dest.clone())),
+            ImageState::Queued { url, dest } if k.starts_with("emoji-") || self.api.is_some() => Some((k.clone(), url.clone(), dest.clone())),
             _ => None,
         });
         if let Some((key, url, dest)) = next {
             self.images.insert(key.clone(), ImageState::Loading);
-            self.file_job = Some(live::fetch_file(client, key, url, dest));
+            self.file_job = Some(if key.starts_with("emoji-") {
+                live::fetch_emoji(key, url, dest)
+            } else {
+                live::fetch_file(self.api.clone().expect("file client"), key, url, dest)
+            });
         }
+    }
+
+    pub fn ensure_emoji(&mut self, name: &str) -> Option<String> {
+        let url = crate::custom_emoji::url(&self.custom_emoji, name)?.to_string();
+        let key = crate::custom_emoji::image_key(&url);
+        if !self.images.contains_key(&key) {
+            let dest = self.cache_dir.join("emoji-images").join(&key);
+            let state = if dest.is_file() {
+                match crate::custom_emoji::decode(&dest) {
+                    Ok(image) => ImageState::Ready(image),
+                    Err(error) => ImageState::Failed(error.to_string()),
+                }
+            } else if self.live {
+                ImageState::Queued { url, dest }
+            } else {
+                ImageState::Failed("not cached; offline".into())
+            };
+            self.images.insert(key.clone(), state);
+        }
+        Some(key)
     }
 
     /// The inline encoding of a thumbnail for a cell box, cached by size.
     pub fn inline_protocol(&mut self, id: &str, cols: u16, rows: u16) -> Option<&Protocol> {
-        let fresh = matches!(self.inline.get(id), Some((c, r, _)) if *c == cols && *r == rows);
+        let encoding_key = format!("{id}:{cols}x{rows}");
+        let fresh = matches!(self.inline.get(&encoding_key), Some((c, r, _)) if *c == cols && *r == rows);
         if !fresh {
             let picker = self.picker.as_ref()?;
             let img = match self.images.get(id) {
@@ -2815,9 +2854,9 @@ impl App {
             let proto = picker
                 .new_protocol(img.clone(), size, ratatui_image::Resize::Fit(None))
                 .ok()?;
-            self.inline.insert(id.to_string(), (cols, rows, proto));
+            self.inline.insert(encoding_key.clone(), (cols, rows, proto));
         }
-        self.inline.get(id).map(|(_, _, p)| p)
+        self.inline.get(&encoding_key).map(|(_, _, p)| p)
     }
 
     /// What a mark applies to: the highlighted conversation from the list,
@@ -3084,6 +3123,21 @@ impl App {
 
     /// Advance the spinner and collect a finished job.
     pub fn tick(&mut self) {
+        if let Some(outcome) = self.emoji_job.as_ref().and_then(|job| job.poll()) {
+            self.emoji_job = None;
+            match outcome {
+                Ok(Done::EmojiList(catalog)) => self.take_emoji_list(catalog),
+                Err(error) => self.status = format!("custom emoji: {error}"),
+                _ => {},
+            }
+        }
+        if self.emoji_pending && self.emoji_job.is_none() {
+            if let Some(client) = self.api.clone() {
+                self.emoji_pending = false;
+                self.emoji_job = Some(live::api_emoji_list(client));
+            }
+        }
+
         self.spinner = self.spinner.wrapping_add(1);
         if let Some(outcome) = self.group_job.as_ref().and_then(|j| j.poll()) {
             self.group_job = None;
@@ -3116,6 +3170,7 @@ impl App {
             let job = self.file_job.take().expect("polled");
             if let JobKind::File { id } = job.kind {
                 let state = match outcome {
+                    Ok(Done::EmojiImage(image)) => ImageState::Ready(image),
                     Ok(Done::File(path)) => match image::open(&path) {
                         Ok(img) => ImageState::Ready(img),
                         Err(e) => ImageState::Failed(format!("{e}")),
@@ -3285,6 +3340,7 @@ impl App {
             }
         };
         match (job.kind, done) {
+            (JobKind::EmojiList, Done::EmojiList(catalog)) => self.take_emoji_list(catalog),
             (JobKind::Refresh { conv, before }, Done::Refreshed) => {
                 self.refresh_conv_stats(conv);
                 self.open_conv(conv);
@@ -4741,6 +4797,63 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
+    }
+
+    #[test]
+    fn custom_emoji_cache_migrates_and_picker_renders_pixels() {
+        let directory = std::env::temp_dir().join(format!("slack-emoji-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("emoji.json"), r#"["custom-test"]"#).unwrap();
+        let mut app = App::new(Corpus::stub(&[]), Tz::Utc, 30.0, false, false, directory.clone(), PathBuf::new(), 60, None, None);
+        app.build_emoji_table();
+        assert!(app.emoji_pending);
+        assert!(app.emoji_table.iter().any(|(name, _)| name == "custom-test"));
+        let url = "https://emoji.slack-edge.com/workspace/custom.png";
+        let catalog = crate::custom_emoji::Catalog::from([
+            ("custom-test".into(), url.into()),
+            ("custom-alias".into(), "alias:custom-test".into()),
+        ]);
+        app.take_emoji_list(catalog.clone());
+        assert_eq!(serde_json::from_str::<crate::custom_emoji::Catalog>(&std::fs::read_to_string(app.emoji_catalog_path()).unwrap()).unwrap(), catalog);
+        let key = crate::custom_emoji::image_key(url);
+        std::fs::create_dir_all(directory.join("emoji-images")).unwrap();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(128, 128, image::Rgb([255, 0, 0])))
+            .save_with_format(directory.join("emoji-images").join(&key), image::ImageFormat::Png).unwrap();
+        assert_eq!(app.ensure_emoji("custom-alias"), Some(key.clone()));
+        assert!(matches!(app.images.get(&key), Some(ImageState::Ready(_))));
+        app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
+        app.open_conv(0);
+        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        app.stack.push(View::Emoji { target: ReactTarget { cid: "C1".into(), id: 1, label: "test".into() }, query: Editor::default(), cursor: 0, matches: vec![] });
+        if let Some(View::Emoji { query, .. }) = app.stack.last_mut() { query.text = "custom-alias".into(); }
+        app.emoji_filter();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(app.inline.contains_key(&format!("{key}:4x2")));
+        assert!(app.inline.contains_key(&format!("{key}:24x12")));
+        let red = |area: ratatui::layout::Rect, terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            area.rows().any(|row| row.columns().any(|cell| {
+                let pixel = &terminal.backend().buffer()[(cell.x, cell.y)];
+                pixel.fg == ratatui::style::Color::Rgb(255, 0, 0) || pixel.bg == ratatui::style::Color::Rgb(255, 0, 0)
+            }))
+        };
+        assert!(red(ratatui::layout::Rect::new(28, 2, 4, 2), &terminal));
+        assert!(red(ratatui::layout::Rect::new(73, 3, 24, 12), &terminal));
+        terminal.resize(ratatui::layout::Rect::new(0, 0, 50, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(red(ratatui::layout::Rect::new(25, 2, 4, 2), &terminal));
+        // --no-images keeps the name and never queues an image.
+        app.picker = None;
+        app.images.clear();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(app.images.is_empty());
+        let text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("custom-alias"));
+        // A second workspace gets a different catalog cache.
+        let first = app.emoji_catalog_path();
+        app.pane_workspace = "https://other.slack.com".into();
+        assert_ne!(first, app.emoji_catalog_path());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
