@@ -360,20 +360,6 @@ impl Client {
             .map(|_| ())
     }
 
-    /// Add or remove your reaction `name` on the message `ts` in `cid`.
-    pub fn react(&self, cid: &str, ts: &str, name: &str, add: bool) -> Result<(), String> {
-        let method = if add {
-            "reactions.add"
-        } else {
-            "reactions.remove"
-        };
-        self.call(
-            method,
-            &[("channel", cid), ("timestamp", ts), ("name", name)],
-        )
-        .map(|_| ())
-    }
-
     /// Leave a channel or group DM.
     pub fn leave(&self, cid: &str) -> Result<(), String> {
         self.call("conversations.leave", &[("channel", cid)])
@@ -421,15 +407,6 @@ impl Client {
 
     pub fn set_muted(&self, cid: &str, muted: bool) -> Result<Vec<String>, String> {
         update_mute(cid, muted, |method, params| self.call(method, params))
-    }
-
-    /// The workspace's custom emoji image URLs and aliases.
-    pub fn emoji_list(&self) -> Result<crate::custom_emoji::Catalog, String> {
-        let v = self.call("emoji.list", &[])?;
-        Ok(v.get("emoji")
-            .and_then(Value::as_object)
-            .map(|m| m.iter().filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.to_string()))).collect())
-            .unwrap_or_default())
     }
 
     /// Fetch at most ten new counts per poll; unchanged snapshots reuse counts.

@@ -1,5 +1,5 @@
 //! What a key does in the lists, and the file that says so. The editors that
-//! run inside a view — the color palette, the emoji picker, the image viewer,
+//! run inside a view — the color palette, reaction details, the image viewer,
 //! the prompts — keep their own fixed keys.
 
 use std::path::{Path, PathBuf};
@@ -70,7 +70,7 @@ impl Action {
             Action::UnreadsFirst => "unread conversations on top",
             Action::Compose => "write a message",
             Action::Delete => "delete your own message",
-            Action::React => "react to the message",
+            Action::React => "View reactions",
             Action::Images => "the message's images",
             Action::InlineImages => "inline thumbnails on/off",
             Action::MarkRead => "mark read",
@@ -490,6 +490,19 @@ mod tests {
             keymap.action(press(KeyCode::Char('g'), false)),
             Some(Action::First)
         );
+    }
+
+    #[test]
+    fn saved_react_binding_loads_as_view_reactions() {
+        let path = std::env::temp_dir().join(format!("slack-tui-reaction-keys-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"react":["f6"]}"#).unwrap();
+        let keymap = Keymap::load(Some(&path)).unwrap();
+        assert_eq!(keymap.action(press(KeyCode::F(6), false)), Some(Action::React));
+        assert_eq!(Action::React.label(), "View reactions");
+        keymap.save(Some(&path)).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["react"], serde_json::json!(["f6"]));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

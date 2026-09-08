@@ -9,7 +9,6 @@ mod archive;
 mod auth;
 mod clip;
 mod complete;
-mod custom_emoji;
 mod conversations_pane;
 mod edit;
 mod keys;
@@ -183,9 +182,11 @@ thread lands in the cache, the open conversation is re-checked every
 and `a` still archives a new conversation into the root. Writes to Slack:
 m and M move your own read marker; c composes a message, Ctrl-j and Alt-Enter
 break the line and Enter sends it; D deletes one of your own messages, the
-same key again confirming; e toggles your reaction on the selected message; /upload [path] sends a file
+same key again confirming; /upload [path] sends a file
 with the next message, and Ctrl-v in the compose prompt attaches the image on
 the clipboard (through wl-paste or xclip); /leave leaves a channel.
+e shows read-only reaction details from the selected message payload, including
+missing-user counts for partial lists; j/k scroll, h returns, Esc goes home.
 /cache start archives a conversation; /cache stop pauses its hourly refresh;
 /cache wipe deletes its archive; /cache highlight on|off colors the cached
 conversations in the list; /colorpalette vintage opens the editor over the
@@ -277,12 +278,10 @@ const READ_ONLY_CALL_METHODS: &[&str] = &[
     "conversations.members",
     "conversations.replies",
     "dnd.info",
-    "emoji.list",
     "files.info",
     "files.list",
     "pins.list",
     "quip.history.getVersions",
-    "reactions.get",
     "reminders.info",
     "reminders.list",
     "search.all",

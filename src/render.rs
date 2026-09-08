@@ -7,7 +7,7 @@ use chrono::{Datelike, Local, NaiveDate, TimeZone, Utc};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::archive::{Archive, Corpus, FileInfo, Msg};
 use crate::palette::{Palette, Role};
@@ -85,7 +85,6 @@ pub struct Ctx<'a> {
 #[derive(Clone, Debug)]
 pub enum ImageSource {
     File(FileInfo),
-    Emoji(String),
 }
 
 #[derive(Clone, Debug)]
@@ -298,25 +297,6 @@ pub fn plain(segs: &[Seg]) -> String {
     segs.iter().map(|s| s.text.as_str()).collect()
 }
 
-/// A Slack emoji as a character: the element's own code points when it
-/// carries them, else the shortcode table; a custom emoji stays `:name:`.
-pub fn emoji(name: &str, unicode: Option<&str>) -> String {
-    if let Some(u) = unicode.filter(|u| !u.is_empty()) {
-        let chars: Option<String> = u
-            .split('-')
-            .map(|h| u32::from_str_radix(h, 16).ok().and_then(char::from_u32))
-            .collect();
-        if let Some(s) = chars {
-            return s;
-        }
-    }
-    let bare = name.split("::").next().unwrap_or(name);
-    match emojis::get_by_shortcode(bare) {
-        Some(e) => e.as_str().to_string(),
-        None => format!(":{name}:"),
-    }
-}
-
 pub fn unescape(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -449,21 +429,13 @@ fn inline(cs: &[char], base: Sty, ctx: &Ctx, out: &mut Vec<Seg>) {
                 }
             }
             ':' => {
-                // `:name:` with a known shortcode becomes the character.
                 if let Some(end) = find_char(cs, i + 1, ':') {
-                    let name: String = cs[i + 1..end].iter().collect();
-                    let plausible = !name.is_empty()
-                        && name.len() <= 40
-                        && name
-                            .chars()
-                            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '+' | '-'));
-                    if plausible {
-                        if let Some(e) = emojis::get_by_shortcode(&name) {
-                            flush(&mut buf, base, out);
-                            out.push(Seg::new(e.as_str(), base));
-                            i = end + 1;
-                            continue;
-                        }
+                    let name = &cs[i + 1..end];
+                    if !name.is_empty() && name.iter().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '+' | '-')) {
+                        // Keep shortcode underscores out of emphasis parsing.
+                        buf.extend(&cs[i..=end]);
+                        i = end + 1;
+                        continue;
                     }
                 }
             }
@@ -796,7 +768,7 @@ fn section(el: &Value, ctx: &Ctx, base: Sty, out: &mut Vec<Seg>) {
                 mention,
             )),
             "emoji" => out.push(Seg::new(
-                emoji(s("name"), e.get("unicode").and_then(Value::as_str)),
+                format!(":{}:", s("name")),
                 base,
             )),
             "broadcast" => out.push(Seg::new(format!("@{}", s("range")), mention)),
@@ -1258,28 +1230,22 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
     }
     let reactions = m.reactions();
     if !reactions.is_empty() {
-        let mut text_reactions = Vec::new();
-        for (name, count) in reactions {
-            let glyph = emoji(&name, None);
-            if ctx.image_font.is_some() && glyph.starts_with(':') && width >= 10 {
-                if !text_reactions.is_empty() {
-                    lines.push(Line::from(Span::styled(format!("  {}", text_reactions.join("   ")), dim)));
-                    text_reactions.clear();
-                }
-                images.push(ImageSlot {
-                    source: ImageSource::Emoji(name.clone()),
-                    line: lines.len(), cols: 4, rows: 2,
-                });
-                // Count and name remain visible during downloads and on failure.
-                lines.push(Line::from(Span::styled(format!("      {count} :{name}:"), dim)));
-                lines.push(Line::from(""));
-            } else {
-                text_reactions.push(format!("{glyph} {count}"));
+        let text = reactions.iter().map(|(name, count)| format!(":{name}: {count}"))
+            .collect::<Vec<_>>().join("   ");
+        let available = width.saturating_sub(2).max(1);
+        let mut row = String::new();
+        let mut columns = 0;
+        for character in text.chars() {
+            let character_width = character.width().unwrap_or(0);
+            if columns + character_width > available && !row.is_empty() {
+                lines.push(Line::from(Span::styled(format!("  {row}"), dim)));
+                row.clear();
+                columns = 0;
             }
+            row.push(character);
+            columns += character_width;
         }
-        if !text_reactions.is_empty() {
-            lines.push(Line::from(Span::styled(format!("  {}", text_reactions.join("   ")), dim)));
-        }
+        if !row.is_empty() { lines.push(Line::from(Span::styled(format!("  {row}"), dim))); }
     }
     if !in_thread && m.has_thread() {
         let last = m
@@ -1424,6 +1390,55 @@ mod tests {
 
     fn text(segs: &[Seg]) -> String {
         plain(segs)
+    }
+
+    #[test]
+    fn shortcodes_rich_text_and_reaction_footers_stay_text_only() {
+        let archive = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let mut context = ctx(&archive, &corpus);
+        let literal = ":eyes: :custom_emoji: :_custom_: :skin-tone-2: 👀";
+        assert_eq!(plain(&mrkdwn(literal, &context, Sty::default())), literal);
+        let mut segments = Vec::new();
+        rich_element(&serde_json::json!({"type":"rich_text_section", "elements":[
+            {"type":"emoji", "name":"eyes", "unicode":"1f440"},
+            {"type":"emoji", "name":"custom_emoji"}
+        ]}), &context, Sty::default(), &mut segments);
+        assert_eq!(plain(&segments), ":eyes::custom_emoji:\n");
+        let message = Msg::from_api("C1".into(), serde_json::json!({
+            "ts":"1.000000", "text":literal,
+            "reactions":[{"name":"eyes", "count":2}, {"name":"custom_emoji", "count":3}]
+        })).unwrap();
+        for image_font in [None, Some((8, 16))] {
+            context.image_font = image_font;
+            for thread in [false, true] {
+                let rendered = message_lines(&message, &context, 120, thread);
+                assert!(rendered.images.is_empty());
+                assert!(rendered.lines.iter().any(|line| line_text(line).contains(":eyes: 2   :custom_emoji: 3")));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_reaction_footers_preserve_every_name_and_count() {
+        let archive = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let context = ctx(&archive, &corpus);
+        let reactions = serde_json::json!([
+            {"name":"a_very_long_custom_reaction_name", "count":12},
+            {"name":"eyes", "count":3}, {"name":"final_reaction", "count":4}]);
+        let with = Msg::from_api("C1".into(),serde_json::json!({"ts":"1.000000", "text":"body", "reactions":reactions})).unwrap();
+        let mut without = with.clone();
+        without.data.as_object_mut().unwrap().remove("reactions");
+        for width in [12,20,40] {
+            let baseline = message_lines(&without,&context,width,true).lines.len();
+            let rendered = message_lines(&with,&context,width,true);
+            let footer = &rendered.lines[baseline..];
+            assert!(footer.len()>1);
+            assert!(footer.iter().all(|line| line.width()<=width));
+            let rebuilt = footer.iter().map(|line| line_text(line).strip_prefix("  ").unwrap().to_string()).collect::<String>();
+            assert_eq!(rebuilt,":a_very_long_custom_reaction_name: 12   :eyes: 3   :final_reaction: 4");
+        }
     }
 
     #[test]

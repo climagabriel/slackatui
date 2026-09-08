@@ -269,7 +269,7 @@ pub fn state(app: &App) -> Value {
             View::Search { .. } => json!({"view":"search"}),
             View::Threads { .. } => json!({"view":"threads"}),
             View::Raw { scroll, .. } => json!({"view":"raw","scroll":scroll}),
-            View::Emoji { cursor, .. } => json!({"view":"emoji","cursor":cursor}),
+            View::Reactions { scroll, .. } => json!({"view":"reactions","scroll":scroll}),
             View::ColorPalette { cursor, .. } => json!({"view":"palette","cursor":cursor}),
             View::Keys { cursor, .. } => json!({"view":"keys","cursor":cursor}),
             View::Image { index, zoom, .. } => json!({"view":"image","index":index,"zoom":zoom}),

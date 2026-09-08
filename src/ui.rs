@@ -236,7 +236,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         Some(
             View::Raw { .. }
                 | View::Image { .. }
-                | View::Emoji { .. }
+                | View::Reactions { .. }
                 | View::Keys { .. }
                 | View::ColorPalette { .. }
         )
@@ -264,12 +264,14 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         draw_color_palette(frame, app, inner);
         return;
     }
-    if let Some(View::Emoji { .. }) = app.stack.last() {
-        draw_emoji_picker(frame, app, inner);
-        return;
-    }
     if let Some(View::Image { .. }) = app.stack.last() {
         draw_image_view(frame, app, inner);
+        return;
+    }
+    if let Some(View::Reactions { lines, scroll, .. }) = app.stack.last() {
+        let shown: Vec<Line> = lines.iter().skip(*scroll).take(inner.height as usize)
+            .map(|line| Line::raw(line.clone())).collect();
+        frame.render_widget(Paragraph::new(shown), inner);
         return;
     }
     if let Some(View::Raw { lines, scroll, .. }) = app.stack.last() {
@@ -288,7 +290,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         app.stack.iter().rev().find(|v| {
             !matches!(
                 v,
-                View::Raw { .. } | View::Image { .. } | View::Emoji { .. }
+                View::Raw { .. } | View::Image { .. } | View::Reactions { .. }
             )
         }),
         app.open.as_ref(),
@@ -373,22 +375,20 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(Text::from(shown)), inner);
     // Inline images: one rect per slot whose first row is on screen.
-    let slots: Vec<(u16, crate::render::ImageSlot, String, bool)> = list
+    let slots: Vec<(u16, crate::render::ImageSlot, bool)> = list
         .flat
         .iter()
         .enumerate()
         .skip(list.scroll)
         .take(end - list.scroll)
-        .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s, fl.line.to_string(), fl.msg == Some(cursor))))
+        .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s, fl.msg == Some(cursor))))
         .collect();
-    for (row, slot, fallback, selected) in slots {
-        let emoji = matches!(slot.source, render::ImageSource::Emoji(_));
+    for (row, slot, selected) in slots {
         let key = match &slot.source {
             render::ImageSource::File(file) => {
                 app.ensure_image(file, false);
                 Some(file.id.clone())
             }
-            render::ImageSource::Emoji(name) => app.ensure_emoji(name),
         };
         let x = inner.x + 3;
         let y = inner.y + row;
@@ -405,10 +405,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         let note = match key.as_ref().and_then(|key| app.images.get(key)) {
             Some(ImageState::Ready(_)) => None,
-            Some(ImageState::Failed(_)) if emoji => Some("!".into()),
             Some(ImageState::Failed(e)) => Some(format!("(image: {e})")),
-            None if emoji && !app.emoji_catalog_loading() => Some("!".into()),
-            _ if emoji => Some("…".into()),
             Some(_) => Some("(loading image)".to_string()),
             None => Some("(image)".to_string()),
         };
@@ -419,15 +416,6 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
             None => {
                 if let Some(proto) = app.message_protocol(key.as_deref().expect("ready image key"), slot.cols, slot.rows, !selected) {
-                    if let render::ImageSource::Emoji(name) = &slot.source {
-                        if let Some(count) = fallback.strip_suffix(&format!(" :{name}:")) {
-                            // Keep the count; the shortcode is only a fallback.
-                            let start = (inner.x + 1).saturating_add(count.width() as u16);
-                            for column in start..inner.right() {
-                                frame.buffer_mut()[(column, y)].set_symbol(" ");
-                            }
-                        }
-                    }
                     frame.render_widget(Image::new(proto).allow_clipping(true), area);
                 }
             }
@@ -440,94 +428,6 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
                 for x in [inner.x, inner.right() - 1] {
                     frame.buffer_mut()[(x, inner.y + row)].set_symbol("│").set_style(outline);
                 }
-            }
-        }
-    }
-}
-
-/// The full-pane viewer: the original file, fitted to the pane.
-/// The reaction picker: the query on the first row, matches below it, the
-/// cursor row selected. With no match, Enter sends the query as typed.
-fn draw_emoji_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
-    let Some(View::Emoji {
-        target,
-        query,
-        cursor,
-        matches,
-    }) = app.stack.last()
-    else {
-        return;
-    };
-    let selected_custom = matches.get(*cursor).and_then(|&index| app.emoji_table.get(index))
-        .filter(|(name, _)| crate::custom_emoji::url(&app.custom_emoji, name).is_some())
-        .map(|(name, _)| name.clone());
-    let preview = (app.picker.is_some() && selected_custom.is_some() && inner.width >= 56 && inner.height >= 10)
-        .then(|| Rect::new(inner.right() - 26, inner.y + 2, 24, inner.height.saturating_sub(2).min(12)));
-    let mut lines: Vec<Line> = editor_lines(
-        query,
-        Span::styled(
-            format!(" {} with: ", target.label),
-            Style::new().fg(app.palette.get(Role::Accent)),
-        ),
-    );
-    let row_height = if app.picker.is_some() && !app.custom_emoji.is_empty() { 2 } else { 1 };
-    let rows = inner.height.saturating_sub(1) as usize / row_height;
-    let mut thumbnails = Vec::new();
-    if matches.is_empty() {
-        let q = query.text.trim().trim_matches(':');
-        let hint = if q.is_empty() {
-            "  type to search; Enter sends the name as typed".to_string()
-        } else {
-            format!("  no match; Enter sends :{q}: as typed")
-        };
-        lines.push(Line::from(Span::styled(
-            hint,
-            Style::new().add_modifier(Modifier::DIM),
-        )));
-    } else {
-        let first = cursor
-            .saturating_sub(rows / 2)
-            .min(matches.len().saturating_sub(rows));
-        for (k, &i) in matches.iter().enumerate().skip(first).take(rows) {
-            let (name, glyph) = &app.emoji_table[i];
-            let style = if k == *cursor {
-                Style::new()
-                    .bg(app.palette.get(Role::SelectionBackground))
-                    .fg(app.palette.get(Role::SelectionText))
-            } else {
-                Style::new()
-            };
-            let custom = app.picker.is_some() && app.custom_emoji.contains_key(name);
-            if custom {
-                thumbnails.push((name.clone(), lines.len() as u16));
-            }
-            lines.push(Line::from(Span::styled(
-                if custom { format!("        {name}") } else { format!("  {glyph:<4} {name}") },
-                style,
-            )));
-            if row_height == 2 { lines.push(Line::from("")); }
-        }
-    }
-    let list_area = if preview.is_some() { Rect { width: inner.width - 28, ..inner } } else { inner };
-    frame.render_widget(Paragraph::new(lines), list_area);
-    for (name, row) in thumbnails {
-        let area = Rect::new(inner.x + 2, inner.y + row, inner.width.saturating_sub(2).min(4), inner.height.saturating_sub(row).min(2));
-        if area.width == 0 || area.height == 0 { continue; }
-        let Some(key) = app.ensure_emoji(&name) else {
-            frame.render_widget(Paragraph::new("!"), area);
-            continue;
-        };
-        if let Some(protocol) = app.inline_protocol(&key, area.width, area.height) {
-            frame.render_widget(Image::new(protocol).allow_clipping(true), area);
-        } else {
-            let symbol = if matches!(app.images.get(&key), Some(ImageState::Failed(_))) { "!" } else { "…" };
-            frame.render_widget(Paragraph::new(symbol), area);
-        }
-    }
-    if let (Some(area), Some(name)) = (preview, selected_custom) {
-        if let Some(key) = app.ensure_emoji(&name) {
-            if let Some(protocol) = app.inline_protocol(&key, area.width, area.height) {
-                frame.render_widget(Image::new(protocol).allow_clipping(true), area);
             }
         }
     }
@@ -1019,7 +919,7 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(
         Action::React,
-        "react to the selected message: a picker opens; type to search, Up/Down or Ctrl-n/Ctrl-p to move, Enter reacts (the name as typed when nothing matches); your own reaction again removes it",
+        "view reactions on the selected message: cached counts and known users; partial lists show missing counts; j/k scroll, h back, Esc home",
     ),
     HelpRow::Bound(
         Action::MarkRead,
@@ -1322,16 +1222,12 @@ mod message_focus_tests {
     }
 
     #[test]
-    fn focus_box_and_grayscale_follow_cursor_for_text_files_and_custom_reactions() {
+    fn focus_box_and_grayscale_follow_cursor_for_text_and_files() {
         let mut app = mute_test_app();
         app.open_conv(0);
         app.picker = Some(ratatui_image::picker::Picker::halfblocks());
         app.inline_images = true;
-        let url = "https://emoji.slack-edge.com/test/focus.png";
-        app.custom_emoji.insert("focus-test".into(), url.into());
-        let emoji_key = crate::custom_emoji::image_key(url);
         let pixels = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(128, 128, image::Rgba([255, 0, 0, 255])));
-        app.images.insert(emoji_key, ImageState::Ready(pixels.clone()));
         app.images.insert("F1".into(), ImageState::Ready(pixels));
         let messages: Vec<Msg> = [1, 2].into_iter().map(|second| Msg::from_api("C1".into(), json!({
             "ts": format!("{second}.000000"), "user": "U1", "text": "nginx colored text",

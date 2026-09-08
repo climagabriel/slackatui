@@ -349,13 +349,6 @@ pub struct PendingDelete {
     pub id: i64,
 }
 
-/// The message `e` reacts to.
-pub struct ReactTarget {
-    pub cid: String,
-    pub id: i64,
-    pub label: String,
-}
-
 /// Where `c` sends: a conversation, and a thread in it when replying.
 pub struct Compose {
     pub conv: usize,
@@ -397,16 +390,9 @@ pub enum View {
         lines: Vec<String>,
         scroll: usize,
     },
+    Reactions { title: String, lines: Vec<String>, scroll: usize },
     /// Roots of the threads the owner wrote in, across every archive.
     Threads { list: MsgList },
-    /// The reaction picker: a searchable emoji list over the messages pane.
-    Emoji {
-        target: ReactTarget,
-        query: Editor,
-        cursor: usize,
-        /// Indices into the emoji table that match the query.
-        matches: Vec<usize>,
-    },
     /// `/colorpalette`: edit semantic UI colors with a live preview.
     ColorPalette {
         highlights: Option<crate::word_highlights::Menu>,
@@ -535,15 +521,8 @@ pub struct App {
     /// What an upload left to fetch: the conversation, and the thread when
     /// the file went into one.
     tail_pending: Option<(usize, Option<i64>)>,
-    /// The target of a reaction being sent.
-    pub react: Option<ReactTarget>,
     /// A delete waiting for its second key press.
     pub pending_delete: Option<PendingDelete>,
-    /// (name, glyph) for the picker: Unicode emoji, then the workspace's custom ones as `:name:`.
-    pub emoji_table: Vec<(String, String)>,
-    pub custom_emoji: crate::custom_emoji::Catalog,
-    emoji_job: Option<live::Job>,
-    emoji_pending: bool,
     /// The last confirmed server snapshot; old local overrides are no longer read.
     pub muted: HashSet<String>,
     pub starred: HashSet<String>,
@@ -663,12 +642,7 @@ impl App {
             attachment: None,
             attach_note: None,
             tail_pending: None,
-            react: None,
             pending_delete: None,
-            emoji_table: Vec::new(),
-            custom_emoji: Default::default(),
-            emoji_job: None,
-            emoji_pending: false,
             muted: HashSet::new(),
             starred: HashSet::new(),
             starred_generation: 0,
@@ -750,7 +724,7 @@ impl App {
             }
             Some(View::Raw { .. })
             | Some(View::Image { .. })
-            | Some(View::Emoji { .. })
+            | Some(View::Reactions { .. })
             | Some(View::ColorPalette { .. })
             | Some(View::Keys { .. }) => Err("close this view first".to_string()),
             None => {
@@ -1344,26 +1318,6 @@ impl App {
         self.mark_all_dirty();
     }
 
-    /// The workspace's custom emoji, cached for the next run.
-    fn emoji_catalog_path(&self) -> PathBuf {
-        self.cache_dir.join(format!("{}-catalog.json", crate::custom_emoji::image_key(&self.pane_workspace)))
-    }
-
-    fn take_emoji_list(&mut self, catalog: crate::custom_emoji::Catalog) {
-        self.custom_emoji = catalog.clone();
-        if let Ok(t) = serde_json::to_string(&catalog) {
-            let _ = std::fs::create_dir_all(&self.cache_dir);
-            let path = self.emoji_catalog_path();
-            let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-            if std::fs::write(&temporary, t).is_ok() {
-                let _ = std::fs::rename(&temporary, &path);
-            }
-        }
-        if !self.emoji_table.is_empty() {
-            self.add_custom_emoji(catalog.keys().cloned().collect());
-        }
-    }
-
     fn sync_muted(&mut self) {
         for c in self.corpus.convs.iter_mut() {
             c.muted = self.muted.contains(&c.id);
@@ -1448,24 +1402,6 @@ impl App {
         }
     }
 
-    /// Every message list on screen: the open timeline and the stacked views.
-    fn lists_mut(&mut self) -> Vec<&mut MsgList> {
-        let mut out: Vec<&mut MsgList> = Vec::new();
-        if let Some(o) = self.open.as_mut() {
-            out.push(&mut o.list);
-        }
-        for v in self.stack.iter_mut() {
-            match v {
-                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } => {
-                    out.push(list)
-                }
-                _ => {}
-            }
-        }
-        out
-    }
-
-    /// `e`: the reaction picker for the selected message.
     /// `D`: arm a delete of the selected message, or carry out the one
     /// already armed. Slack only lets the author withdraw a message, so a
     /// message written by someone else is refused before the round trip.
@@ -1540,184 +1476,27 @@ impl App {
         }
     }
 
-    fn react(&mut self) {
-        if self.api.is_none() {
-            self.status = "reacting needs the Slack sign-in".to_string();
-            return;
-        }
-        let Some(m) = self.selected() else {
-            self.status = "no message selected".to_string();
+    fn view_reactions(&mut self) {
+        let Some(message) = self.selected() else {
+            self.status = "no message selected".into();
             return;
         };
-        let who = m
-            .user
-            .as_deref()
-            .and_then(|u| self.corpus.user_name(u))
-            .unwrap_or_else(|| "?".to_string());
-        let target = ReactTarget {
-            cid: m.channel_id.clone(),
-            id: m.id,
-            label: format!("react to {who}'s message"),
+        let conversation = self.corpus.conv_by_channel(&message.channel_id)
+            .map(|index| &self.corpus.convs[index]);
+        let archive = match self.stack.last() {
+            Some(View::Thread { live: Some(archive), .. }) => Some(archive.as_ref()),
+            _ => conversation.and_then(|conv| self.corpus.conv_archive(conv)),
         };
-        self.build_emoji_table();
-        let matches = (0..self.emoji_table.len()).collect();
-        self.stack.push(View::Emoji {
-            target,
-            query: Editor::default(),
-            cursor: 0,
-            matches,
-        });
-    }
-
-    /// Unicode emoji from the `emojis` crate, then the workspace's custom
-    /// names from the cache file; the file is fetched once when missing.
-    fn build_emoji_table(&mut self) {
-        if !self.emoji_table.is_empty() {
-            if self.custom_emoji.is_empty() { self.emoji_pending = true; }
-            return;
-        }
-        for e in emojis::iter() {
-            if let Some(sc) = e.shortcode() {
-                self.emoji_table
-                    .push((sc.to_string(), e.as_str().to_string()));
-            }
-        }
-        let catalog = std::fs::read_to_string(self.emoji_catalog_path()).ok()
-            .and_then(|text| serde_json::from_str::<crate::custom_emoji::Catalog>(&text).ok());
-        if let Some(catalog) = catalog {
-            self.add_custom_emoji(catalog.keys().cloned().collect());
-            self.custom_emoji = catalog;
-        } else {
-            // Keep old name-only caches useful until the catalog arrives.
-            if let Some(names) = std::fs::read_to_string(self.cache_dir.join("emoji.json")).ok()
-                .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok()) {
-                self.add_custom_emoji(names);
-            }
-        }
-        self.emoji_pending = true;
-    }
-
-    fn add_custom_emoji(&mut self, names: Vec<String>) {
-        let known: HashSet<String> = self.emoji_table.iter().map(|(n, _)| n.clone()).collect();
-        let mut names: Vec<String> = names.into_iter().filter(|n| !known.contains(n)).collect();
-        names.sort();
-        for n in names {
-            let glyph = format!(":{n}:");
-            self.emoji_table.push((n, glyph));
-        }
-        self.emoji_filter();
-    }
-
-    /// The picker's matches for its query: names starting with it first,
-    /// then names containing it, table order within each group.
-    fn emoji_filter(&mut self) {
-        let table = &self.emoji_table;
-        let Some(View::Emoji {
-            query,
-            cursor,
-            matches,
-            ..
-        }) = self.stack.last_mut()
-        else {
-            return;
-        };
-        let q = query.text.trim().trim_matches(':').to_lowercase();
-        if q.is_empty() {
-            *matches = (0..table.len()).collect();
-        } else {
-            let mut starts = Vec::new();
-            let mut contains = Vec::new();
-            for (i, (name, _)) in table.iter().enumerate() {
-                if name.starts_with(&q) {
-                    starts.push(i);
-                } else if name.contains(&q) {
-                    contains.push(i);
-                }
-            }
-            starts.extend(contains);
-            *matches = starts;
-        }
-        *cursor = 0;
-    }
-
-    fn on_emoji_key(&mut self, k: KeyEvent, ctrl: bool) {
-        let table_len = self.emoji_table.len();
-        let Some(View::Emoji {
-            query,
-            cursor,
-            matches,
-            ..
-        }) = self.stack.last_mut()
-        else {
-            return;
-        };
-        match (k.code, ctrl) {
-            (KeyCode::Char('c'), true) => self.quit = true,
-            (KeyCode::Esc, _) => {
-                self.stack.pop();
-            }
-            (KeyCode::Enter, _) => {
-                let picked_index = matches.get(*cursor).copied().filter(|&i| i < table_len);
-                let typed = query.text.trim().trim_matches(':').to_string();
-                let Some(View::Emoji { target, .. }) = self.stack.pop() else {
-                    return;
-                };
-                let picked = match picked_index {
-                    Some(i) => self.emoji_table[i].0.clone(),
-                    None => typed,
-                };
-                if picked.is_empty() {
-                    self.status = "no reaction picked".to_string();
-                    return;
-                }
-                self.react = Some(target);
-                self.send_reaction(&picked);
-            }
-            (KeyCode::Up, _) | (KeyCode::Char('p'), true) => {
-                *cursor = cursor.saturating_sub(1);
-            }
-            (KeyCode::Down, _) | (KeyCode::Char('n'), true) => {
-                if *cursor + 1 < matches.len() {
-                    *cursor += 1;
-                }
-            }
-            (KeyCode::PageUp, _) => *cursor = cursor.saturating_sub(10),
-            (KeyCode::PageDown, _) => *cursor = (*cursor + 10).min(matches.len().saturating_sub(1)),
-            _ => {
-                if query.key(k, false) {
-                    self.emoji_filter();
-                }
-            }
-        }
-    }
-
-    /// Enter in the reaction prompt: add the reaction, or remove it when it
-    /// is already yours.
-    fn send_reaction(&mut self, text: &str) {
-        let Some(t) = self.react.take() else {
-            return;
-        };
-        let Some(name) = reaction_name(text) else {
-            self.status = "no reaction name".to_string();
-            return;
-        };
-        let Some(c) = self.api.clone() else {
-            self.status = "reacting needs the Slack sign-in".to_string();
-            return;
-        };
-        if self.job.is_some() {
-            self.status = "a fetch is already running; press e again in a moment".to_string();
-            return;
-        }
-        let me = self.corpus.me.clone().unwrap_or_default();
-        let mine = self
-            .lists_mut()
-            .iter()
-            .flat_map(|l| l.msgs.iter())
-            .find(|m| m.id == t.id)
-            .map(|m| has_reaction(&m.data, &name, &me))
-            .unwrap_or(false);
-        self.job = Some(live::api_react(c, t.cid, t.id, name, !mine));
+        let context = Ctx { archive, corpus: &self.corpus, tz: self.tz,
+            image_font: None, last_read: None, palette: &self.palette };
+        let channel = conversation.map(|conv| conv.name.clone())
+            .or_else(|| message.channel_name.as_ref().map(|name| format!("#{}", name.trim_start_matches('#'))))
+            .unwrap_or_else(|| message.channel_id.clone());
+        let title = format!("{channel} · Reactions · {} {} · {}",
+            self.tz.fmt(message.id / 1_000_000, "%Y-%m-%d %H:%M:%S"), self.tz.label(), context.author(message));
+        let lines = reaction_details(message, &context);
+        self.pending_delete = None;
+        self.stack.push(View::Reactions { title, lines, scroll: 0 });
     }
 
     /// `/upload [path]`: hold a file for the next send and open the compose
@@ -3039,44 +2818,13 @@ impl App {
             return;
         }
         let next = self.images.iter().find_map(|(k, s)| match s {
-            ImageState::Queued { url, dest } if k.starts_with("emoji-") || self.api.is_some() => Some((k.clone(), url.clone(), dest.clone())),
+            ImageState::Queued { url, dest } if self.api.is_some() => Some((k.clone(), url.clone(), dest.clone())),
             _ => None,
         });
         if let Some((key, url, dest)) = next {
             self.images.insert(key.clone(), ImageState::Loading);
-            self.file_job = Some(if key.starts_with("emoji-") {
-                live::fetch_emoji(key, url, dest)
-            } else {
-                live::fetch_file(self.api.clone().expect("file client"), key, url, dest)
-            });
+            self.file_job = Some(live::fetch_file(self.api.clone().expect("file client"), key, url, dest));
         }
-    }
-
-    pub fn emoji_catalog_loading(&self) -> bool {
-        (self.emoji_pending && self.live) || self.emoji_job.is_some()
-    }
-
-    pub fn ensure_emoji(&mut self, name: &str) -> Option<String> {
-        if self.emoji_table.is_empty() {
-            self.build_emoji_table();
-        }
-        let url = crate::custom_emoji::url(&self.custom_emoji, name)?.to_string();
-        let key = crate::custom_emoji::image_key(&url);
-        if !self.images.contains_key(&key) {
-            let dest = self.cache_dir.join("emoji-images").join(&key);
-            let state = if dest.is_file() {
-                match crate::custom_emoji::decode(&dest) {
-                    Ok(image) => ImageState::Ready(image),
-                    Err(error) => ImageState::Failed(error.to_string()),
-                }
-            } else if self.live {
-                ImageState::Queued { url, dest }
-            } else {
-                ImageState::Failed("not cached; offline".into())
-            };
-            self.images.insert(key.clone(), state);
-        }
-        Some(key)
     }
 
     /// The inline encoding of a thumbnail for a cell box, cached by size.
@@ -3401,21 +3149,6 @@ impl App {
         if let Some(location) = self.channel_browser.as_mut().filter(|browser| browser.visible).and_then(|browser| browser.message.take()) {
             self.open_file_message(location);
         }
-        if let Some(outcome) = self.emoji_job.as_ref().and_then(|job| job.poll()) {
-            self.emoji_job = None;
-            match outcome {
-                Ok(Done::EmojiList(catalog)) => self.take_emoji_list(catalog),
-                Err(error) => self.status = format!("custom emoji: {error}"),
-                _ => {},
-            }
-        }
-        if self.emoji_pending && self.emoji_job.is_none() {
-            if let Some(client) = self.api.clone() {
-                self.emoji_pending = false;
-                self.emoji_job = Some(live::api_emoji_list(client));
-            }
-        }
-
         self.spinner = self.spinner.wrapping_add(1);
         if let Some(outcome) = self.group_job.as_ref().and_then(|j| j.poll()) {
             self.group_job = None;
@@ -3448,7 +3181,6 @@ impl App {
             let job = self.file_job.take().expect("polled");
             if let JobKind::File { id } = job.kind {
                 let state = match outcome {
-                    Ok(Done::EmojiImage(image)) => ImageState::Ready(image),
                     Ok(Done::File(path)) => match image::open(&path) {
                         Ok(img) => ImageState::Ready(img),
                         Err(e) => ImageState::Failed(format!("{e}")),
@@ -3520,7 +3252,6 @@ impl App {
                         self.extend_thread(msgs, root);
                     }
                 }
-                Ok(Done::EmojiList(names)) => self.take_emoji_list(names),
                 Ok(Done::Messages(msgs)) => {
                     if let JobKind::Tail { conv } = job.kind {
                         self.append_tail(conv, msgs, true);
@@ -3668,7 +3399,6 @@ impl App {
             (JobKind::MutedChannels { gen }, Done::MutedChannels(ids)) => {
                 self.take_muted_snapshot(gen, ids)
             }
-            (JobKind::EmojiList, Done::EmojiList(catalog)) => self.take_emoji_list(catalog),
             (JobKind::Refresh { conv, before }, Done::Refreshed) => {
                 self.refresh_conv_stats(conv);
                 if job.navigate_on_completion { self.open_conv(conv); }
@@ -3785,24 +3515,6 @@ impl App {
                 self.mark_all_dirty();
                 self.status = format!("left {name}");
             }
-            (JobKind::React { id, name, add }, Done::Reacted) => {
-                let me = self.corpus.me.clone().unwrap_or_default();
-                let mut touched = 0;
-                for list in self.lists_mut() {
-                    for m in list.msgs.iter_mut().filter(|m| m.id == id) {
-                        patch_reaction(&mut m.data, &name, &me, add);
-                        touched += 1;
-                    }
-                    if touched > 0 {
-                        list.mark_dirty();
-                    }
-                }
-                self.status = if add {
-                    format!("reacted :{name}:")
-                } else {
-                    format!("reaction :{name}: removed")
-                };
-            }
             _ => {}
         }
     }
@@ -3853,7 +3565,7 @@ impl App {
                 v,
                 View::Raw { .. }
                     | View::Image { .. }
-                    | View::Emoji { .. }
+                    | View::Reactions { .. }
                     | View::ColorPalette { .. }
             )
         }) {
@@ -3870,7 +3582,7 @@ impl App {
                 v,
                 View::Raw { .. }
                     | View::Image { .. }
-                    | View::Emoji { .. }
+                    | View::Reactions { .. }
                     | View::ColorPalette { .. }
             )
         }) {
@@ -3914,6 +3626,7 @@ impl App {
                 unreachable!("handled before opening a conversation")
             }
             Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
+            Some(View::Reactions { title, .. }) => title.clone(),
             Some(View::Image {
                 files, index, zoom, ..
             }) => {
@@ -3929,13 +3642,6 @@ impl App {
                         .as_ref()
                         .map(|p| format!("{:?}", p.protocol_type()).to_lowercase())
                         .unwrap_or_default()
-                )
-            }
-            Some(View::Emoji { matches, .. }) => {
-                format!(
-                    "pick a reaction · {} matching · {}",
-                    matches.len(),
-                    conv.name
                 )
             }
             Some(View::Threads { list }) => format!(
@@ -4126,8 +3832,9 @@ impl App {
             self.on_palette_key(k, ctrl);
             return;
         }
-        if let Some(View::Emoji { .. }) = self.stack.last() {
-            self.on_emoji_key(k, ctrl);
+        if matches!(self.stack.last(), Some(View::Reactions { .. }))
+            && !matches!(self.keymap.action(k), Some(Action::Quit | Action::Help)) {
+            self.on_raw_key(k, ctrl);
             return;
         }
         let action = self.keymap.action(k);
@@ -4255,7 +3962,7 @@ impl App {
 
     fn on_raw_key(&mut self, k: KeyEvent, ctrl: bool) {
         let height = self.msgs_height.max(1);
-        let Some(View::Raw { lines, scroll, .. }) = self.stack.last_mut() else {
+        let Some(View::Raw { lines, scroll, .. } | View::Reactions { lines, scroll, .. }) = self.stack.last_mut() else {
             return;
         };
         let max = lines.len().saturating_sub(height);
@@ -4314,7 +4021,7 @@ impl App {
             Some(Action::MyThreads) => self.open_my_threads(),
             Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
             Some(Action::Compose) => self.compose(),
-            Some(Action::React) => self.react(),
+            Some(Action::React) => self.view_reactions(),
             Some(Action::MarkRead) => self.mark_read(),
             Some(Action::MarkUnread) => self.mark_unread(),
             Some(Action::Sort) => {
@@ -4472,7 +4179,7 @@ impl App {
             Some(Action::MyThreads) => self.open_my_threads(),
             Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
             Some(Action::Compose) => self.compose(),
-            Some(Action::React) => self.react(),
+            Some(Action::React) => self.view_reactions(),
             Some(Action::Delete) => self.delete_selected(),
             Some(Action::Images) => self.open_images(),
             Some(Action::MarkRead) => self.mark_read(),
@@ -4663,86 +4370,32 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-/// A typed reaction as Slack names it: `eyes`, `:eyes:` or the emoji itself.
-fn reaction_name(text: &str) -> Option<String> {
-    let s = text.trim().trim_matches(':').trim();
-    if s.is_empty() {
-        return None;
-    }
-    if s.is_ascii() {
-        return Some(s.to_lowercase());
-    }
-    emojis::get(s)
-        .and_then(|e| e.shortcode())
-        .map(str::to_string)
-}
-
-/// Whether `me` already reacted with `name` on a message.
-fn has_reaction(data: &Value, name: &str, me: &str) -> bool {
-    data.get("reactions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|r| r.get("name").and_then(Value::as_str) == Some(name))
-        .any(|r| {
-            r.get("users")
-                .and_then(Value::as_array)
-                .map(|u| u.iter().any(|x| x.as_str() == Some(me)))
-                .unwrap_or(false)
-        })
-}
-
-/// The message JSON after your reaction `name` was added or removed, as
-/// Slack would report it.
-fn patch_reaction(data: &mut Value, name: &str, me: &str, add: bool) {
-    let obj = match data.as_object_mut() {
-        Some(o) => o,
-        None => return,
-    };
-    let rs = obj
-        .entry("reactions")
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let Some(rs) = rs.as_array_mut() else {
-        return;
-    };
-    let at = rs
-        .iter()
-        .position(|r| r.get("name").and_then(Value::as_str) == Some(name));
-    match (at, add) {
-        (None, true) => rs.push(serde_json::json!({"name": name, "users": [me], "count": 1})),
-        (None, false) => {}
-        (Some(i), add) => {
-            let r = &mut rs[i];
-            let mut users: Vec<String> = r
-                .get("users")
-                .and_then(Value::as_array)
-                .map(|u| {
-                    u.iter()
-                        .filter_map(|x| x.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let had = users.iter().any(|u| u == me);
-            if add && !had {
-                users.push(me.to_string());
-            } else if !add && had {
-                users.retain(|u| u != me);
-            } else {
-                return;
+fn reaction_details(message: &Msg, context: &Ctx) -> Vec<String> {
+    let mut lines = vec!["Read-only · loaded message · j/k scroll · h back · Esc home".into()];
+    let reactions = message.data.get("reactions").and_then(Value::as_array);
+    for reaction in reactions.into_iter().flatten() {
+        let name = reaction["name"].as_str().unwrap_or("?");
+        let count = reaction["count"].as_u64();
+        let mut seen = HashSet::new();
+        let users: Vec<&str> = reaction["users"].as_array().into_iter().flatten()
+            .filter_map(Value::as_str).filter(|user| seen.insert(*user)).collect();
+        lines.push(String::new());
+        lines.push(format!(":{name}: {}", count.map(|n| n.to_string()).unwrap_or_else(|| "count unknown".into())));
+        for user in &users {
+            let name = context.user(user);
+            let label = if name == *user { name } else { format!("@{name}") };
+            lines.push(format!("  {label}"));
+        }
+        match count {
+            Some(count) if count > users.len() as u64 => {
+                lines.push(format!("  Partial: {} missing users from this payload", count - users.len() as u64));
             }
-            let count =
-                r.get("count").and_then(Value::as_i64).unwrap_or(0) + if add { 1 } else { -1 };
-            if count <= 0 {
-                rs.remove(i);
-            } else {
-                r["users"] = Value::Array(users.into_iter().map(Value::String).collect());
-                r["count"] = Value::from(count);
-            }
+            None => lines.push("  Partial: total user count unavailable".into()),
+            _ => {}
         }
     }
-    if rs.is_empty() {
-        obj.remove("reactions");
-    }
+    if lines.len() == 1 { lines.push("No reactions in this payload".into()); }
+    lines
 }
 
 /// `@handle` becomes a real mention when `user_id` knows the handle;
@@ -5389,125 +5042,114 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn custom_reactions_render_in_conversations_and_threads_without_opening_picker() {
-        let directory = std::env::temp_dir().join(format!("slack-reaction-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let mut app = App::new(Corpus::stub(&[]), Tz::Utc, 30.0, false, false, directory.clone(), PathBuf::new(), 60, None, None);
-        app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
-        app.open_conv(0);
-        let mut message = msg(1, "reaction rendering");
+    fn reaction_details_resolve_deduplicate_and_report_partial_payloads() {
+        let mut corpus = Corpus::stub(&[]);
+        corpus.merge_profiles(vec![json!({"id":"U1", "name":"ada"})]);
+        let mut message = msg(1, "reactions");
         message.data["reactions"] = json!([
-            {"name":"custom-reaction", "count":3},
-            {"name":"eyes", "count":2},
-            {"name":"custom-alias", "count":1},
+            {"name":"eyes", "count":5, "users":["U1", "U1", "UNKNOWN", "UNKNOWN"]},
+            {"name":"custom", "count":2},
+            {"name":"unknown-count", "users":["U1"]}
         ]);
-        app.open.as_mut().unwrap().list = MsgList::new(vec![message.clone()], false);
-        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
-        app.inline_images = true;
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
-        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
-        assert!(app.emoji_pending);
-        assert!(app.stack.is_empty());
-        let loading_text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
-        assert!(loading_text.contains("3 :custom-reaction:"));
-        assert!(loading_text.contains("1 :custom-alias:"));
-        let url = "https://emoji.slack-edge.com/workspace/custom.png";
-        app.take_emoji_list(crate::custom_emoji::Catalog::from([
-            ("custom-reaction".into(), url.into()),
-            ("custom-alias".into(), "alias:custom-reaction".into()),
-        ]));
-        let key = crate::custom_emoji::image_key(url);
-        let pixels = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(128, 128, image::Rgb([255, 0, 0])));
-        app.images.insert(key.clone(), ImageState::Ready(pixels.clone()));
-        for thread in [false, true] {
-            if thread {
-                app.stack.push(View::Thread { root: message.id, list: MsgList::new(vec![message.clone()], true), live: None, place: None });
-            }
-            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
-            let buffer = terminal.backend().buffer();
-            assert!(buffer.content.iter().any(|cell| cell.fg == ratatui::style::Color::Rgb(255, 0, 0)));
-            let text = buffer.content.iter().map(|cell| cell.symbol()).collect::<String>();
-            assert!(!text.contains(":custom-reaction:"));
-            assert!(!text.contains(":custom-alias:"));
-            let image_rows: Vec<String> = buffer.content.chunks(buffer.area.width as usize)
-                .filter(|row| row.iter().any(|cell| cell.fg == ratatui::style::Color::Rgb(255, 0, 0)))
-                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>()).collect();
-            assert_eq!(image_rows[0].trim_end_matches([' ', '│']).split_whitespace().last(), Some("3"));
-            assert_eq!(image_rows[2].trim_end_matches([' ', '│']).split_whitespace().last(), Some("1"));
-            assert!(app.active_list().unwrap().flat.iter().any(|line| line.line.to_string().contains("👀 2")));
-            assert_eq!(app.active_list().unwrap().flat.iter().filter(|line| matches!(line.image.as_ref().map(|slot| &slot.source), Some(render::ImageSource::Emoji(_)))).count(), 2);
-            for state in [ImageState::Loading, ImageState::Failed("download failed".into())] {
-                app.images.insert(key.clone(), state);
-                terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
-                let text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
-                assert!(text.contains("3 :custom-reaction:"));
-                assert!(text.contains("1 :custom-alias:"));
-            }
-            app.images.insert(key.clone(), ImageState::Ready(pixels.clone()));
-        }
-        app.inline_images = false;
-        app.mark_all_dirty();
-        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
-        let text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
-        assert!(text.contains(":custom-reaction: 3"));
-        assert!(app.active_list().unwrap().flat.iter().all(|line| line.image.is_none()));
-        std::fs::remove_dir_all(directory).unwrap();
+        let before = message.data.clone();
+        let palette = Palette::default();
+        let context = Ctx { archive: None, corpus: &corpus, tz: Tz::Utc, image_font: None, last_read: None, palette: &palette };
+        let lines = reaction_details(&message, &context);
+        assert!(lines.contains(&":eyes: 5".into()));
+        assert_eq!(lines.iter().filter(|line| *line == "  UNKNOWN").count(), 1);
+        assert_eq!(lines.iter().filter(|line| *line == "  @ada").count(), 2);
+        assert!(lines.contains(&"  Partial: 3 missing users from this payload".into()));
+        assert!(lines.contains(&"  Partial: 2 missing users from this payload".into()));
+        assert!(lines.contains(&"  Partial: total user count unavailable".into()));
+        assert_eq!(message.data, before);
+        assert!(reaction_details(&msg(2, "empty"), &context).contains(&"No reactions in this payload".into()));
     }
 
     #[test]
-    fn custom_emoji_cache_migrates_and_picker_renders_pixels() {
-        let directory = std::env::temp_dir().join(format!("slack-emoji-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("emoji.json"), r#"["custom-test"]"#).unwrap();
-        let mut app = App::new(Corpus::stub(&[]), Tz::Utc, 30.0, false, false, directory.clone(), PathBuf::new(), 60, None, None);
-        app.build_emoji_table();
-        assert!(app.emoji_pending);
-        assert!(app.emoji_table.iter().any(|(name, _)| name == "custom-test"));
-        let url = "https://emoji.slack-edge.com/workspace/custom.png";
-        let catalog = crate::custom_emoji::Catalog::from([
-            ("custom-test".into(), url.into()),
-            ("custom-alias".into(), "alias:custom-test".into()),
-        ]);
-        app.take_emoji_list(catalog.clone());
-        assert_eq!(serde_json::from_str::<crate::custom_emoji::Catalog>(&std::fs::read_to_string(app.emoji_catalog_path()).unwrap()).unwrap(), catalog);
-        let key = crate::custom_emoji::image_key(url);
-        std::fs::create_dir_all(directory.join("emoji-images")).unwrap();
-        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(128, 128, image::Rgb([255, 0, 0])))
-            .save_with_format(directory.join("emoji-images").join(&key), image::ImageFormat::Png).unwrap();
-        assert_eq!(app.ensure_emoji("custom-alias"), Some(key.clone()));
-        assert!(matches!(app.images.get(&key), Some(ImageState::Ready(_))));
-        app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
+    fn reaction_details_target_selection_and_isolate_navigation_offline() {
+        let mut app = mute_test_app();
         app.open_conv(0);
-        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
-        app.stack.push(View::Emoji { target: ReactTarget { cid: "C1".into(), id: 1, label: "test".into() }, query: Editor::default(), cursor: 0, matches: vec![] });
-        if let Some(View::Emoji { query, .. }) = app.stack.last_mut() { query.text = "custom-alias".into(); }
-        app.emoji_filter();
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
-        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
-        assert!(app.inline.contains_key(&format!("{key}:4x2")));
-        assert!(app.inline.contains_key(&format!("{key}:24x12")));
-        let red = |area: ratatui::layout::Rect, terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
-            area.rows().any(|row| row.columns().any(|cell| {
-                let pixel = &terminal.backend().buffer()[(cell.x, cell.y)];
-                pixel.fg == ratatui::style::Color::Rgb(255, 0, 0) || pixel.bg == ratatui::style::Color::Rgb(255, 0, 0)
-            }))
-        };
-        assert!(red(ratatui::layout::Rect::new(28, 2, 4, 2), &terminal));
-        assert!(red(ratatui::layout::Rect::new(73, 3, 24, 12), &terminal));
-        terminal.resize(ratatui::layout::Rect::new(0, 0, 50, 20)).unwrap();
-        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
-        assert!(red(ratatui::layout::Rect::new(25, 2, 4, 2), &terminal));
-        // --no-images keeps the name and never queues an image.
-        app.picker = None;
-        app.images.clear();
-        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
-        assert!(app.images.is_empty());
-        let text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
-        assert!(text.contains("custom-alias"));
-        // A second workspace gets a different catalog cache.
-        let first = app.emoji_catalog_path();
-        app.pane_workspace = "https://other.slack.com".into();
-        assert_ne!(first, app.emoji_catalog_path());
-        std::fs::remove_dir_all(directory).unwrap();
+        app.corpus.merge_profiles(vec![json!({"id":"U1", "name":"ada"})]);
+        let mut root = msg(1, "root");
+        root.data["reactions"] = json!([{"name":"root", "count":1, "users":["U1"]}]);
+        let mut reply = msg(2, "reply");
+        reply.data["reactions"] = json!([{"name":"reply", "count":3, "users":["U1", "UNKNOWN"]}]);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![root.clone()], false);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for thread in [false, true] {
+            if thread {
+                let mut list = MsgList::new(vec![root.clone(), reply.clone()], true);
+                list.cursor = 1;
+                app.stack.push(View::Thread { root: root.id, list, live: None, place: None });
+            }
+            let depth = app.stack.len();
+            app.on_key(key(KeyCode::Char('e')));
+            let Some(View::Reactions { title, lines, .. }) = app.stack.last() else { panic!("details missing") };
+            assert!(title.contains(if thread { "1970-01-01 00:00:02" } else { "1970-01-01 00:00:01" }));
+            assert!(lines.contains(&if thread { ":reply: 3" } else { ":root: 1" }.into()));
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+            assert!(text.contains("ada"));
+            if thread { assert!(text.contains("UNKNOWN")); assert!(text.contains("Partial: 1 missing")); }
+            app.msgs_height = 1;
+            app.on_key(key(KeyCode::Char('j')));
+            assert!(matches!(app.stack.last(), Some(View::Reactions { scroll: 1, .. })));
+            app.on_key(key(KeyCode::Char('k')));
+            assert!(matches!(app.stack.last(), Some(View::Reactions { scroll: 0, .. })));
+            for character in ['D', 'c', 'e', 'm', 'M', 'R', 'a', 'T', '/', 'I'] {
+                app.on_key(key(KeyCode::Char(character)));
+                assert_eq!(app.stack.len(), depth + 1);
+                assert!(matches!(app.mode, Mode::Normal));
+                assert!(app.pending_delete.is_none());
+                assert!(app.job.is_none());
+                assert!(app.api.is_none());
+            }
+            app.on_key(key(KeyCode::Char('h')));
+            assert_eq!(app.stack.len(), depth);
+            assert_eq!(app.selected().unwrap().id, if thread { reply.id } else { root.id });
+        }
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!(app.open.as_ref().unwrap().list.msgs[0].data, root.data);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(app.open.is_none());
+    }
+
+    #[test]
+    fn reaction_details_use_the_selected_channel_and_archive_profiles() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        let open_channel = app.open_conv_ref().unwrap().id.clone();
+        app.merge_conversations(vec![json!({"id":"COTHER", "name":"other-channel", "is_member":true})]);
+        let index = app.corpus.conv_by_channel("COTHER").unwrap();
+        app.corpus.archives.push(Archive::stub(&[("UARCHIVE","archive.user")], &[]));
+        app.corpus.convs[index].archive = app.corpus.archives.len() - 1;
+        app.corpus.convs[index].live_only = false;
+        let mut hit = msg(1,"other channel hit");
+        hit.channel_id = "COTHER".into();
+        hit.data["reactions"] = json!([{"name":"eyes", "count":1, "users":["UARCHIVE"]}]);
+        app.stack.push(View::Search {query:"hit".into(),list:MsgList::new(vec![hit.clone()],false),
+            capped:false,live_hits:None,live_pending:false});
+        app.view_reactions();
+        assert!(app.title().starts_with("#other-channel · Reactions"));
+        assert_eq!(app.open_conv_ref().unwrap().id,open_channel);
+        let Some(View::Reactions {lines,..}) = app.stack.last() else {panic!()};
+        assert!(lines.contains(&"  @archive.user".into()));
+        app.stack.clear();
+        hit.data["reactions"] = json!([{"name":"thread", "count":1, "users":["UTHREAD"]}]);
+        app.stack.push(View::Thread {root:hit.id,list:MsgList::new(vec![hit],true),
+            live:Some(Box::new(Archive::stub(&[("UTHREAD","thread.user")], &[]))),place:None});
+        app.view_reactions();
+        let Some(View::Reactions {lines,..}) = app.stack.last() else {panic!()};
+        assert!(lines.contains(&"  @thread.user".into()));
+        app.on_key(KeyEvent::new(KeyCode::Char('?'),KeyModifiers::NONE));
+        assert!(app.help);
+        app.on_key(KeyEvent::new(KeyCode::Char('?'),KeyModifiers::NONE));
+        assert!(!app.help);
+        app.on_key(KeyEvent::new(KeyCode::Char('q'),KeyModifiers::NONE));
+        assert!(app.quit);
     }
 
     #[test]
@@ -5635,33 +5277,6 @@ pub(crate) mod tests {
         assert_eq!(parse_command("/version"), Some(Command::Version));
         assert_eq!(parse_command("version now"), None);
         assert_eq!(parse_command(""), None);
-    }
-
-    #[test]
-    fn reactions_toggle_in_the_message_json() {
-        let mut d = serde_json::json!({"text": "x"});
-        patch_reaction(&mut d, "eyes", "U1", true);
-        assert_eq!(
-            d["reactions"],
-            serde_json::json!([{"name": "eyes", "users": ["U1"], "count": 1}])
-        );
-        assert!(has_reaction(&d, "eyes", "U1"));
-        patch_reaction(&mut d, "eyes", "U2", true);
-        assert_eq!(d["reactions"][0]["count"], 2);
-        patch_reaction(&mut d, "eyes", "U1", false);
-        assert_eq!(
-            d["reactions"],
-            serde_json::json!([{"name": "eyes", "users": ["U2"], "count": 1}])
-        );
-        assert!(!has_reaction(&d, "eyes", "U1"));
-        patch_reaction(&mut d, "eyes", "U2", false);
-        assert!(d.get("reactions").is_none());
-        patch_reaction(&mut d, "eyes", "U1", false);
-        assert!(d.get("reactions").is_none());
-        assert_eq!(reaction_name(" :Eyes: "), Some("eyes".to_string()));
-        assert_eq!(reaction_name("👀"), Some("eyes".to_string()));
-        assert_eq!(reaction_name("+1"), Some("+1".to_string()));
-        assert_eq!(reaction_name("::"), None);
     }
 
     #[test]
@@ -5950,7 +5565,7 @@ pub(crate) mod tests {
         app.images.insert("F1:full".into(), ImageState::Loading);
         app.images.insert("F2:full".into(), ImageState::Loading);
         app.file_job = Some(live::completed_job(JobKind::File { id: "F1:full".into() },
-            Ok(Done::EmojiImage(image::DynamicImage::new_rgb8(2, 2)))));
+            Ok(Done::File(PathBuf::from("unused-image.png")))));
         app.release_picture("F2:full");
         assert!(app.file_job.is_some());
         app.release_picture("F1:full");

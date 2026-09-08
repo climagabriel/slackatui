@@ -77,18 +77,10 @@ pub enum JobKind {
     Delete {
         id: i64,
     },
-    /// Your reaction `name` added to or removed from message `id`.
-    React {
-        id: i64,
-        name: String,
-        add: bool,
-    },
     /// Membership of `conv` given up.
     Leave {
         conv: usize,
     },
-    /// The workspace's custom emoji names, for the reaction picker.
-    EmojiList,
     /// The channels muted in Slack itself.
     MutedChannels {
         gen: u64,
@@ -106,8 +98,8 @@ impl JobKind {
             Self::Older {..} => "older", Self::Newer {..} => "newer", Self::Conversations => "conversations",
             Self::Profiles => "profiles", Self::Usergroups => "usergroups", Self::Counts {..} => "counts",
             Self::File {..} => "file", Self::Mark {..} => "mark", Self::Send {..} => "send", Self::Upload {..} => "upload",
-            Self::Delete {..} => "delete", Self::React {..} => "reaction", Self::Leave {..} => "leave",
-            Self::EmojiList => "emoji_list", Self::MutedChannels {..} => "muted_channels", Self::SetMuted => "set_muted",
+            Self::Delete {..} => "delete", Self::Leave {..} => "leave",
+            Self::MutedChannels {..} => "muted_channels", Self::SetMuted => "set_muted",
             Self::StarredChannels {..} => "starred_channels", Self::SetStarred => "set_starred",
         }
     }
@@ -129,16 +121,13 @@ pub enum Done {
     Usergroups(Vec<Value>, Option<String>),
     Counts(Value),
     File(PathBuf),
-    EmojiImage(image::DynamicImage),
     Marked,
     Sent(Box<Msg>),
     /// A file reached Slack; the name it went up under.
     Uploaded(String),
     /// A message Slack no longer holds.
     Deleted,
-    Reacted,
     Left,
-    EmojiList(crate::custom_emoji::Catalog),
     MutedChannels(Vec<String>),
     StarredChannels(Vec<String>),
     StarChanged { cid: String, starred: bool, ids: Vec<String> },
@@ -415,19 +404,6 @@ pub fn fetch_file(client: Arc<Client>, id: String, url: String, dest: PathBuf) -
     })
 }
 
-pub fn fetch_emoji(id: String, url: String, dest: PathBuf) -> Job {
-    spawn(JobKind::File { id }, String::new(), move || {
-        let bytes = crate::custom_emoji::download(&url)?;
-        if let Some(directory) = dest.parent() {
-            std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
-        }
-        let part = dest.with_extension(format!("{}.part", std::process::id()));
-        std::fs::write(&part, bytes).map_err(|e| e.to_string())?;
-        std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
-        Ok(Done::EmojiImage(crate::custom_emoji::decode(&dest)?))
-    })
-}
-
 pub fn api_mark(client: Arc<Client>, conv: usize, cid: String, id: i64) -> Job {
     spawn(
         JobKind::Mark { conv, id },
@@ -499,30 +475,10 @@ pub fn api_delete(client: Arc<Client>, cid: String, id: i64) -> Job {
     })
 }
 
-pub fn api_react(client: Arc<Client>, cid: String, id: i64, name: String, add: bool) -> Job {
-    let label = if add {
-        "reacting"
-    } else {
-        "removing the reaction"
-    }
-    .to_string();
-    let n = name.clone();
-    spawn(JobKind::React { id, name, add }, label, move || {
-        client.react(&cid, &id_to_ts(id), &n, add)?;
-        Ok(Done::Reacted)
-    })
-}
-
 pub fn api_leave(client: Arc<Client>, conv: usize, cid: String) -> Job {
     spawn(JobKind::Leave { conv }, "leaving".to_string(), move || {
         client.leave(&cid)?;
         Ok(Done::Left)
-    })
-}
-
-pub fn api_emoji_list(client: Arc<Client>) -> Job {
-    spawn(JobKind::EmojiList, String::new(), move || {
-        Ok(Done::EmojiList(client.emoji_list()?))
     })
 }
 
