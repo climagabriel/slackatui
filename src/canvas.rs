@@ -674,6 +674,9 @@ pub struct Browser {
     cursor: usize,
     entries: Option<Vec<Tab>>,
     entry_cursor: usize,
+    entry_scroll: usize,
+    pub previews: bool,
+    pub thumbnails: Vec<(Rect, crate::archive::FileInfo)>,
     document: Option<Document>,
     section: usize,
     document_rows: Vec<(usize, String)>,
@@ -704,6 +707,9 @@ impl Browser {
             cursor: 0,
             entries: None,
             entry_cursor: 0,
+            entry_scroll: 0,
+            previews: true,
+            thumbnails: vec![],
             document: None,
             section: 0,
             document_rows: vec![],
@@ -728,6 +734,7 @@ impl Browser {
                 Ok(Loaded::Entries(entries)) => {
                     self.entries = Some(entries);
                     self.entry_cursor = 0;
+                    self.entry_scroll = 0;
                 }
                 Ok(Loaded::Canvas(doc)) => {
                     self.document = Some(doc);
@@ -941,6 +948,7 @@ impl Browser {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, palette: &Palette) {
+        self.thumbnails.clear();
         let block = Block::bordered()
             .title(format!(" {} ", self.title()))
             .border_style(Style::new().fg(palette.get(Role::Accent)));
@@ -1015,6 +1023,10 @@ impl Browser {
             );
             return;
         }
+        if self.entries.is_some() && self.document.is_none() {
+            self.draw_entries(frame, body, palette);
+            return;
+        }
         let (rows, cursor) = if let Some(doc) = &self.document {
             self.document_rows.clear();
             for (index, section) in doc.sections.iter().enumerate() {
@@ -1030,11 +1042,6 @@ impl Browser {
                     .collect::<Vec<_>>(),
                 self.section,
             )
-        } else if let Some(entries) = &self.entries {
-            (
-                entries.iter().map(|t| t.label.clone()).collect(),
-                self.entry_cursor,
-            )
         } else {
             (
                 self.tabs.iter().map(|t| t.label.clone()).collect(),
@@ -1049,6 +1056,40 @@ impl Browser {
             &mut state,
         );
     }
+    fn draw_entries(&mut self, frame: &mut Frame, body: Rect, palette: &Palette) {
+        let entries = self.entries.as_ref().expect("entry list");
+        if entries.is_empty() { return; }
+        let preview_rows = body.height.saturating_sub(1).min(8);
+        let height = |entry: &Tab| -> u16 {
+            if self.previews && matches!(entry.target, Target::Image(..)) {
+                preview_rows + 1
+            } else { 1 }
+        };
+        self.entry_cursor = self.entry_cursor.min(entries.len() - 1);
+        self.entry_scroll = self.entry_scroll.min(self.entry_cursor);
+        let mut visible_rows: usize = entries[self.entry_scroll..=self.entry_cursor]
+            .iter().map(|entry| usize::from(height(entry))).sum();
+        while visible_rows > usize::from(body.height) {
+            visible_rows -= usize::from(height(&entries[self.entry_scroll]));
+            self.entry_scroll += 1;
+        }
+        let mut y = body.y;
+        for (index, entry) in entries.iter().enumerate().skip(self.entry_scroll) {
+            let rows = height(entry);
+            if y + rows > body.bottom() { break; }
+            let style = if index == self.entry_cursor {
+                Style::new().bg(palette.get(Role::SelectionBackground)).fg(palette.get(Role::SelectionText))
+            } else { Style::new() };
+            frame.render_widget(Paragraph::new(entry.label.as_str()).style(style), Rect::new(body.x, y, body.width, 1));
+            if rows > 1 {
+                if let Target::Image(file, _) = &entry.target {
+                    self.thumbnails.push((Rect::new(body.x, y + 1, body.width.min(64), preview_rows), file.clone()));
+                }
+            }
+            y += rows;
+        }
+    }
+
 }
 
 fn wrap_lines(text: &str, width: usize) -> Vec<String> {
@@ -1201,6 +1242,9 @@ mod tests {
             cursor: 0,
             entries: None,
             entry_cursor: 0,
+            entry_scroll: 0,
+            previews: true,
+            thumbnails: vec![],
             document: Some(document()),
             section: 0,
             document_rows: vec![],
@@ -1353,6 +1397,57 @@ mod tests {
         .unwrap();
         assert!(!numbered.sections[0].editable);
     }
+    #[test]
+    fn file_list_renders_visible_thumbnails_without_opening_a_picture() {
+        use crate::app::{App, ImageState};
+        use crate::archive::{Corpus, FileInfo};
+        use crate::render::Tz;
+        use std::path::PathBuf;
+        let mut browser = browser();
+        browser.document = None;
+        browser.tabs = vec![Tab { label: "Files & links".into(), target: Target::Files }];
+        browser.entries = Some((0..20).map(|index| {
+            let id = format!("F{index}");
+            let file = FileInfo::from_slack(&json!({"id":id,"title":format!("image{index}.png"),
+                "mimetype":"image/png","thumb_360":"https://example.invalid/thumb.png"}), "C1");
+            Tab { label: file.name.clone(), target: Target::Image(file, String::new()) }
+        }).collect());
+        let mut app = App::new(Corpus::stub(&[]), Tz::Utc, 30.0, false, false,
+            PathBuf::new(), PathBuf::new(), 0, None, None);
+        app.channel_browser = Some(browser);
+        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        app.images.insert("F0".into(), ImageState::Ready(image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_pixel(128, 128, image::Rgb([255, 0, 0])))));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(terminal.backend().buffer().content.iter().any(|cell| cell.fg == ratatui::style::Color::Rgb(255, 0, 0)));
+        let browser = app.channel_browser.as_ref().unwrap();
+        assert!(browser.picture.is_none());
+        assert_eq!(browser.thumbnails.len(), 2);
+        assert!(!app.images.contains_key("F2"));
+        app.on_key(key('G'));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let browser = app.channel_browser.as_ref().unwrap();
+        assert_eq!(browser.entry_cursor, 19);
+        assert_eq!(browser.thumbnails.last().unwrap().1.id, "F19");
+        assert!(browser.thumbnails.iter().all(|(area, _)| area.bottom() <= 26));
+        app.images.insert("F19".into(), ImageState::Failed("denied".into()));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Image unavailable"));
+        app.on_key(key('g'));
+        terminal.backend_mut().resize(80, 10);
+        terminal.resize(Rect::new(0, 0, 80, 10)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(app.channel_browser.as_ref().unwrap().thumbnails.len(), 1);
+        app.picker = None;
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(app.channel_browser.as_ref().unwrap().thumbnails.is_empty());
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("image0.png"));
+        assert!(text.contains("image1.png"));
+    }
+
     #[test]
     fn files_breadcrumb_and_picture_rendering_return_one_level_at_a_time() {
         use crate::app::{App, ImageState};

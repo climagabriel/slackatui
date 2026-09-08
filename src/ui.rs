@@ -194,7 +194,19 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.channel_browser.as_ref().is_some_and(|browser| browser.visible) {
         let mut browser = app.channel_browser.take().expect("visible browser");
+        browser.previews = app.picker.is_some();
         browser.draw(frame, area, &app.palette);
+        for (thumbnail_area, file) in &browser.thumbnails {
+            app.ensure_image(file, false);
+            if let Some(protocol) = app.inline_protocol(&file.id, thumbnail_area.width, thumbnail_area.height) {
+                frame.render_widget(Image::new(protocol).allow_clipping(true), *thumbnail_area);
+            } else {
+                let message = if matches!(app.images.get(&file.id), Some(ImageState::Failed(_))) {
+                    "Image unavailable · l/Enter for details"
+                } else { "Loading image…" };
+                frame.render_widget(Paragraph::new(message), *thumbnail_area);
+            }
+        }
         if let Some(picture) = &mut browser.picture {
             let inner = Block::bordered().inner(area);
             let body = Rect { height: inner.height.saturating_sub(2), ..inner };
