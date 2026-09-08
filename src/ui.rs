@@ -339,7 +339,14 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s)))
         .collect();
     for (row, slot) in slots {
-        app.ensure_image(&slot.file, false);
+        let emoji = matches!(slot.source, render::ImageSource::Emoji(_));
+        let key = match &slot.source {
+            render::ImageSource::File(file) => {
+                app.ensure_image(file, false);
+                Some(file.id.clone())
+            }
+            render::ImageSource::Emoji(name) => app.ensure_emoji(name),
+        };
         let x = inner.x + 3;
         let y = inner.y + row;
         let width = slot.cols.min(inner.width.saturating_sub(3));
@@ -353,9 +360,12 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
             width,
             height,
         };
-        let note = match app.images.get(&slot.file.id) {
+        let note = match key.as_ref().and_then(|key| app.images.get(key)) {
             Some(ImageState::Ready(_)) => None,
+            Some(ImageState::Failed(_)) if emoji => Some("!".into()),
             Some(ImageState::Failed(e)) => Some(format!("(image: {e})")),
+            None if emoji && !app.emoji_catalog_loading() => Some("!".into()),
+            _ if emoji => Some("…".into()),
             Some(_) => Some("(loading image)".to_string()),
             None => Some("(image)".to_string()),
         };
@@ -365,7 +375,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
                 Rect { height: 1, ..area },
             ),
             None => {
-                if let Some(proto) = app.inline_protocol(&slot.file.id, slot.cols, slot.rows) {
+                if let Some(proto) = app.inline_protocol(key.as_deref().expect("ready image key"), slot.cols, slot.rows) {
                     frame.render_widget(Image::new(proto).allow_clipping(true), area);
                 }
             }

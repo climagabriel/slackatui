@@ -2820,7 +2820,14 @@ impl App {
         }
     }
 
+    pub fn emoji_catalog_loading(&self) -> bool {
+        (self.emoji_pending && self.live) || self.emoji_job.is_some()
+    }
+
     pub fn ensure_emoji(&mut self, name: &str) -> Option<String> {
+        if self.emoji_table.is_empty() {
+            self.build_emoji_table();
+        }
         let url = crate::custom_emoji::url(&self.custom_emoji, name)?.to_string();
         let key = crate::custom_emoji::image_key(&url);
         if !self.images.contains_key(&key) {
@@ -4797,6 +4804,66 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
+    }
+
+    #[test]
+    fn custom_reactions_render_in_conversations_and_threads_without_opening_picker() {
+        let directory = std::env::temp_dir().join(format!("slack-reaction-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut app = App::new(Corpus::stub(&[]), Tz::Utc, 30.0, false, false, directory.clone(), PathBuf::new(), 60, None, None);
+        app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
+        app.open_conv(0);
+        let mut message = msg(1, "reaction rendering");
+        message.data["reactions"] = json!([
+            {"name":"custom-reaction", "count":3},
+            {"name":"eyes", "count":2},
+            {"name":"custom-alias", "count":1},
+        ]);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![message.clone()], false);
+        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        app.inline_images = true;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(app.emoji_pending);
+        assert!(app.stack.is_empty());
+        let loading_text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(loading_text.contains("3 :custom-reaction:"));
+        assert!(loading_text.contains("1 :custom-alias:"));
+        let url = "https://emoji.slack-edge.com/workspace/custom.png";
+        app.take_emoji_list(crate::custom_emoji::Catalog::from([
+            ("custom-reaction".into(), url.into()),
+            ("custom-alias".into(), "alias:custom-reaction".into()),
+        ]));
+        let key = crate::custom_emoji::image_key(url);
+        let pixels = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(128, 128, image::Rgb([255, 0, 0])));
+        app.images.insert(key.clone(), ImageState::Ready(pixels.clone()));
+        for thread in [false, true] {
+            if thread {
+                app.stack.push(View::Thread { root: message.id, list: MsgList::new(vec![message.clone()], true), live: None, place: None });
+            }
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(buffer.content.iter().any(|cell| cell.fg == ratatui::style::Color::Rgb(255, 0, 0)));
+            let text = buffer.content.iter().map(|cell| cell.symbol()).collect::<String>();
+            assert!(text.contains("3 :custom-reaction:"));
+            assert!(text.contains("1 :custom-alias:"));
+            assert!(app.active_list().unwrap().flat.iter().any(|line| line.line.to_string().contains("👀 2")));
+            assert_eq!(app.active_list().unwrap().flat.iter().filter(|line| matches!(line.image.as_ref().map(|slot| &slot.source), Some(render::ImageSource::Emoji(_)))).count(), 2);
+            for state in [ImageState::Loading, ImageState::Failed("download failed".into())] {
+                app.images.insert(key.clone(), state);
+                terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+                let text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+                assert!(text.contains("3 :custom-reaction:"));
+                assert!(text.contains("1 :custom-alias:"));
+            }
+            app.images.insert(key.clone(), ImageState::Ready(pixels.clone()));
+        }
+        app.inline_images = false;
+        app.mark_all_dirty();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains(":custom-reaction: 3"));
+        assert!(app.active_list().unwrap().flat.iter().all(|line| line.image.is_none()));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

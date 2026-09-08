@@ -83,8 +83,14 @@ pub struct Ctx<'a> {
 
 /// Rows reserved under a message for one image, at their position.
 #[derive(Clone, Debug)]
+pub enum ImageSource {
+    File(FileInfo),
+    Emoji(String),
+}
+
+#[derive(Clone, Debug)]
 pub struct ImageSlot {
-    pub file: FileInfo,
+    pub source: ImageSource,
     /// Index of the first reserved line within the message's lines.
     pub line: usize,
     pub cols: u16,
@@ -1211,7 +1217,7 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
         if let Some(font) = ctx.image_font {
             if let Some((cols, rows)) = image_cells(&f, font, width) {
                 images.push(ImageSlot {
-                    file: f.clone(),
+                    source: ImageSource::File(f.clone()),
                     line: lines.len(),
                     cols,
                     rows,
@@ -1224,12 +1230,28 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rende
     }
     let reactions = m.reactions();
     if !reactions.is_empty() {
-        let s = reactions
-            .iter()
-            .map(|(n, c)| format!("{} {c}", emoji(n, None)))
-            .collect::<Vec<_>>()
-            .join("   ");
-        lines.push(Line::from(Span::styled(format!("  {s}"), dim)));
+        let mut text_reactions = Vec::new();
+        for (name, count) in reactions {
+            let glyph = emoji(&name, None);
+            if ctx.image_font.is_some() && glyph.starts_with(':') && width >= 10 {
+                if !text_reactions.is_empty() {
+                    lines.push(Line::from(Span::styled(format!("  {}", text_reactions.join("   ")), dim)));
+                    text_reactions.clear();
+                }
+                images.push(ImageSlot {
+                    source: ImageSource::Emoji(name.clone()),
+                    line: lines.len(), cols: 4, rows: 2,
+                });
+                // Count and name remain visible during downloads and on failure.
+                lines.push(Line::from(Span::styled(format!("      {count} :{name}:"), dim)));
+                lines.push(Line::from(""));
+            } else {
+                text_reactions.push(format!("{glyph} {count}"));
+            }
+        }
+        if !text_reactions.is_empty() {
+            lines.push(Line::from(Span::styled(format!("  {}", text_reactions.join("   ")), dim)));
+        }
     }
     if !in_thread && m.has_thread() {
         let last = m
