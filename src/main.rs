@@ -173,7 +173,10 @@ the list, on top of the channels muted in Slack itself.
 /conversations-pane selects visible categories and individual conversations.
 Ctrl-Shift-P opens the same menu and /keys can rebind it. Terminals must report
 the Shift modifier separately; otherwise use the command or rebind the action.
-Space toggles, Enter saves, Esc cancels; type to search. Reset to default
+Outside Search: j/k move; h/l unset/set (hide/show for individuals,
+previous/next for Muted and Number). Space cycles.
+Type only on the Search row; Down, Tab or Enter leaves Search.
+Enter elsewhere saves; Esc cancels. Reset to default
 enables every category and removes individual overrides. Muted cycles through include, hide and only.
 Only shows muted conversations across all categories; individual hides apply.
 Include and hide respect categories; individual show/hide overrides take precedence.

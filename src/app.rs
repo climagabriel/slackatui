@@ -3632,6 +3632,21 @@ impl App {
             self.status.clear();
             return;
         }
+        if self.pane_menu.as_ref().unwrap().cursor == 0 {
+            let menu = self.pane_menu.as_mut().unwrap();
+            match k.code {
+                KeyCode::Enter | KeyCode::Tab | KeyCode::Down => menu.cursor = 1,
+                KeyCode::Backspace => { menu.query.pop(); },
+                KeyCode::Char('u') if ctrl(k) => menu.query.clear(),
+                KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                    menu.query.push(c);
+                }
+                KeyCode::PageDown => menu.cursor = 10.min(menu.rows().len() - 1),
+                KeyCode::End => menu.cursor = menu.rows().len() - 1,
+                _ => {},
+            }
+            return;
+        }
         if k.code == KeyCode::Enter {
             let settings = self.pane_menu.as_ref().unwrap().settings.clone();
             if let Err(e) = settings.save(self.pane_path.as_deref(), &self.pane_workspace) {
@@ -3657,29 +3672,15 @@ impl App {
         let menu = self.pane_menu.as_mut().unwrap();
         let last = menu.rows().len().saturating_sub(1);
         match k.code {
-            KeyCode::Up => menu.cursor = menu.cursor.saturating_sub(1),
-            KeyCode::Down => menu.cursor = (menu.cursor + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => menu.cursor = menu.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => menu.cursor = (menu.cursor + 1).min(last),
             KeyCode::PageUp => menu.cursor = menu.cursor.saturating_sub(10),
             KeyCode::PageDown => menu.cursor = (menu.cursor + 10).min(last),
             KeyCode::Home => menu.cursor = 0,
             KeyCode::End => menu.cursor = last,
+            KeyCode::Char('h') | KeyCode::Left => menu.set(false),
+            KeyCode::Char('l') | KeyCode::Right => menu.set(true),
             KeyCode::Char(' ') => menu.toggle(),
-            KeyCode::Backspace => {
-                menu.query.pop();
-                menu.cursor = 0;
-            }
-            KeyCode::Char('u') if ctrl(k) => {
-                menu.query.clear();
-                menu.cursor = 0;
-            }
-            KeyCode::Char(c)
-                if !k
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                menu.query.push(c);
-                menu.cursor = 0;
-            }
             _ => {}
         }
     }
@@ -4431,23 +4432,23 @@ mod tests {
             assert_eq!(N::Hidden.value(c, sort), None);
         }
         let mut menu = Menu::new(Settings::default(), &app.corpus.convs);
-        menu.cursor = 7;
-        menu.toggle();
-        assert_eq!(menu.settings.number, N::Messages);
-        assert!(menu.rows()[7].contains("Cached messages"));
         menu.cursor = 8;
         menu.toggle();
+        assert_eq!(menu.settings.number, N::Messages);
+        assert!(menu.rows()[8].contains("Cached messages"));
+        menu.cursor = 9;
+        menu.toggle();
         assert_eq!(menu.settings.overrides.get("C1"), Some(&true));
-        menu.cursor = 0;
+        menu.cursor = 1;
         menu.toggle();
         assert_eq!(menu.settings, Settings::default());
         app.run_command("conversation-pane", "");
-        app.pane_menu.as_mut().unwrap().cursor = 7;
+        app.pane_menu.as_mut().unwrap().cursor = 8;
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.pane_settings.number, N::Sort);
         app.run_command("conversation-pane", "");
-        app.pane_menu.as_mut().unwrap().cursor = 7;
+        app.pane_menu.as_mut().unwrap().cursor = 8;
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.pane_settings.number, N::Messages);
@@ -4520,6 +4521,73 @@ mod tests {
     }
 
     #[test]
+    fn conversations_pane_navigation_and_focused_search() {
+        let mut app = App::new(
+            Corpus::stub(&[]), Tz::Utc, 30.0, false, false,
+            PathBuf::new(), PathBuf::new(), 60, None, None,
+        );
+        app.merge_conversations(vec![
+            json!({"id":"C1", "name":"alpha", "is_member":true}),
+            json!({"id":"C2", "name":"beta", "is_member":true}),
+        ]);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.open_conversations_pane();
+        assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 1);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 2);
+        for _ in 0..2 { app.on_key(key(KeyCode::Char('h'))); }
+        assert!(app.pane_menu.as_ref().unwrap().settings.hidden.contains("public"));
+        for _ in 0..2 { app.on_key(key(KeyCode::Char('l'))); }
+        assert!(!app.pane_menu.as_ref().unwrap().settings.hidden.contains("public"));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Backspace));
+        assert!(app.pane_menu.as_ref().unwrap().query.is_empty());
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 0);
+        for c in "jkh l".chars() { app.on_key(key(KeyCode::Char(c))); }
+        assert_eq!(app.pane_menu.as_ref().unwrap().query, "jkh l");
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.pane_menu.as_ref().unwrap().query, "jkh ");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "beta".chars() { app.on_key(key(KeyCode::Char(c))); }
+        assert_eq!(app.pane_menu.as_ref().unwrap().matching().len(), 1);
+        let mut terminal = ratatui::Terminal::new(
+            ratatui::backend::TestBackend::new(120, 30),
+        ).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let search = (1..20).map(|x| terminal.backend().buffer()[(x, 5)].symbol()).collect::<String>();
+        assert!(search.starts_with("Search: beta"));
+        assert_ne!(terminal.backend().buffer()[(1, 5)].bg, terminal.backend().buffer()[(1, 6)].bg);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 1);
+        app.on_key(key(KeyCode::End));
+        app.on_key(key(KeyCode::Char('h')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().settings.overrides.get("C2"), Some(&false));
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('l')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().settings.overrides.get("C2"), Some(&true));
+        app.pane_menu.as_mut().unwrap().cursor = 7;
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.pane_menu.as_ref().unwrap().settings.only_muted);
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(!app.pane_menu.as_ref().unwrap().settings.only_muted);
+        app.pane_menu.as_mut().unwrap().cursor = 8;
+        app.on_key(key(KeyCode::Char('h')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().settings.number, crate::conversations_pane::NumberColumn::Hidden);
+        app.on_key(key(KeyCode::Char('l')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().settings.number, crate::conversations_pane::NumberColumn::Sort);
+        for leave in [KeyCode::Down, KeyCode::Tab] {
+            app.on_key(key(KeyCode::Home));
+            app.on_key(key(leave));
+            assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 1);
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.pane_menu.is_none());
+        assert_eq!(app.pane_settings.overrides.get("C2"), Some(&true));
+    }
+
+    #[test]
     fn conversations_pane_save_cancel_reset_and_shortcut() {
         let mut app = App::new(
             Corpus::stub(&[]),
@@ -4582,6 +4650,7 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert!(app.filtered.is_empty());
         app.run_command("conversations-pane", "");
+        app.on_key(key(KeyCode::Up));
         app.on_key(key(KeyCode::Char('p')));
         assert_eq!(app.pane_menu.as_ref().unwrap().matching().len(), 2);
         app.on_key(key(KeyCode::Char('u')));

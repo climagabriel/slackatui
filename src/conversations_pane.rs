@@ -88,6 +88,9 @@ impl NumberColumn {
     pub fn next(self) -> Self {
         Self::ALL[(Self::ALL.iter().position(|&n| n == self).unwrap() + 1) % Self::ALL.len()]
     }
+    pub fn previous(self) -> Self {
+        Self::ALL[(Self::ALL.iter().position(|&n| n == self).unwrap() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
     pub fn value(self, c: &Conv, sort_mine: bool) -> Option<i64> {
         match self {
             Self::Hidden => None,
@@ -280,11 +283,11 @@ mod tests {
         for category in 0..5 {
             menu.settings.toggle_category(category);
         }
-        menu.cursor = 6;
+        menu.cursor = 7;
         menu.toggle(); // Include -> Hide.
-        assert!(menu.rows()[6].starts_with("Muted: Hide"));
+        assert!(menu.rows()[7].starts_with("Muted: Hide"));
         menu.toggle(); // Hide -> Only.
-        assert!(menu.rows()[6].starts_with("Muted: Only"));
+        assert!(menu.rows()[7].starts_with("Muted: Only"));
         for category in 0..5 {
             assert!(menu.settings.visible_id("muted", category, true));
             assert!(!menu.settings.visible_id("unmuted", category, false));
@@ -296,9 +299,9 @@ mod tests {
         assert!(!menu.settings.visible_id("muted", 0, true));
         menu.toggle(); // Only -> Include; category preferences survive.
         assert!(!menu.settings.only_muted);
-        assert!(menu.rows()[6].starts_with("Muted: Include"));
+        assert!(menu.rows()[7].starts_with("Muted: Include"));
         assert!(!menu.settings.visible_id("other", 0, true));
-        menu.cursor = 0;
+        menu.cursor = 1;
         menu.toggle();
         assert_eq!(menu.settings, Settings::default());
     }
@@ -386,7 +389,7 @@ impl Menu {
             settings,
             entries,
             query: String::new(),
-            cursor: 0,
+            cursor: 1,
         }
     }
     pub fn matching(&self) -> Vec<usize> {
@@ -399,7 +402,7 @@ impl Menu {
             .collect()
     }
     pub fn rows(&self) -> Vec<String> {
-        let mut rows = vec!["Reset to default — show everything".into()];
+        let mut rows = vec![format!("Search: {}", self.query), "Reset to default — show everything".into()];
         for (i, label) in CATEGORIES.iter().enumerate() {
             if i == 5 {
                 let mode = if self.settings.only_muted {
@@ -447,13 +450,45 @@ impl Menu {
         }
         rows
     }
+    pub fn set(&mut self, enabled: bool) {
+        match self.cursor {
+            0 => {},
+            1 if enabled => self.settings = Settings::default(),
+            1 => {},
+            2..=6 => {
+                let key = KEYS[self.cursor - 2];
+                if enabled {
+                    self.settings.hidden.remove(key);
+                } else {
+                    self.settings.hidden.insert(key.into());
+                }
+            }
+            7 => {
+                self.settings.toggle_category(5);
+                if !enabled {
+                    self.settings.toggle_category(5);
+                }
+            }
+            8 => self.settings.number = if enabled {
+                self.settings.number.next()
+            } else {
+                self.settings.number.previous()
+            },
+            _ => {
+                if let Some(&i) = self.matching().get(self.cursor - 9) {
+                    self.settings.overrides.insert(self.entries[i].id.clone(), enabled);
+                }
+            }
+        }
+    }
     pub fn toggle(&mut self) {
         match self.cursor {
-            0 => self.settings = Settings::default(),
-            1..=6 => self.settings.toggle_category(self.cursor - 1),
-            7 => self.settings.number = self.settings.number.next(),
+            0 => {},
+            1 => self.settings = Settings::default(),
+            2..=7 => self.settings.toggle_category(self.cursor - 2),
+            8 => self.settings.number = self.settings.number.next(),
             _ => {
-                if let Some(&i) = self.matching().get(self.cursor - 8) {
+                if let Some(&i) = self.matching().get(self.cursor - 9) {
                     self.settings.cycle(&self.entries[i].id);
                 }
             }
