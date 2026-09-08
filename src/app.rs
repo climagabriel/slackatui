@@ -459,6 +459,7 @@ pub enum Mode {
 }
 
 pub struct App {
+    pub last_key: Option<(String, Instant)>,
     pub channel_browser: Option<crate::canvas::Browser>,
     pub corpus: Corpus,
     pub tz: Tz,
@@ -604,6 +605,7 @@ impl App {
             ),
         };
         let mut app = App {
+            last_key: None,
             channel_browser: None,
             pane_menu: None,
             pane_settings,
@@ -3999,6 +4001,7 @@ impl App {
     // ----------------------------------------------------------------- keys
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        self.last_key = Some((crate::keys::received_key(k), Instant::now()));
         if k.code == KeyCode::Esc {
             if let Some(browser) = self.channel_browser.as_mut().filter(|browser| browser.visible && browser.escape_edits()) {
                 browser.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -5536,6 +5539,25 @@ pub(crate) mod tests {
             app.on_msg_key(Some(Action::Back)); assert!(matches!(app.stack.last(),Some(View::Saved {..})));
             app.on_msg_key(Some(Action::Back)); assert!(app.focus == Focus::Convs);
         }
+    }
+
+    #[test]
+    fn received_key_indicator_tracks_prompts_and_expires() {
+        let mut app=mute_test_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('/'),KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'),KeyModifiers::CONTROL|KeyModifiers::SHIFT));
+        assert_eq!(app.last_key.as_ref().unwrap().0,"Ctrl+Shift+s");
+        assert_eq!(crate::keys::received_key(KeyEvent::new(KeyCode::Char('x'),KeyModifiers::ALT)),"Alt+x");
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let text:String=terminal.backend().buffer().content.iter().map(|cell|cell.symbol()).collect();
+        assert!(text.contains("Ctrl+Shift+s"));
+        app.last_key.as_mut().unwrap().1=Instant::now()-Duration::from_secs(4);
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let text:String=terminal.backend().buffer().content.iter().map(|cell|cell.symbol()).collect();
+        assert!(!text.contains("Ctrl+Shift+s"));
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!(app.last_key.as_ref().unwrap().0,"Esc");
     }
 
     #[test]

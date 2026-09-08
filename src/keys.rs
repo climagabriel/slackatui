@@ -304,6 +304,23 @@ impl Chord {
     }
 }
 
+/// Describe the event delivered by the terminal, including modifiers used by editors.
+pub fn received_key(event: KeyEvent) -> String {
+    let mut parts = Vec::new();
+    for (modifier, name) in [(KeyModifiers::CONTROL,"Ctrl"),(KeyModifiers::ALT,"Alt"),
+        (KeyModifiers::SHIFT,"Shift"),(KeyModifiers::SUPER,"Super"),
+        (KeyModifiers::HYPER,"Hyper"),(KeyModifiers::META,"Meta")] {
+        if event.modifiers.contains(modifier) { parts.push(name.to_string()); }
+    }
+    parts.push(match event.code {
+        KeyCode::Char(' ') => "Space".into(),
+        KeyCode::Char(c) if c.is_control() => c.escape_default().to_string(),
+        KeyCode::Char(c) => c.to_string(),
+        code => code.to_string(),
+    });
+    parts.join("+")
+}
+
 /// The bindings in force, first match wins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keymap {

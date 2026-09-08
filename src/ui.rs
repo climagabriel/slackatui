@@ -58,6 +58,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &mut state,
         );
     }
+    if let Some((key, received)) = &app.last_key {
+        if received.elapsed() < std::time::Duration::from_secs(3) && main.height >= 3 && main.width >= 4 {
+            let width=(key.width().saturating_add(4)).min(main.width as usize) as u16;
+            let popup=Rect::new(main.right()-width,main.bottom()-3,width,3);
+            frame.render_widget(Clear,popup);
+            frame.render_widget(Paragraph::new(format!(" {key} "))
+                .style(background_style(&app.palette).fg(Color::Gray))
+                .block(Block::bordered().border_type(ratatui::widgets::BorderType::Rounded)
+                    .border_style(Style::new().fg(Color::DarkGray))),popup);
+        }
+    }
 }
 
 /// The palette's background, or nothing when the terminal keeps its own.
