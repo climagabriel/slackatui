@@ -63,10 +63,10 @@ Home/End reach its start/end. Press l or Right again for raw JSON.
 h/Left or Esc returns one level along the path you entered, ending at
 the conversation list. JSON colors follow /colorpalette.
 
-Conversations are ordered by your own activity, weighted by recency: each
-message you wrote counts 2^(-age / half-life), so where you wrote last
-week outranks where you wrote a lot a year ago (s cycles to name, recent,
-size). Your user id comes from the DM archive, or from SLACK_SELF_USER_ID.
+Conversations default to recent order: newest message first. Starred, muted,
+unread and search-match grouping take precedence. Press s to cycle recent,
+size, my activity, and name. My activity weights your messages by recency
+using half-life. Your user id comes from the DM archive, or from SLACK_SELF_USER_ID.
 
 flags
   --root DIR      archive root (default $SLACKDUMPS, then /srv/slackdumps)

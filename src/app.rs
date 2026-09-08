@@ -601,7 +601,7 @@ impl App {
             corpus,
             tz,
             focus: Focus::Convs,
-            sort: Sort::Mine,
+            sort: Sort::Recent,
             filter: String::new(),
             filtered: Vec::new(),
             conv_cursor: 0,
