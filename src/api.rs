@@ -179,6 +179,19 @@ impl Client {
         Ok(out)
     }
 
+    /// Canvas export is HTML; keep it separate from binary file downloads.
+    pub fn download_canvas(&self, url: &str) -> Result<String, String> {
+        let host = url.strip_prefix("https://").and_then(|s| s.split('/').next()).unwrap_or("");
+        if host != "files.slack.com" { return Err("canvas export must be on files.slack.com".into()); }
+        let mut response = self.agent.get(url)
+            .config().max_redirects(0).build()
+            .header("Authorization", &format!("Bearer {}", self.auth.token))
+            .header("Cookie", &format!("d={}", self.auth.cookie))
+            .call().map_err(|e| e.to_string())?;
+        if !response.status().is_success() { return Err(format!("canvas export: HTTP {}", response.status())); }
+        response.body_mut().with_config().limit(4 * 1024 * 1024).read_to_string().map_err(|e| e.to_string())
+    }
+
     /// A file's bytes, with the session's credentials as files.slack.com wants them.
     pub fn download(&self, url: &str) -> Result<Vec<u8>, String> {
         // The session credentials go to Slack's own file hosts only.

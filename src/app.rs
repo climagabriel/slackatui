@@ -396,6 +396,7 @@ pub enum Mode {
 }
 
 pub struct App {
+    pub channel_browser: Option<crate::canvas::Browser>,
     pub corpus: Corpus,
     pub tz: Tz,
     pub focus: Focus,
@@ -542,6 +543,7 @@ impl App {
             ),
         };
         let mut app = App {
+            channel_browser: None,
             pane_menu: None,
             pane_settings,
             pane_path,
@@ -3130,6 +3132,7 @@ impl App {
 
     /// Advance the spinner and collect a finished job.
     pub fn tick(&mut self) {
+        if let Some(browser) = &mut self.channel_browser { browser.tick(); }
         if let Some(outcome) = self.emoji_job.as_ref().and_then(|job| job.poll()) {
             self.emoji_job = None;
             match outcome {
@@ -3751,6 +3754,12 @@ impl App {
     // ----------------------------------------------------------------- keys
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        if let Some(browser) = self.channel_browser.as_mut().filter(|b| b.visible) {
+            if browser.can_toggle() && self.keymap.action(k)==Some(Action::ChannelTabs) {browser.visible=false;}
+            else {browser.key(k);}
+            return;
+        }
+
         if self.pane_menu.is_some() {
             self.on_conversations_pane_key(k);
             return;
@@ -3777,6 +3786,20 @@ impl App {
             return;
         }
         let action = self.keymap.action(k);
+        if action == Some(Action::ChannelTabs) {
+            let index = if self.focus == Focus::Convs { self.filtered.get(self.conv_cursor).copied() }
+                else { self.open.as_ref().map(|o| o.conv) };
+            let same_channel = index.is_some_and(|index| self.channel_browser.as_ref().is_some_and(|b| b.channel == self.corpus.convs[index].id));
+            if same_channel || self.channel_browser.as_ref().is_some_and(|b| b.busy_or_dirty()) {
+                if let Some(browser) = &mut self.channel_browser { browser.visible = true; }
+            } else if let (Some(client), Some(index)) = (self.api.clone(), index) {
+                if self.focus == Focus::Convs { self.open_conv(index); }
+                let conv = &self.corpus.convs[index];
+                self.channel_browser = Some(crate::canvas::Browser::new(client, conv.id.clone(), conv.name.clone()));
+                self.focus = Focus::Msgs;
+            } else { self.status = "Select a channel and sign in to Slack to read its tabs".into(); }
+            return;
+        }
         // An armed delete lives for exactly one more key, and only in the
         // pane that armed it.
         if self.pending_delete.is_some()
@@ -3787,6 +3810,10 @@ impl App {
         }
         match action {
             Some(Action::Quit) => {
+                if self.channel_browser.as_ref().is_some_and(|b| b.busy_or_dirty()) {
+                    self.status = "Channel tabs have pending work or an unsaved draft; press T to return".into();
+                    return;
+                }
                 self.quit = true;
                 return;
             }

@@ -192,6 +192,11 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(browser) = app.channel_browser.as_mut().filter(|b| b.visible) {
+        browser.draw(frame, area, &app.palette);
+        return;
+    }
+
     let focused = app.focus == Focus::Msgs;
     let reading = !matches!(
         app.stack.last(),
@@ -929,6 +934,7 @@ const HELP: &[HelpRow] = &[
         "from a search hit or a thread: show the message in the channel",
     ),
     HelpRow::Bound(Action::GoToDate, "go to a date (YYYY-MM-DD)"),
+    HelpRow::Bound(Action::ChannelTabs, "channel tabs: canvases, files and bookmarks"),
     HelpRow::Bound(Action::MyThreads, "threads you took part in, newest reply first"),
     HelpRow::Bound(
         Action::Images,

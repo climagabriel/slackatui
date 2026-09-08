@@ -27,6 +27,7 @@ pub enum Action {
     ConversationsPane,
     GoToDate,
     MyThreads,
+    ChannelTabs,
     UnreadsFirst,
     Compose,
     Delete,
@@ -65,6 +66,7 @@ impl Action {
             Action::ConversationsPane => "choose visible conversations",
             Action::GoToDate => "go to a date",
             Action::MyThreads => "threads I took part in",
+            Action::ChannelTabs => "channel tabs and canvases",
             Action::UnreadsFirst => "unread conversations on top",
             Action::Compose => "write a message",
             Action::Delete => "delete your own message",
@@ -103,6 +105,7 @@ impl Action {
             Action::ConversationsPane => "conversations_pane",
             Action::GoToDate => "go_to_date",
             Action::MyThreads => "my_threads",
+            Action::ChannelTabs => "channel_tabs",
             Action::UnreadsFirst => "unreads_first",
             Action::Compose => "compose",
             Action::Delete => "delete",
@@ -142,7 +145,8 @@ pub const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::Keys, &[]),
     (Action::ConversationsPane, &["ctrl-shift-p"]),
     (Action::GoToDate, &["d"]),
-    (Action::MyThreads, &["T"]),
+    (Action::MyThreads, &["ctrl-t"]),
+    (Action::ChannelTabs, &["T"]),
     (Action::UnreadsFirst, &["U"]),
     (Action::Compose, &["c"]),
     (Action::Delete, &["D"]),
@@ -385,6 +389,12 @@ impl Keymap {
             let list = value
                 .as_array()
                 .ok_or_else(|| format!("{}: {} must be a list", path.display(), action.key()))?;
+            // Old saved defaults used T for MyThreads. Migrate that one exact
+            // default only; a file already naming ChannelTabs is intentional.
+            if *action == Action::MyThreads && !object.contains_key("channel_tabs")
+                && list.len() == 1 && list[0].as_str() == Some("T") {
+                continue;
+            }
             keymap.bindings.retain(|(_, a)| a != action);
             for item in list {
                 let text = item.as_str().ok_or_else(|| {
@@ -552,6 +562,14 @@ mod tests {
             Some(Action::ConversationsPane)
         );
 
+        std::fs::write(&path, r#"{"my_threads":["T"]}"#).unwrap();
+        let migrated = Keymap::load(Some(&path)).unwrap();
+        assert_eq!(migrated.action(press(KeyCode::Char('T'), false)), Some(Action::ChannelTabs));
+        assert_eq!(migrated.action(press(KeyCode::Char('t'), true)), Some(Action::MyThreads));
+        std::fs::write(&path, r#"{"my_threads":["T"],"channel_tabs":["f6"]}"#).unwrap();
+        let explicit = Keymap::load(Some(&path)).unwrap();
+        assert_eq!(explicit.action(press(KeyCode::Char('T'), false)), Some(Action::MyThreads));
+        assert_eq!(explicit.action(press(KeyCode::F(6), false)), Some(Action::ChannelTabs));
         std::fs::write(&path, "{\"quit\":[\"meta-q\"]}\n").unwrap();
         let error = Keymap::load(Some(&path)).unwrap_err();
         assert!(error.contains("unknown key"), "{error}");

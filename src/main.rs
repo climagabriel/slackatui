@@ -2,6 +2,7 @@
 
 mod api;
 mod app;
+mod canvas;
 mod archive;
 mod auth;
 mod clip;
@@ -89,6 +90,7 @@ flags
                   the first key, so there it runs only when asked for.
   --call 'METHOD k=v ...'
                   one allowlisted read-only Web API call, JSON out (debug)
+  --dump-canvas ID read a Slack canvas as Markdown and exit
   --delete-message URL
                   delete your own message at that permalink (debug)
   --fetch-file URL OUT
@@ -131,8 +133,21 @@ keys (also ? inside)
   R refresh from Slack, a archive a conversation not cached yet,
   i view a message's images, I inline thumbnails on/off,
   m mark read, M mark unread from the cursor, D delete your own message,
+  T channel tabs and canvases; Ctrl-T threads you participated in,
   H the key guide,
   Esc in the list closes the conversation
+
+Channel tabs: T toggles the menu in browsing and normal mode;
+j/k select, l/Enter opens, h/Esc returns. Ctrl-T opens participated threads.
+Canvases: j/k moves by line; i edits that section as Markdown. Esc leaves
+insert mode; hjkl moves the cursor. In normal mode, :w saves,
+:wq saves and closes, :q closes a clean draft, :q! discards it.
+:w PATH exports the draft to a new local file for conflict recovery.
+Drafts are held in memory; they do not survive application exits.
+Saves replace the selected section after checking exported HTML.
+Concurrent edits after that check can be overwritten; Slack provides no
+atomic revision check. Unsupported sections are read-only text previews.
+Files & links lists channel files plus bookmarks; Bookmarks lists bookmarks.
 
 Images: thumbnails under messages and a full-pane viewer, through the
 kitty, Sixel or iTerm2 protocol when the terminal has one and half-block
@@ -222,6 +237,7 @@ struct Opts {
     fetch_file: Option<(String, String)>,
     delete_message: Option<String>,
     call: Option<String>,
+    dump_canvas: Option<String>,
 }
 
 /// Methods the debug `--call` escape hatch may invoke. Keep this exact: Slack
@@ -293,6 +309,7 @@ fn parse_args() -> Result<Opts, String> {
         fetch_file: None,
         delete_message: None,
         call: None,
+        dump_canvas: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -336,6 +353,7 @@ fn parse_args() -> Result<Opts, String> {
             "--delete-message" => {
                 opts.delete_message = Some(value("--delete-message")?);
             }
+            "--dump-canvas" => opts.dump_canvas = Some(value("--dump-canvas")?),
             "--call" => {
                 let spec = value("--call")?;
                 read_only_call_method(&spec)?;
@@ -438,6 +456,7 @@ fn run() -> i32 {
         || opts.fetch_file.is_some()
         || opts.delete_message.is_some()
         || opts.call.is_some()
+        || opts.dump_canvas.is_some()
     {
         let scratch = std::env::temp_dir().join("slack-tui");
         let agent = api::agent();
@@ -452,6 +471,13 @@ fn run() -> i32 {
             },
         };
         eprintln!("credentials: {}", auth.source);
+        if let Some(id) = &opts.dump_canvas {
+            let client = api::Client::new(auth);
+            return match canvas::load_document(&client, id) {
+                Ok(document) => emit(&(document.sections.iter().map(|s|s.markdown.as_str()).collect::<Vec<_>>().join("\n\n") + "\n")),
+                Err(error) => { eprintln!("slack-tui: {error}"); 1 },
+            };
+        }
         if let Some(spec) = &opts.call {
             let mut words = spec.split_whitespace();
             let method = words
