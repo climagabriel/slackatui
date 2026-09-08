@@ -77,6 +77,7 @@ pub struct MsgList {
     pub flat: Vec<FlatLine>,
     pub first: Vec<usize>,
     pub last: Vec<usize>,
+    collapsed: Vec<bool>,
     flat_w: usize,
     flat_date: Option<(Tz, i64)>,
     pane_height: Option<usize>,
@@ -149,6 +150,7 @@ impl MsgList {
         self.flat.clear();
         self.first.clear();
         self.last.clear();
+        self.collapsed.clear();
         if let Some(note) = &self.top_note {
             self.flat.push(FlatLine {
                 msg: None,
@@ -193,9 +195,10 @@ impl MsgList {
                 new_marked = true;
             }
             let mut rendered = render::message_lines(m, ctx, width, self.in_thread, today);
-            if self.pane_height.is_some_and(|height| rendered.lines.len() + 2 > height / 2)
-                && rendered.lines.len() > 3
-            {
+            let collapsed = self.pane_height.is_some_and(|height| rendered.lines.len() + 2 > height / 2)
+                && rendered.lines.len() > 3;
+            self.collapsed.push(collapsed);
+            if collapsed {
                 let remaining = rendered.lines.len() - 3;
                 rendered.lines.truncate(3);
                 rendered.lines.push(Line::from(format!("  ({remaining} more lines)")));
@@ -3940,7 +3943,9 @@ impl App {
                 && self.selected().is_some_and(|message| message.has_thread() || message.parent_id.is_some())
             {
                 self.on_msg_key(Some(Action::Open));
-            } else if self.active_list().is_some_and(|list| list.line_scroll) {
+            } else if self.active_list().is_some_and(|list|
+                list.line_scroll || !list.collapsed.get(list.cursor).copied().unwrap_or(false)
+            ) {
                 self.open_raw();
             } else if let Some(list) = self.active_list_mut() {
                 if list.selected().is_some() {
@@ -5178,6 +5183,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn horizontal_open_reads_only_collapsed_messages() {
+        for forward in [KeyCode::Char('l'), KeyCode::Right] {
+            for thread in [false, true] {
+                let mut app = mute_test_app();
+                app.open_conv(0);
+                let message = msg(1, &"body line\n".repeat(12));
+                if thread {
+                    app.stack.push(View::Thread { root: message.id,
+                        list: MsgList::new(vec![message], true), live: None, place: None });
+                } else {
+                    app.open.as_mut().unwrap().list = MsgList::new(vec![message], false);
+                }
+                let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+                for height in [24, 100, 24] {
+                    terminal.backend_mut().resize(120, height);
+                    terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+                    let collapsed = height == 24;
+                    assert_eq!(app.active_list().unwrap().collapsed, vec![collapsed]);
+                    assert_eq!(app.active_list().unwrap().flat.iter().any(|line|
+                        line.line.to_string().contains("more lines)")), collapsed);
+                    app.on_key(key(forward));
+                    if collapsed {
+                        assert!(app.active_list().unwrap().line_scroll);
+                        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+                        assert!(!app.active_list().unwrap().flat.iter().any(|line|
+                            line.line.to_string().contains("more lines)")));
+                        app.on_key(key(forward));
+                    }
+                    assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+                    app.on_key(key(KeyCode::Char('h')));
+                    assert_eq!(app.active_list().unwrap().line_scroll, collapsed);
+                    if collapsed { app.on_key(key(KeyCode::Char('h'))); }
+                    assert_eq!(app.stack.len(), usize::from(thread));
+                }
+                assert!(app.job.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn horizontal_navigation_unwinds_one_level_at_a_time() {
         for (forward, back) in [(KeyCode::Char('l'), KeyCode::Char('h')), (KeyCode::Right, KeyCode::Left)] {
             let mut app = App::new(
@@ -5209,7 +5255,9 @@ pub(crate) mod tests {
             // Re-enter, then descend through message reading and raw JSON.
             app.on_key(key(forward));
             let View::Thread { list, .. } = app.stack.last_mut().unwrap() else { panic!() };
-            *list = MsgList::new(vec![msg(4, "reply")], true);
+            *list = MsgList::new(vec![msg(4, &"reply\n".repeat(40))], true);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
             app.on_key(key(forward));
             assert!(app.active_list().unwrap().line_scroll);
             app.on_key(key(forward));
