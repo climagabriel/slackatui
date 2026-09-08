@@ -335,15 +335,15 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(Text::from(shown)), inner);
     // Inline images: one rect per slot whose first row is on screen.
-    let slots: Vec<(u16, crate::render::ImageSlot)> = list
+    let slots: Vec<(u16, crate::render::ImageSlot, String)> = list
         .flat
         .iter()
         .enumerate()
         .skip(list.scroll)
         .take(inner.height as usize)
-        .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s)))
+        .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s, fl.line.to_string())))
         .collect();
-    for (row, slot) in slots {
+    for (row, slot, fallback) in slots {
         let emoji = matches!(slot.source, render::ImageSource::Emoji(_));
         let key = match &slot.source {
             render::ImageSource::File(file) => {
@@ -381,6 +381,15 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
             None => {
                 if let Some(proto) = app.inline_protocol(key.as_deref().expect("ready image key"), slot.cols, slot.rows) {
+                    if let render::ImageSource::Emoji(name) = &slot.source {
+                        if let Some(count) = fallback.strip_suffix(&format!(" :{name}:")) {
+                            // Keep the count; the shortcode is only a fallback.
+                            let start = (inner.x + 1).saturating_add(count.width() as u16);
+                            for column in start..inner.right() {
+                                frame.buffer_mut()[(column, y)].set_symbol(" ");
+                            }
+                        }
+                    }
                     frame.render_widget(Image::new(proto).allow_clipping(true), area);
                 }
             }

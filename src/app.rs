@@ -4882,8 +4882,13 @@ mod tests {
             let buffer = terminal.backend().buffer();
             assert!(buffer.content.iter().any(|cell| cell.fg == ratatui::style::Color::Rgb(255, 0, 0)));
             let text = buffer.content.iter().map(|cell| cell.symbol()).collect::<String>();
-            assert!(text.contains("3 :custom-reaction:"));
-            assert!(text.contains("1 :custom-alias:"));
+            assert!(!text.contains(":custom-reaction:"));
+            assert!(!text.contains(":custom-alias:"));
+            let image_rows: Vec<String> = buffer.content.chunks(buffer.area.width as usize)
+                .filter(|row| row.iter().any(|cell| cell.fg == ratatui::style::Color::Rgb(255, 0, 0)))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>()).collect();
+            assert_eq!(image_rows[0].trim_end_matches([' ', '│']).split_whitespace().last(), Some("3"));
+            assert_eq!(image_rows[2].trim_end_matches([' ', '│']).split_whitespace().last(), Some("1"));
             assert!(app.active_list().unwrap().flat.iter().any(|line| line.line.to_string().contains("👀 2")));
             assert_eq!(app.active_list().unwrap().flat.iter().filter(|line| matches!(line.image.as_ref().map(|slot| &slot.source), Some(render::ImageSource::Emoji(_)))).count(), 2);
             for state in [ImageState::Loading, ImageState::Failed("download failed".into())] {
