@@ -78,6 +78,7 @@ pub struct MsgList {
     pub first: Vec<usize>,
     pub last: Vec<usize>,
     flat_w: usize,
+    pane_height: Option<usize>,
     dirty: bool,
     pub in_thread: bool,
     pub top_note: Option<String>,
@@ -111,6 +112,15 @@ impl MsgList {
 
     /// Render every message at this width, keeping the cursor where it was
     /// on screen.
+    pub fn rebuild_for_pane(&mut self, ctx: &Ctx, width: usize, height: usize) {
+        let height = if self.line_scroll { None } else { Some(height) };
+        if self.pane_height != height {
+            self.pane_height = height;
+            self.dirty = true;
+        }
+        self.rebuild(ctx, width);
+    }
+
     pub fn rebuild(&mut self, ctx: &Ctx, width: usize) {
         if !self.dirty && self.flat_w == width {
             return;
@@ -163,7 +173,16 @@ impl MsgList {
             if new_here {
                 new_marked = true;
             }
-            let rendered = render::message_lines(m, ctx, width, self.in_thread);
+            let mut rendered = render::message_lines(m, ctx, width, self.in_thread);
+            if self.pane_height.is_some_and(|height| rendered.lines.len() + 2 > height / 2)
+                && rendered.lines.len() > 3
+            {
+                let remaining = rendered.lines.len() - 3;
+                rendered.lines.truncate(3);
+                rendered.lines.push(Line::from(format!("  ({remaining} more lines)")));
+                // Never paint a partial image over the preview or its count.
+                rendered.images.retain(|slot| slot.line + slot.rows as usize <= 3);
+            }
             self.first.push(self.flat.len());
             self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
             let base = self.flat.len();
@@ -214,6 +233,32 @@ impl MsgList {
             first.saturating_sub(back)
         };
         self.align_top = false;
+    }
+
+    /// Select a contiguous viewport containing complete message blocks only.
+    pub fn whole_message_viewport(&mut self, height: usize) -> usize {
+        if self.first.is_empty() || height == 0 { return 0; }
+        self.cursor = self.cursor.min(self.first.len() - 1);
+        self.line_scroll = false;
+        self.scroll = self.scroll.min(self.first[self.cursor]);
+        if let Some(index) = self.flat.get(self.scroll).and_then(|line| line.msg) {
+            self.scroll = self.first[index];
+        }
+        while self.last[self.cursor] >= self.scroll + height {
+            let Some(index) = (self.scroll..self.flat.len()).find_map(|row| self.flat[row].msg) else { break };
+            if index == self.cursor {
+                self.scroll = self.first[index];
+                break;
+            }
+            self.scroll = self.last[index] + 1;
+        }
+        let mut end = self.scroll;
+        while end < self.flat.len() {
+            let next = self.flat[end].msg.map_or(end + 1, |index| self.last[index] + 1);
+            if next > self.scroll + height { break; }
+            end = next;
+        }
+        end
     }
 
     pub fn ensure_visible(&mut self, height: usize) {
@@ -4811,6 +4856,7 @@ pub(crate) mod tests {
         let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
         draw(&mut app, &mut terminal);
         app.on_key(key(KeyCode::Char('l')));
+        draw(&mut app, &mut terminal);
         assert!(app.stack.is_empty());
         let first = app.active_list().unwrap().first[0];
         for n in 1..=12 {

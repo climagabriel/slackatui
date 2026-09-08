@@ -332,15 +332,24 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         palette,
     };
     let text_w = inner.width as usize - 2;
-    list.rebuild(&ctx, text_w);
-    list.ensure_visible(inner.height as usize);
+    if inner.height < 6 {
+        frame.render_widget(Paragraph::new("Enlarge pane to show a whole message"), inner);
+        return;
+    }
+    list.rebuild_for_pane(&ctx, text_w, inner.height as usize);
+    let end = if list.line_scroll {
+        list.ensure_visible(inner.height as usize);
+        (list.scroll + inner.height as usize).min(list.flat.len())
+    } else {
+        list.whole_message_viewport(inner.height as usize)
+    };
     let cursor = list.cursor;
     let first = list.first.get(cursor).copied();
     let last = list.last.get(cursor).copied();
     let scroll = list.scroll;
     let outline = Style::reset().fg(Color::Rgb(112, 112, 112)).bg(palette.get(Role::Background));
     let mut shown: Vec<Line> = Vec::with_capacity(inner.height as usize);
-    for (i, fl) in list.flat.iter().enumerate().skip(list.scroll).take(inner.height as usize) {
+    for (i, fl) in list.flat.iter().enumerate().skip(list.scroll).take(end - list.scroll) {
         let selected = fl.msg == Some(cursor);
         if selected && (first == Some(i) || last == Some(i)) {
             let (left, right) = if first == Some(i) { ("╭", "╮") } else { ("╰", "╯") };
@@ -350,7 +359,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut spans = vec![Span::styled(if selected { "│" } else { " " }, outline)];
         spans.extend(clip_line(fl.line.clone(), text_w).spans);
         let mut line = Line::from(spans).style(fl.line.style);
-        if !selected {
+        if fl.msg.is_some() && !selected {
             frame.buffer_mut().set_style(
                 Rect::new(inner.x, inner.y + (i - scroll) as u16, inner.width, 1),
                 muted_message_style(Style::default()),
@@ -368,7 +377,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .skip(list.scroll)
-        .take(inner.height as usize)
+        .take(end - list.scroll)
         .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s, fl.line.to_string(), fl.msg == Some(cursor))))
         .collect();
     for (row, slot, fallback, selected) in slots {
@@ -426,7 +435,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     if let (Some(first), Some(last)) = (first, last) {
         for row in 0..inner.height {
             let index = scroll + row as usize;
-            if index > first && index < last {
+            if index < end && index > first && index < last {
                 for x in [inner.x, inner.right() - 1] {
                     frame.buffer_mut()[(x, inner.y + row)].set_symbol("│").set_style(outline);
                 }
@@ -1178,6 +1187,60 @@ mod message_focus_tests {
     use serde_json::json;
 
     #[test]
+    fn whole_messages_collapse_resize_and_preserve_unread_divider() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        app.corpus.convs[0].last_read = 1_000_000;
+        let messages = (1..=8).map(|second| Msg::from_api("C1".into(), json!({
+            "ts": format!("{second}.000000"), "user": "U1",
+            "text": if second == 2 { (0..20).map(|n| format!("body {n}")).collect::<Vec<_>>().join("\n") } else { "short".into() }
+        })).unwrap()).collect();
+        app.open.as_mut().unwrap().list = MsgList::new(messages, false);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        for height in [20, 8, 12, 50, 20] {
+            terminal.backend_mut().resize(80, height);
+            terminal.resize(Rect::new(0, 0, 80, height)).unwrap();
+            for cursor in [0, 1, 2, 7, 6, 0] {
+                app.focus = Focus::Msgs;
+                let current = app.active_list().unwrap().cursor;
+                let direction = if cursor > current { 'j' } else { 'k' };
+                for _ in 0..cursor.abs_diff(current) {
+                    app.on_key(crate::event::KeyEvent::new(crate::event::KeyCode::Char(direction), crate::event::KeyModifiers::NONE));
+                }
+                terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
+                let list = app.active_list().unwrap();
+                let buffer = terminal.backend().buffer();
+                let first = list.first[cursor] - list.scroll + 1;
+                let last = list.last[cursor] - list.scroll + 1;
+                assert_eq!(buffer[(1, first as u16)].symbol(), "╭");
+                assert_eq!(buffer[(78, last as u16)].symbol(), "╯");
+                let end = list.scroll + height as usize - 2;
+                for index in 0..list.msgs.len() {
+                    if list.first[index] < list.scroll { assert!(list.last[index] < list.scroll); }
+                    if list.first[index] >= list.scroll && list.last[index] >= end {
+                        let row = list.first[index] - list.scroll + 1;
+                        if row + 1 < height as usize - 1 {
+                            assert!((2..78).all(|column| buffer[(column, row as u16 + 1)].symbol() == " "));
+                        }
+                    }
+                }
+                let preview: Vec<_> = list.flat[list.first[1]..=list.last[1]].iter().map(|line| line.line.to_string()).collect();
+                if height < 50 {
+                    assert_eq!(preview.len(), 6);
+                    assert!(preview[2].contains("body 0"));
+                    assert!(preview[3].contains("body 1"));
+                    assert!(preview[4].contains("(18 more lines)"));
+                } else { assert!(preview.len() > 6); }
+                for (row, line) in list.flat.iter().enumerate().skip(list.scroll).take(height as usize - 2) {
+                    if line.msg.is_none() && line.line.to_string().contains("new") {
+                        assert_eq!(buffer[(3, (row - list.scroll + 1) as u16)].fg, app.palette.get(Role::Unread));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn long_wide_header_cannot_cover_border_or_color_nonselected_background() {
         let mut app = mute_test_app();
         app.open_conv(0);
@@ -1269,17 +1332,11 @@ mod message_focus_tests {
                 }
             }
         }
-        // A message taller than the viewport retains its sides when scrolled;
-        // no false top/bottom cap is drawn through its text or images.
+        // A tiny pane shows a size hint rather than a partial message.
         terminal.backend_mut().resize(24, 6);
         terminal.resize(Rect::new(0, 0, 24, 6)).unwrap();
         terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
-        let list = app.active_list_mut().unwrap();
-        list.line_scroll = true;
-        list.scroll = list.first[list.cursor] + 2;
-        terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
-        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "│");
-        assert_eq!(terminal.backend().buffer()[(22, 1)].symbol(), "│");
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "E");
         // Originals remain colored after encoding both variants.
         let ImageState::Ready(original) = &app.images["F1"] else { panic!() };
         assert_eq!(original.to_rgba8().get_pixel(0,0).0, [255,0,0,255]);
