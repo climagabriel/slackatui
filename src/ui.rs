@@ -336,6 +336,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new("Enlarge pane to show a whole message"), inner);
         return;
     }
+    list.set_unread_count(last_read.and(conv.unread_count));
     list.rebuild_for_pane(&ctx, text_w, inner.height as usize);
     let end = if list.line_scroll {
         list.ensure_visible(inner.height as usize);
@@ -1185,6 +1186,55 @@ mod message_focus_tests {
     use crate::app::{MsgList, tests::mute_test_app};
     use crate::archive::Msg;
     use serde_json::json;
+
+    #[test]
+    fn opening_at_the_end_backfills_whole_collapsed_messages() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        let body = (0..50).map(|n| format!("body {n}")).collect::<Vec<_>>().join("\n");
+        let messages = (1..=20).map(|second| Msg::from_api("C1".into(), json!({
+            "ts":format!("{second}.000000"), "user":"U1", "text":if second == 20 { "final" } else { &body }
+        })).unwrap()).collect();
+        app.open.as_mut().unwrap().list = MsgList::new(messages, false);
+        app.open.as_mut().unwrap().list.cursor = 19;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
+        let list = app.active_list().unwrap();
+        let visible = list.first.iter().filter(|&&first| first >= list.scroll && first < list.scroll + 38).count();
+        assert_eq!(visible, 6);
+        assert!(list.flat.len() - list.scroll >= 34);
+        assert_eq!(list.cursor, 19);
+        let selected_last = list.last[19] - list.scroll + 1;
+        assert_eq!(terminal.backend().buffer()[(78, selected_last as u16)].symbol(), "╯");
+        // There is not enough spare space for another whole preceding message.
+        let previous = list.flat[list.scroll - 1].msg.unwrap();
+        assert!(list.flat.len() - list.first[previous] > 38);
+    }
+
+    #[test]
+    fn unread_divider_updates_count_without_message_changes() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        let messages = [1, 2, 86401].into_iter().map(|second| Msg::from_api("C1".into(), json!({
+            "ts":format!("{second}.000000"), "user":"U1", "text":"body"
+        })).unwrap()).collect();
+        app.open.as_mut().unwrap().list = MsgList::new(messages, false);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 25)).unwrap();
+        for marker in [1_000_000, 2_000_000] {
+            app.corpus.convs[0].last_read = marker;
+            app.active_list_mut().unwrap().mark_dirty();
+            for (count, label) in [(None, "new (—)"), (Some(3), "new (3)"), (Some(10), "new (9+)")] {
+                app.corpus.convs[0].unread_count = count;
+                terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
+                let buffer = terminal.backend().buffer();
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains(label));
+                let list = app.active_list().unwrap();
+                let divider = list.flat.iter().position(|line| line.msg.is_none() && line.line.to_string().contains(label)).unwrap();
+                assert_eq!(buffer[(3, (divider - list.scroll + 1) as u16)].fg, app.palette.get(Role::Unread));
+            }
+        }
+    }
 
     #[test]
     fn whole_messages_collapse_resize_and_preserve_unread_divider() {

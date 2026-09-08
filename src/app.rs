@@ -79,6 +79,7 @@ pub struct MsgList {
     pub last: Vec<usize>,
     flat_w: usize,
     pane_height: Option<usize>,
+    unread_count: Option<i64>,
     dirty: bool,
     pub in_thread: bool,
     pub top_note: Option<String>,
@@ -110,8 +111,15 @@ impl MsgList {
         self.dirty = true;
     }
 
-    /// Render every message at this width, keeping the cursor where it was
-    /// on screen.
+    /// Refresh the divider when a live unread count arrives.
+    pub fn set_unread_count(&mut self, count: Option<i64>) {
+        if self.unread_count != count {
+            self.unread_count = count;
+            self.dirty = true;
+        }
+    }
+
+    /// Render at the current pane size, keeping the selected message visible.
     pub fn rebuild_for_pane(&mut self, ctx: &Ctx, width: usize, height: usize) {
         let height = if self.line_scroll { None } else { Some(height) };
         if self.pane_height != height {
@@ -145,6 +153,12 @@ impl MsgList {
         }
         let mut prev_day = None;
         let mut new_marked = false;
+        let count = match self.unread_count {
+            Some(count) if count > 9 => "9+".to_string(),
+            Some(count) if count > 0 => count.to_string(),
+            _ => "—".to_string(),
+        };
+        let unread_label = format!("new ({count})");
         for (i, m) in self.msgs.iter().enumerate() {
             let day = ctx.tz.day(m.secs());
             // The first message past the read marker opens the unread part:
@@ -153,7 +167,7 @@ impl MsgList {
             if prev_day != Some(day) {
                 let text = ctx.tz.fmt(m.secs(), "%a %Y-%m-%d");
                 let line = if new_here {
-                    render::divider_new(&format!("{text} · new"), width, ctx.palette)
+                    render::divider_new(&format!("{text} · {unread_label}"), width, ctx.palette)
                 } else {
                     render::divider(&text, width)
                 };
@@ -166,7 +180,7 @@ impl MsgList {
             } else if new_here {
                 self.flat.push(FlatLine {
                     msg: None,
-                    line: render::divider_new("new", width, ctx.palette),
+                    line: render::divider_new(&unread_label, width, ctx.palette),
                     image: None,
                 });
             }
@@ -257,6 +271,13 @@ impl MsgList {
             let next = self.flat[end].msg.map_or(end + 1, |index| self.last[index] + 1);
             if next > self.scroll + height { break; }
             end = next;
+        }
+        // Near the end of history, use spare rows for preceding whole messages.
+        while self.scroll > 0 {
+            let previous = self.scroll - 1;
+            let start = self.flat[previous].msg.map_or(previous, |index| self.first[index]);
+            if end - start > height { break; }
+            self.scroll = start;
         }
         end
     }
@@ -481,6 +502,7 @@ pub struct App {
     pub bg: Option<Job>,
     profile_job: Option<Job>,
     unread_count_job: Option<Job>,
+    counts_pending: bool,
     group_job: Option<Job>,
     dm_users: HashMap<String, String>,
     /// A slackdump binary answers; the fallback engine.
@@ -621,6 +643,7 @@ impl App {
             bg: None,
             profile_job: None,
             unread_count_job: None,
+            counts_pending: false,
             group_job: None,
             dm_users: HashMap::new(),
             slackdump,
@@ -1971,6 +1994,7 @@ impl App {
             });
             self.stack.clear();
             self.focus = Focus::Msgs;
+            self.counts_pending = true;
             match self.api.clone() {
                 Some(c) if self.job.is_none() => {
                     self.job = Some(live::api_older(c, idx, cid, 0));
@@ -2018,6 +2042,7 @@ impl App {
         self.focus = Focus::Msgs;
         self.update_notes();
         self.status.clear();
+        self.counts_pending = true;
         // Whatever Slack has past the archive's end, quietly.
         if let Some(c) = self.api.clone() {
             if self.bg.is_none() && since > 0 {
@@ -2787,9 +2812,24 @@ impl App {
         }
     }
 
+    fn pump_requested_counts(&mut self) {
+        if self.counts_pending && self.bg.is_none() && self.unread_count_job.is_none() {
+            if let Some(client) = self.api.clone() {
+                self.counts_pending = false;
+                self.bg = Some(live::api_counts(client, self.counts_gen));
+            }
+        }
+    }
+
     fn unread_count_targets(&self) -> Vec<String> {
-        if self.pane_settings.number != crate::conversations_pane::NumberColumn::Unread { return Vec::new(); }
-        self.filtered.iter().map(|&index| self.corpus.convs[index].id.clone()).collect()
+        let mut targets: Vec<String> = if self.pane_settings.number == crate::conversations_pane::NumberColumn::Unread {
+            self.filtered.iter().map(|&index| self.corpus.convs[index].id.clone()).collect()
+        } else { Vec::new() };
+        if let Some(open) = &self.open {
+            let id = &self.corpus.convs[open.conv].id;
+            if !targets.contains(id) { targets.push(id.clone()); }
+        }
+        targets
     }
 
     /// Unread markers from `client.counts`, and last activity for
@@ -3495,6 +3535,7 @@ impl App {
                 }
             }
         }
+        self.pump_requested_counts();
         if let Some(c) = self.api.clone() {
             if self.starred_pending && self.bg.is_none()
                 && !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::SetStarred)) {
@@ -4949,6 +4990,30 @@ pub(crate) mod tests {
         assert!(!app.active_list().unwrap().line_scroll);
         app.on_key(key(KeyCode::Char('h')));
         assert!(app.open.is_none());
+    }
+
+    #[test]
+    fn opening_requests_counts_without_polling_and_waits_for_busy_lookup() {
+        let mut app = mute_test_app();
+        app.pane_settings.number = crate::conversations_pane::NumberColumn::Hidden;
+        let client = Arc::new(Client::for_test(|method, _| {
+            assert_eq!(method, "client.counts");
+            Ok(json!({"channels":[]}))
+        }));
+        assert_eq!(app.poll_every, Duration::ZERO);
+        // An earlier enrichment is still occupying its separate slot.
+        app.unread_count_job = Some(live::api_unread_counts(client.clone(), 0, json!({}), vec![]));
+        app.open_conv(0);
+        app.api = Some(client);
+        assert_eq!(app.unread_count_targets(), vec!["C1"]);
+        assert!(app.counts_pending);
+        app.pump_requested_counts();
+        assert!(app.counts_pending);
+        assert!(app.bg.is_none());
+        app.unread_count_job = None;
+        app.pump_requested_counts();
+        assert!(!app.counts_pending);
+        assert!(matches!(app.bg.as_ref().map(|job| &job.kind), Some(JobKind::Counts { .. })));
     }
 
     #[test]
