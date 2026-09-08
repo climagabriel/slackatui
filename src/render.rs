@@ -48,6 +48,12 @@ impl Tz {
         .unwrap_or(0)
     }
 
+    pub fn date_label(self, secs: i64, today: i64) -> String {
+        let day = self.day(secs);
+        if day != 0 && day == today { "Today".into() }
+        else { self.fmt(secs, "%a %Y-%m-%d") }
+    }
+
     /// Midnight of a calendar day, as unix seconds.
     pub fn midnight(self, date: NaiveDate) -> Option<i64> {
         let ndt = date.and_hms_opt(0, 0, 0)?;
@@ -1115,15 +1121,15 @@ fn human_bytes(n: i64) -> String {
 
 /// One message as lines: header, wrapped body, files, reactions, thread
 /// footer. `in_thread` drops the footer (the replies are on screen).
-pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool) -> Rendered {
+pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i64) -> Rendered {
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let time = ctx.tz.fmt(
+    let time = format!("{} {}", ctx.tz.date_label(m.secs(), today), ctx.tz.fmt(
         m.secs(),
         match ctx.tz {
-            Tz::Utc => "%a %Y-%m-%d %H:%M UTC",
-            Tz::Local => "%a %Y-%m-%d %H:%M %:z",
+            Tz::Utc => "%H:%M UTC",
+            Tz::Local => "%H:%M %:z",
         },
-    );
+    ));
     let sub = m.subtype.as_deref().unwrap_or("");
     if is_system(m) {
         let text = match sub {
@@ -1412,7 +1418,7 @@ mod tests {
         for image_font in [None, Some((8, 16))] {
             context.image_font = image_font;
             for thread in [false, true] {
-                let rendered = message_lines(&message, &context, 120, thread);
+                let rendered = message_lines(&message, &context, 120, thread, 0);
                 assert!(rendered.images.is_empty());
                 assert!(rendered.lines.iter().any(|line| line_text(line).contains(":eyes: 2   :custom_emoji: 3")));
             }
@@ -1431,8 +1437,8 @@ mod tests {
         let mut without = with.clone();
         without.data.as_object_mut().unwrap().remove("reactions");
         for width in [12,20,40] {
-            let baseline = message_lines(&without,&context,width,true).lines.len();
-            let rendered = message_lines(&with,&context,width,true);
+            let baseline = message_lines(&without,&context,width,true,0).lines.len();
+            let rendered = message_lines(&with,&context,width,true,0);
             let footer = &rendered.lines[baseline..];
             assert!(footer.len()>1);
             assert!(footer.iter().all(|line| line.width()<=width));
@@ -1442,10 +1448,41 @@ mod tests {
     }
 
     #[test]
+    fn today_labels_use_the_selected_calendar_date_in_headers() {
+        let archive = Archive::stub(&[("U1", "Ada")], &[]);
+        let corpus = Corpus::stub(&[]);
+        let mut context = ctx(&archive, &corpus);
+        let reference = Utc.with_ymd_and_hms(2026, 9, 8, 0, 30, 0).unwrap().timestamp();
+        for timezone in [Tz::Utc, Tz::Local] {
+            context.tz = timezone;
+            let date = |seconds| match timezone {
+                Tz::Utc => Utc.timestamp_opt(seconds,0).unwrap().date_naive(),
+                Tz::Local => Local.timestamp_opt(seconds,0).unwrap().date_naive(),
+            };
+            for seconds in [reference-86400, reference, reference+8*3600, reference+86400] {
+                let expected = if date(seconds)==date(reference) {"Today".to_string()}
+                    else {timezone.fmt(seconds,"%a %Y-%m-%d")};
+                assert_eq!(timezone.date_label(seconds,timezone.day(reference)),expected);
+                for subtype in ["", "channel_join"] {
+                    let message = Msg::from_api("C1".into(),serde_json::json!({
+                        "ts":format!("{seconds}.000000"),"user":"U1","text":"hello","subtype":subtype
+                    })).unwrap();
+                    let time = timezone.fmt(seconds,match timezone {Tz::Utc=>"%H:%M UTC",Tz::Local=>"%H:%M %:z"});
+                    for thread in [false,true] {
+                        let rendered = message_lines(&message,&context,120,thread,timezone.day(reference));
+                        assert!(line_text(&rendered.lines[0]).starts_with(&format!("{expected} {time}")));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn message_headers_include_date_and_timezone() {
         let a = Archive::stub(&[("U1", "Ada")], &[]);
         let corpus = Corpus::stub(&[]);
         let mut c = ctx(&a, &corpus);
+        let reference = Utc.with_ymd_and_hms(2026, 9, 9, 12, 0, 0).unwrap().timestamp();
         let secs = Utc
             .with_ymd_and_hms(2026, 9, 7, 10, 59, 0)
             .unwrap()
@@ -1460,7 +1497,7 @@ mod tests {
             )
             .unwrap();
             for in_thread in [false, true] {
-                let rendered = message_lines(&m, &c, 120, in_thread);
+                let rendered = message_lines(&m, &c, 120, in_thread, c.tz.day(reference));
                 assert!(line_text(&rendered.lines[0]).starts_with("Mon 2026-09-07 10:59 UTC"));
             }
             c.tz = Tz::Local;
@@ -1469,7 +1506,7 @@ mod tests {
                 .unwrap()
                 .format("%a %Y-%m-%d %H:%M %:z")
                 .to_string();
-            assert!(line_text(&message_lines(&m, &c, 120, false).lines[0]).starts_with(&expected));
+            assert!(line_text(&message_lines(&m, &c, 120, false, c.tz.day(reference)).lines[0]).starts_with(&expected));
             c.tz = Tz::Utc;
         }
     }

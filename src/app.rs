@@ -78,6 +78,7 @@ pub struct MsgList {
     pub first: Vec<usize>,
     pub last: Vec<usize>,
     flat_w: usize,
+    flat_date: Option<(Tz, i64)>,
     pane_height: Option<usize>,
     unread_count: Option<i64>,
     dirty: bool,
@@ -130,7 +131,11 @@ impl MsgList {
     }
 
     pub fn rebuild(&mut self, ctx: &Ctx, width: usize) {
-        if !self.dirty && self.flat_w == width {
+        self.rebuild_on_day(ctx, width, ctx.tz.day(chrono::Utc::now().timestamp()));
+    }
+
+    fn rebuild_on_day(&mut self, ctx: &Ctx, width: usize, today: i64) {
+        if !self.dirty && self.flat_w == width && self.flat_date == Some((ctx.tz, today)) {
             return;
         }
         let inside = self
@@ -165,7 +170,7 @@ impl MsgList {
             // its day divider lights up, or a "new" line stands in for one.
             let new_here = !new_marked && ctx.last_read.is_some_and(|lr| m.id > lr);
             if prev_day != Some(day) {
-                let text = ctx.tz.fmt(m.secs(), "%a %Y-%m-%d");
+                let text = ctx.tz.date_label(m.secs(), today);
                 let line = if new_here {
                     render::divider_new(&format!("{text} · {unread_label}"), width, ctx.palette)
                 } else {
@@ -187,7 +192,7 @@ impl MsgList {
             if new_here {
                 new_marked = true;
             }
-            let mut rendered = render::message_lines(m, ctx, width, self.in_thread);
+            let mut rendered = render::message_lines(m, ctx, width, self.in_thread, today);
             if self.pane_height.is_some_and(|height| rendered.lines.len() + 2 > height / 2)
                 && rendered.lines.len() > 3
             {
@@ -232,6 +237,7 @@ impl MsgList {
             });
         }
         self.flat_w = width;
+        self.flat_date = Some((ctx.tz, today));
         self.dirty = false;
         let first = self.first.get(self.cursor).copied().unwrap_or(0);
         // A fresh list, or a jump, keeps the line above the cursor on screen:
@@ -4439,6 +4445,34 @@ pub(crate) mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn cached_today_labels_refresh_at_midnight_in_headers_and_dividers() {
+        let reference = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc,2026,9,8,12,0,0).unwrap().timestamp();
+        let corpus = Corpus::stub(&[]);
+        let palette = Palette::default();
+        let mut context = Ctx {archive:None,corpus:&corpus,tz:Tz::Utc,
+            image_font:None,last_read:Some(reference*1_000_000-1),palette:&palette};
+        for thread in [false,true] {
+            let mut list = MsgList::new(vec![msg(reference,"first"),msg(reference+86400,"second")],thread);
+            list.set_unread_count(Some(2));
+            let today = context.tz.day(reference);
+            list.rebuild_on_day(&context,120,today);
+            assert!(list.flat[list.first[0]+1].line.to_string().starts_with("Today 12:00 UTC"));
+            assert!(list.flat.iter().any(|row| row.msg.is_none() && row.line.to_string().contains("Today · new (2)")));
+            assert!(list.flat[list.first[1]+1].line.to_string().starts_with("Wed 2026-09-09"));
+            assert!(!list.dirty);
+            list.rebuild_on_day(&context,120,today+1);
+            assert!(list.flat[list.first[0]+1].line.to_string().starts_with("Tue 2026-09-08"));
+            assert!(list.flat[list.first[1]+1].line.to_string().starts_with("Today 12:00 UTC"));
+            assert!(list.flat.iter().any(|row| row.msg.is_none() && row.line.to_string().contains("Tue 2026-09-08 · new (2)")));
+            // A timezone change also invalidates an otherwise unchanged list.
+            context.tz = Tz::Local;
+            list.rebuild_on_day(&context,120,context.tz.day(reference+86400));
+            assert!(list.flat[list.first[1]+1].line.to_string().starts_with(&format!("Today {}",context.tz.fmt(reference+86400,"%H:%M %:z"))));
+            context.tz = Tz::Utc;
+        }
     }
 
     #[test]
