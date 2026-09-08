@@ -137,8 +137,8 @@ impl Action {
 pub const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::Down, &["j", "down"]),
     (Action::Up, &["k", "up"]),
-    (Action::HalfPageDown, &["ctrl-d"]),
-    (Action::HalfPageUp, &["ctrl-u"]),
+    (Action::HalfPageDown, &["ctrl-d", "f"]),
+    (Action::HalfPageUp, &["ctrl-u", "b"]),
     (Action::PageDown, &["ctrl-f", "page-down"]),
     (Action::PageUp, &["ctrl-b", "page-up"]),
     (Action::First, &["g", "home"]),
@@ -431,6 +431,13 @@ impl Keymap {
                 keymap.bindings.push((chord, *action));
             }
         }
+        // Add the new aliases to unchanged old defaults, without stealing a custom key.
+        for (action, old, alias) in [(Action::HalfPageDown,"ctrl-d","f"),(Action::HalfPageUp,"ctrl-u","b")] {
+            if object.get(action.key()) == Some(&serde_json::json!([old])) {
+                let chord=Chord::parse(alias).unwrap();
+                if !keymap.bindings.iter().any(|(key,_)|*key==chord) { keymap.bind(action,chord,true); }
+            }
+        }
         Ok(keymap)
     }
 
@@ -608,6 +615,13 @@ mod tests {
         let explicit = Keymap::load(Some(&path)).unwrap();
         assert_eq!(explicit.action(press(KeyCode::Char('T'), false)), Some(Action::MyThreads));
         assert_eq!(explicit.action(press(KeyCode::F(6), false)), Some(Action::ChannelTabs));
+        std::fs::write(&path, r#"{"half_page_down":["ctrl-d"],"half_page_up":["ctrl-u"]}"#).unwrap();
+        let migrated=Keymap::load(Some(&path)).unwrap();
+        assert_eq!(migrated.action(press(KeyCode::Char('f'),false)),Some(Action::HalfPageDown));
+        assert_eq!(migrated.action(press(KeyCode::Char('b'),false)),Some(Action::HalfPageUp));
+        std::fs::write(&path, r#"{"half_page_down":["ctrl-d"],"archive":["f"]}"#).unwrap();
+        let custom=Keymap::load(Some(&path)).unwrap();
+        assert_eq!(custom.action(press(KeyCode::Char('f'),false)),Some(Action::Archive));
         std::fs::write(&path, "{\"quit\":[\"meta-q\"]}\n").unwrap();
         let error = Keymap::load(Some(&path)).unwrap_err();
         assert!(error.contains("unknown key"), "{error}");

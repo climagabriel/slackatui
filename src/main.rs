@@ -150,7 +150,7 @@ environment
                        (derived from the DM archive otherwise)
 
 keys (also ? inside)
-  j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
+  j/k move, f/b half page down/up, g/G oldest/newest, h/l or Tab panes,
   Enter thread, Esc back, / a command (Tab completes: upload, keys,
   colorpalette, version, find, search, leave, mute, unmute, star, unstar, pin, unpin, cache),
   d go to date, v raw JSON,

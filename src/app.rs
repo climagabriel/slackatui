@@ -4193,8 +4193,8 @@ impl App {
             (KeyCode::Char('k'), false) | (KeyCode::Up, _) => browser.move_cursor(-1),
             (KeyCode::Char('g'), false) | (KeyCode::Home, _) => browser.move_cursor(isize::MIN),
             (KeyCode::Char('G'), false) | (KeyCode::End, _) => browser.move_cursor(isize::MAX),
-            (KeyCode::Char('d'), true) => browser.scroll_lines(height / 2),
-            (KeyCode::Char('u'), true) => browser.scroll_lines(-height / 2),
+            (KeyCode::Char('d'), true) | (KeyCode::Char('f'), false) => browser.scroll_lines(height / 2),
+            (KeyCode::Char('u'), true) | (KeyCode::Char('b'), false) => browser.scroll_lines(-height / 2),
             (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => browser.scroll_lines(height),
             (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => browser.scroll_lines(-height),
             _ => {}
@@ -4272,8 +4272,8 @@ impl App {
         match (k.code, ctrl) {
             (KeyCode::Char('j'), false) | (KeyCode::Down, _) => *scroll = (*scroll + 1).min(max),
             (KeyCode::Char('k'), false) | (KeyCode::Up, _) => *scroll = scroll.saturating_sub(1),
-            (KeyCode::Char('d'), true) => *scroll = (*scroll + height / 2).min(max),
-            (KeyCode::Char('u'), true) => *scroll = scroll.saturating_sub(height / 2),
+            (KeyCode::Char('d'), true) | (KeyCode::Char('f'), false) => *scroll = (*scroll + height / 2).min(max),
+            (KeyCode::Char('u'), true) | (KeyCode::Char('b'), false) => *scroll = scroll.saturating_sub(height / 2),
             (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => {
                 *scroll = (*scroll + height).min(max)
             }
@@ -4293,9 +4293,10 @@ impl App {
     }
 
     fn on_conv_key(&mut self, action: Option<Action>) {
+        let half_page = (self.msgs_height.max(2) / 2) as isize;
         let delta = match action {
             Some(Action::Down) => Some(1), Some(Action::Up) => Some(-1),
-            Some(Action::HalfPageDown) => Some(10), Some(Action::HalfPageUp) => Some(-10),
+            Some(Action::HalfPageDown) => Some(half_page), Some(Action::HalfPageUp) => Some(-half_page),
             Some(Action::PageDown) => Some(20), Some(Action::PageUp) => Some(-20),
             Some(Action::First) => Some(isize::MIN), Some(Action::Last) => Some(isize::MAX), _ => None,
         };
@@ -5539,6 +5540,34 @@ pub(crate) mod tests {
             app.on_msg_key(Some(Action::Back)); assert!(matches!(app.stack.last(),Some(View::Saved {..})));
             app.on_msg_key(Some(Action::Back)); assert!(app.focus == Focus::Convs);
         }
+    }
+
+    #[test]
+    fn plain_half_page_keys_preserve_text_input_and_readers() {
+        let mut app=mute_test_app();app.msgs_height=10;
+        app.merge_conversations((0..30).map(|i|json!({"id":format!("CEXTRA{i}"),"name":format!("extra{i}"),"is_member":true})).collect());
+        app.top_section=Some(TopSection::Saved);
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,3);
+        app.on_key(KeyEvent::new(KeyCode::Char('b'),KeyModifiers::NONE));assert_eq!(app.top_section,Some(TopSection::Saved));
+        app.msgs_height=20;
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,8);
+        app.msgs_height=10;
+        app.stack.push(View::Reactions {title:"reactions".into(),lines:vec!["reaction".into();100],scroll:0});
+        for (key,expected) in [('f',5),('j',6),('k',5),('b',0)] {
+            app.on_key(KeyEvent::new(KeyCode::Char(key),KeyModifiers::NONE));
+            assert!(matches!(app.stack.last(),Some(View::Reactions {scroll,..}) if *scroll==expected));
+        }
+        app.stack.clear();app.open_command();
+        for key in ['f','b'] {app.on_key(KeyEvent::new(KeyCode::Char(key),KeyModifiers::NONE));}
+        assert!(matches!(&app.mode,Mode::Prompt {buf,..} if buf.text=="fb"));
+        app.mode=Mode::Normal;
+        let mut browser=crate::raw::Browser::new(&json!({"text":"line\n".repeat(100)}));
+        browser.scroll=20;
+        app.stack.push(View::Raw {title:"raw".into(),browser});
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(),Some(View::Raw {browser,..}) if browser.scroll==24));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'),KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(),Some(View::Raw {browser,..}) if browser.scroll==20));
     }
 
     #[test]
