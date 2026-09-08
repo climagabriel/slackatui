@@ -118,10 +118,27 @@ pub fn load(client: &Client, channel: &str, file: &str) -> Result<Location, Stri
     let (ts, root_ts) = share(&info["file"], channel)?;
     let focus = ts_to_id(&ts).ok_or("Invalid sharing timestamp")?;
     let root = ts_to_id(&root_ts).ok_or("Invalid thread timestamp")?;
+    let location = message_context(client, channel, focus, root)?;
+    let timeline = &location.timeline;
+    let replies = &location.replies;
+    let target = if focus == root { &timeline } else { &replies };
+    if !target.iter().any(|m| {
+        m.id == focus
+            && m.data["files"]
+                .as_array()
+                .is_some_and(|files| files.iter().any(|f| f["id"].as_str() == Some(file)))
+    }) {
+        return Err("The sharing message no longer contains this file in Slack.".into());
+    }
+    Ok(location)
+}
+
+pub fn message_context(client: &Client, channel: &str, focus: i64, root: i64) -> Result<Location, String> {
+    let root_ts = crate::live::id_to_ts(root);
     let (mut timeline, has_older) = history_page(client, channel, Some(&root_ts), None, true, 40)?;
     if !timeline.iter().any(|m| m.id == root) {
         return Err(
-            "The sharing message or its thread root is no longer available in Slack.".into(),
+            "The message or its thread root is no longer available in Slack.".into(),
         );
     }
     let (newer, has_newer) = newer(client, channel, &root_ts, 40)?;
@@ -137,14 +154,8 @@ pub fn load(client: &Client, channel: &str, file: &str) -> Result<Location, Stri
     } else {
         vec![]
     };
-    let target = if focus == root { &timeline } else { &replies };
-    if !target.iter().any(|m| {
-        m.id == focus
-            && m.data["files"]
-                .as_array()
-                .is_some_and(|files| files.iter().any(|f| f["id"].as_str() == Some(file)))
-    }) {
-        return Err("The sharing message no longer contains this file in Slack.".into());
+    if !(if focus == root { &timeline } else { &replies }).iter().any(|message| message.id == focus) {
+        return Err("Message is no longer available in Slack".into());
     }
     Ok(Location {
         channel: channel.into(),

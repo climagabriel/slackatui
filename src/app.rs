@@ -473,6 +473,7 @@ pub struct App {
     pub saved_messages: Vec<Msg>,
     pub open: Option<Open>,
     pub stack: Vec<View>,
+    sent_return: Option<(Option<Open>, Vec<View>, usize)>,
     pub mode: Mode,
     pub help: bool,
     pub status: String,
@@ -623,6 +624,7 @@ impl App {
             saved_messages: Vec::new(),
             open: None,
             stack: Vec::new(),
+            sent_return: None,
             mode: Mode::Normal,
             help: false,
             status: keys_status,
@@ -1359,6 +1361,7 @@ impl App {
     }
 
     fn open_sent(&mut self) {
+        self.sent_return = None;
         self.invalidate_thread_jobs();
         if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
         self.sent_generation = self.sent_generation.wrapping_add(1);
@@ -1404,6 +1407,7 @@ impl App {
     }
 
     fn open_saved(&mut self) {
+        self.sent_return = None;
         self.invalidate_thread_jobs();
         if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
         self.refresh_saved(None);
@@ -1901,6 +1905,7 @@ impl App {
     }
 
     pub fn open_conv(&mut self, idx: usize) -> bool {
+        if self.open.as_ref().map(|open| open.conv) != Some(idx) { self.sent_return = None; }
         self.invalidate_thread_jobs();
         self.top_section = None;
         let conv = &self.corpus.convs[idx];
@@ -2079,6 +2084,50 @@ impl App {
         self.update_notes();
     }
 
+    fn open_sent_context(&mut self) {
+        let Some(message) = self.selected().cloned() else { return; };
+        let Some(View::Sent { generation, .. }) = self.stack.last() else { return; };
+        let generation = *generation;
+        if self.job.is_some() { self.status = "A fetch is running; retry when it finishes".into(); return; }
+        if self.corpus.conv_by_channel(&message.channel_id).is_none() {
+            self.status = "Conversation is unavailable; refresh the conversation list".into(); return;
+        }
+        if let Some(client) = self.api.clone() {
+            let channel = message.channel_id.clone();
+            let focus = message.id;
+            self.job = Some(live::spawn(JobKind::SentContext { generation, focus, channel: channel.clone() }, "opening sent message".into(), move || {
+                crate::file_message::message_context(&client, &channel, focus, focus).map(Done::MessageContext)
+            }));
+        } else {
+            let Some(archive) = self.corpus.conv_by_channel(&message.channel_id)
+                .and_then(|index| self.corpus.conv_archive(&self.corpus.convs[index])) else {
+                self.status = "Conversation is not cached; sign in to Slack".into(); return;
+            };
+            let mut timeline = match archive.timeline_page(&message.channel_id, Some(message.id), None, PAGE / 2) {
+                Ok(messages) => messages, Err(error) => { self.status = format!("Archive: {error}"); return; }
+            };
+            let has_older = timeline.len() == PAGE / 2;
+            let newer = match archive.timeline_page(&message.channel_id, None, Some(message.id), PAGE / 2) {
+                Ok(messages) => messages, Err(error) => { self.status = format!("Archive: {error}"); return; }
+            };
+            let has_newer = newer.len() == PAGE / 2;
+            timeline.extend(newer);
+            if !timeline.iter().any(|item| item.id == message.id) { timeline.push(message.clone()); }
+            timeline.sort_by_key(|item| item.id);
+            self.apply_sent_context(crate::file_message::Location { channel: message.channel_id, focus: message.id,
+                root: message.id, timeline, replies: vec![], has_older, has_newer }, false);
+        }
+    }
+
+    fn apply_sent_context(&mut self, location: crate::file_message::Location, api_only: bool) {
+        if !matches!(self.stack.last(), Some(View::Sent {..})) { return; }
+        self.sent_return = Some((self.open.take(), std::mem::take(&mut self.stack), self.conv_cursor));
+        self.open_file_message(location);
+        if let Some(open) = &mut self.open { open.api_only = api_only; }
+        self.top_section = None;
+        self.status = "Opened sent message · h: back to SENT".into();
+    }
+
     fn open_file_message(&mut self, location: crate::file_message::Location) {
         let Some(conv) = self.corpus.conv_by_channel(&location.channel) else {
             if let Some(browser) = &mut self.channel_browser { browser.message_unavailable(); }
@@ -2154,7 +2203,7 @@ impl App {
             if let View::Search {live_pending,..}=view { *live_pending=false; }
         }
         for slot in [&mut self.job, &mut self.bg] {
-            if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. } | JobKind::Sent { .. } | JobKind::Search { .. })) { *slot = None; }
+            if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. } | JobKind::Sent { .. } | JobKind::SentContext { .. } | JobKind::Search { .. })) { *slot = None; }
         }
     }
 
@@ -3177,6 +3226,7 @@ impl App {
             self.apply_filter();
         }
         self.open = None;
+        self.sent_return = None;
         self.stack.clear();
         self.status.clear();
         self.focus = Focus::Convs;
@@ -3564,6 +3614,10 @@ impl App {
         if let JobKind::MessageLink { raw_id, .. } = &job.kind {
             if !matches!(self.stack.last(), Some(View::Raw { browser, .. }) if browser.id == *raw_id) { return; }
         }
+        if let JobKind::SentContext { generation, focus, channel } = &job.kind {
+            if !job.navigate_on_completion || !matches!(self.stack.last(), Some(View::Sent { generation: current, list, .. })
+                if current == generation && list.selected().is_some_and(|message| message.id == *focus && message.channel_id == *channel)) { return; }
+        }
         let done = match outcome {
             Ok(d) => d,
             Err(e) => {
@@ -3614,6 +3668,7 @@ impl App {
                     if new == 1 { "" } else { "s" }
                 );
             }
+            (JobKind::SentContext { .. }, Done::MessageContext(location)) => self.apply_sent_context(location, true),
             (JobKind::Saved, Done::Saved(messages)) => self.apply_saved(messages),
             (JobKind::Sent { generation, append }, Done::SentPage(page)) => self.apply_sent(generation, append, page),
             (JobKind::MessageLink { raw_id, link }, Done::ThreadMsgs(messages)) => {
@@ -4154,7 +4209,9 @@ impl App {
             && action == Some(Action::Open)
             && matches!(k.code, KeyCode::Char('l') | KeyCode::Right)
         {
-            if !matches!(self.stack.last(), Some(View::Thread { .. }))
+            if matches!(self.stack.last(), Some(View::Sent { .. })) {
+                self.on_msg_key(Some(Action::Open));
+            } else if !matches!(self.stack.last(), Some(View::Thread { .. }))
                 && self.selected().is_some_and(|message| message.has_thread() || message.parent_id.is_some())
             {
                 self.on_msg_key(Some(Action::Open));
@@ -4453,7 +4510,10 @@ impl App {
                 }
             }
             Some(Action::Open) => {
-                if matches!(self.stack.last(), Some(View::Thread { .. })) {
+                if matches!(self.stack.last(), Some(View::Sent { .. }))
+                    && self.selected().is_some_and(|message| message.parent_id.is_none() && !message.has_thread()) {
+                    self.open_sent_context();
+                } else if matches!(self.stack.last(), Some(View::Thread { .. })) {
                     self.open_raw();
                 } else if let Some(m) = self.selected() {
                     let (cid, root, id) = (m.channel_id.clone(), m.thread_root(), m.id);
@@ -4523,6 +4583,14 @@ impl App {
                     list.line_scroll = false;
                     self.status.clear();
                     return;
+                }
+                if self.stack.is_empty() {
+                    if let Some((open, stack, cursor)) = self.sent_return.take() {
+                        self.invalidate_thread_jobs();
+                        self.open = open; self.stack = stack; self.conv_cursor = cursor;
+                        self.top_section = Some(TopSection::Sent); self.status.clear();
+                        return;
+                    }
                 }
                 // Unwind one stacked view; from the bare timeline, straight home.
                 if matches!(self.stack.last(), Some(View::Thread { .. } | View::Search { .. })) { self.invalidate_thread_jobs(); }
@@ -5644,6 +5712,44 @@ pub(crate) mod tests {
         let target=app.compose_target().unwrap();
         assert_eq!(target.cid,app.corpus.convs[app.filtered[1]].id);assert!(target.thread.is_none());
         for section in [TopSection::Saved,TopSection::Sent] {app.top_section=Some(section);assert!(app.compose_target().is_err());}
+    }
+
+    #[test]
+    fn sent_dm_opens_context_and_returns_to_sent() {
+        for key in [KeyCode::Char('l'), KeyCode::Enter] {
+            let mut app=mute_test_app();
+            app.merge_conversations(vec![json!({"id":"DTEST","is_im":true,"user":"U2"})]);
+            app.open_sent(); let generation=app.sent_generation;
+            let mut message=msg(2,"sent DM"); message.channel_id="DTEST".into();
+            app.apply_sent(generation,false,crate::sent::Page {messages:vec![message],next_cursor:None});
+            app.api=Some(Arc::new(Client::for_test(|method,params| {
+                assert_eq!(method,"conversations.history");
+                assert!(params.contains(&("channel","DTEST")));
+                if params.contains(&("inclusive","true")) {
+                    Ok(json!({"messages":[{"ts":"2.000000","text":"sent DM"},{"ts":"1.000000","text":"before"}]}))
+                } else { Ok(json!({"messages":[{"ts":"3.000000","text":"after"}]})) }
+            })));
+            app.on_key(KeyEvent::new(key,KeyModifiers::NONE));
+            let job=app.job.take().unwrap();
+            let outcome=job.wait_for_test();
+            app.job=Some(Job::completed_for_test(job.kind,outcome)); app.tick();
+            assert!(app.stack.is_empty()); assert!(app.in_timeline());
+            assert_eq!(app.selected().unwrap().text,"sent DM");
+            assert_eq!(app.active_list().unwrap().len(),3);
+            assert_eq!(app.corpus.convs[app.open.as_ref().unwrap().conv].id,"DTEST");
+            app.open_conv(app.open.as_ref().unwrap().conv);
+            assert!(app.sent_return.is_some());
+            app.on_key(KeyEvent::new(KeyCode::Char('h'),KeyModifiers::NONE));
+            assert!(matches!(app.stack.last(),Some(View::Sent {..})));
+            assert_eq!(app.selected().unwrap().text,"sent DM"); assert!(app.sent_return.is_none());
+            app.job=Some(Job::completed_for_test(JobKind::SentContext {generation,focus:2_000_000,channel:"DTEST".into()},Err("offline".into())));
+            app.tick(); assert!(matches!(app.stack.last(),Some(View::Sent {..}))); assert!(app.status.contains("offline"));
+            app.on_key(KeyEvent::new(key,KeyModifiers::NONE));
+            let job=app.job.take().unwrap(); let outcome=job.wait_for_test();
+            app.escape_home();
+            app.job=Some(Job::completed_for_test(job.kind,outcome)); app.tick();
+            assert!(app.open.is_none()); assert!(app.stack.is_empty());
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::archive::Msg;
 use crate::auth;
 
 pub enum JobKind {
+    SentContext { generation: u64, focus: i64, channel: String },
     Sent { generation: u64, append: bool },
     Saved,
     MessageLink { raw_id: u64, link: crate::raw::Link },
@@ -96,6 +97,7 @@ pub enum JobKind {
 impl JobKind {
     fn log_name(&self) -> &'static str {
         match self {
+            Self::SentContext {..} => "sent_context",
             Self::MessageLink {..} => "message_link",
             Self::Saved => "saved_messages",
             Self::Sent { .. } => "sent_messages",
@@ -112,6 +114,7 @@ impl JobKind {
 }
 
 pub enum Done {
+    MessageContext(crate::file_message::Location),
     SentPage(crate::sent::Page),
     Saved(Vec<Msg>),
     Refreshed,
@@ -155,6 +158,11 @@ pub struct Job {
 }
 
 impl Job {
+    #[cfg(test)]
+    pub(crate) fn wait_for_test(&self) -> Result<Done, String> {
+        self.rx.recv_timeout(std::time::Duration::from_secs(2)).expect("job timed out")
+    }
+
     #[cfg(test)]
     pub(crate) fn completed_for_test(kind: JobKind, outcome: Result<Done, String>) -> Self {
         let (sender, rx) = mpsc::channel();
