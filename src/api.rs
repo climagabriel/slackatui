@@ -11,6 +11,8 @@ use crate::auth::Auth;
 pub struct Client {
     agent: ureq::Agent,
     auth: Auth,
+    unread_rotation: std::sync::atomic::AtomicUsize,
+    unread_counts: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
     #[cfg(test)]
     mock: Option<Box<dyn Fn(&str, &[(&str, &str)]) -> Result<Value, String> + Send + Sync>>,
 }
@@ -32,6 +34,8 @@ impl Client {
         Client {
             agent: agent(),
             auth,
+            unread_counts: Default::default(),
+            unread_rotation: Default::default(),
             #[cfg(test)]
             mock: None,
         }
@@ -428,10 +432,62 @@ impl Client {
             .unwrap_or_default())
     }
 
+    /// Fetch at most ten new counts per poll; unchanged snapshots reuse counts.
+    pub fn enrich_unread_counts(&self, mut snapshot: Value, targets: &[String]) -> Result<Value, String> {
+        let mut cache = self.unread_counts.lock().unwrap_or_else(|error| error.into_inner());
+        let mut budget = 10;
+        let mut entries: Vec<&mut Value> = snapshot.as_object_mut().into_iter()
+            .flat_map(|object| object.iter_mut())
+            .filter(|(key, _)| ["channels", "ims", "mpims"].contains(&key.as_str()))
+            .flat_map(|(_, value)| value.as_array_mut().into_iter().flatten())
+            .filter(|conversation| conversation["id"].as_str().is_some_and(|id| targets.iter().any(|target| target == id)))
+            .collect();
+        if !entries.is_empty() {
+            let offset = self.unread_rotation.fetch_add(10, std::sync::atomic::Ordering::Relaxed) % entries.len();
+            entries.rotate_left(offset);
+        }
+        for conversation in entries {
+            let Some(id) = conversation["id"].as_str().map(str::to_owned) else { continue };
+            if conversation["has_unreads"].as_bool() != Some(true) {
+                cache.remove(&id);
+                conversation["unread_count"] = 0.into();
+                continue;
+            }
+            let Some(marker) = conversation["last_read"].as_str() else { continue };
+            let Some(fingerprint) = unread_fingerprint(conversation) else { continue };
+            if let Some((_, count)) = cache.get(&id).filter(|(old, _)| *old == fingerprint) {
+                conversation["unread_count"] = (*count).into();
+                continue;
+            }
+            if budget == 0 { continue; }
+            budget -= 1;
+            let response = self.call("conversations.history", &[
+                ("channel", &id), ("oldest", marker), ("inclusive", "false"), ("limit", "10"),
+            ]);
+            let Ok(response) = response else { continue };
+            let Some(messages) = response["messages"].as_array() else { continue };
+            let count = messages.len().min(10) as i64;
+            // A short, incomplete page cannot prove an exact unread count.
+            if count < 10 && (response["has_more"].as_bool() == Some(true)
+                || response.pointer("/response_metadata/next_cursor").and_then(Value::as_str).is_some_and(|cursor| !cursor.is_empty())) { continue; }
+            cache.insert(id, (fingerprint, count));
+            conversation["unread_count"] = count.into();
+        }
+        Ok(snapshot)
+    }
+
     /// Unread state per conversation, as the web client fetches it.
     pub fn counts(&self) -> Result<Value, String> {
         self.call("client.counts", &[("thread_counts_by_channel", "false")])
     }
+}
+
+pub(crate) fn unread_fingerprint(conversation: &Value) -> Option<String> {
+    let marker = conversation["last_read"].as_str()?;
+    let latest = conversation["latest"].as_str()?;
+    crate::archive::ts_to_id(marker)?;
+    crate::archive::ts_to_id(latest)?;
+    Some(format!("{marker}|{latest}|{}", conversation["history_invalid"]))
 }
 
 fn muted_ids(response: &Value) -> Result<Vec<String>, String> {
@@ -513,6 +569,68 @@ pub fn parse_permalink(link: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unread_lookups_have_a_budget_and_cover_more_than_one_batch() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let client = super::Client::for_test(move |method, params| {
+            assert_eq!(method, "conversations.history");
+            seen.lock().unwrap().push(params.iter().find(|(key,_)| *key == "channel").unwrap().1.to_string());
+            Ok(serde_json::json!({"messages":[{"ts":"2.000000"}],"has_more":false}))
+        });
+        let targets: Vec<String> = (0..25).map(|n| format!("C{n}")).collect();
+        let snapshot = serde_json::json!({"channels": targets.iter().map(|id| serde_json::json!({"id":id,"has_unreads":true,"last_read":"1.000000","latest":"2.000000"})).collect::<Vec<_>>()});
+        for _ in 0..3 {
+            let before = calls.lock().unwrap().len();
+            client.enrich_unread_counts(snapshot.clone(), &targets).unwrap();
+            assert!(calls.lock().unwrap().len() - before <= 10);
+        }
+        assert_eq!(calls.lock().unwrap().len(), 25);
+        client.enrich_unread_counts(snapshot.clone(), &targets).unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 25);
+        let mut changed = snapshot;
+        changed["channels"][0]["history_invalid"] = serde_json::json!("changed");
+        client.enrich_unread_counts(changed, &targets).unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 26);
+    }
+
+    #[test]
+    fn unread_counts_are_bounded_cached_and_do_not_guess_incomplete_pages() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let client = super::Client::for_test(move |method, params| {
+            if method == "client.counts" {
+                return Ok(serde_json::json!({"channels": [
+                    {"id":"C1","has_unreads":true,"last_read":"1.000000","latest":"20.000000"},
+                    {"id":"C2","has_unreads":true,"last_read":"1.000000","latest":"20.000000"},
+                    {"id":"C3","has_unreads":false}
+                ]}));
+            }
+            assert_eq!(method, "conversations.history");
+            assert!(params.contains(&("limit", "10")));
+            assert!(params.contains(&("oldest", "1.000000")));
+            assert!(params.contains(&("inclusive", "false")));
+            seen.fetch_add(1, Ordering::SeqCst);
+            if params.contains(&("channel", "C2")) {
+                Ok(serde_json::json!({"messages":[],"has_more":true}))
+            } else {
+                Ok(serde_json::json!({"messages":vec![serde_json::json!({"ts":"2.000000"});10],"has_more":true}))
+            }
+        });
+        let targets = vec!["C1".into(),"C2".into(),"C3".into()];
+        for _ in 0..2 {
+            let snapshot = client.enrich_unread_counts(client.counts().unwrap(), &targets).unwrap();
+            assert_eq!(snapshot["channels"][0]["unread_count"], 10);
+            assert!(snapshot["channels"][1]["unread_count"].is_null());
+            assert_eq!(snapshot["channels"][2]["unread_count"], 0);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        client.enrich_unread_counts(client.counts().unwrap(), &[]).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
     use super::parse_permalink;
 
     #[test]

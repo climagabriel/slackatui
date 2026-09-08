@@ -114,13 +114,13 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             let c = app.conv(i);
             let hidden =
                 app.pane_settings.number == crate::conversations_pane::NumberColumn::Hidden;
-            let count = if hidden {
+            let count = if hidden || (app.pane_settings.number == crate::conversations_pane::NumberColumn::Unread && !c.unread) {
                 String::new()
             } else {
                 app.pane_settings
                     .number
                     .value(c, app.sort == Sort::Mine)
-                    .map(human_count)
+                    .map(|count| if app.pane_settings.number == crate::conversations_pane::NumberColumn::Unread && count > 9 { "9+".into() } else { human_count(count) })
                     .unwrap_or_else(|| "—".into())
             };
             let gap = usize::from(!hidden);

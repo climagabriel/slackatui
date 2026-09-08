@@ -550,6 +550,12 @@ pub fn api_counts(client: Arc<Client>, gen: u64) -> Job {
     })
 }
 
+pub fn api_unread_counts(client: Arc<Client>, gen: u64, snapshot: Value, targets: Vec<String>) -> Job {
+    spawn(JobKind::Counts { gen }, String::new(), move || {
+        Ok(Done::Counts(client.enrich_unread_counts(snapshot, &targets)?))
+    })
+}
+
 // -------------------------------------------------------------- slackdump
 
 pub fn slackdump_bin() -> String {

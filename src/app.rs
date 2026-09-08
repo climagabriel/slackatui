@@ -480,6 +480,7 @@ pub struct App {
     /// Quiet background work: sign-in, conversation list, counts, tails.
     pub bg: Option<Job>,
     profile_job: Option<Job>,
+    unread_count_job: Option<Job>,
     group_job: Option<Job>,
     dm_users: HashMap<String, String>,
     /// A slackdump binary answers; the fallback engine.
@@ -619,6 +620,7 @@ impl App {
             api: None,
             bg: None,
             profile_job: None,
+            unread_count_job: None,
             group_job: None,
             dm_users: HashMap::new(),
             slackdump,
@@ -2640,6 +2642,8 @@ impl App {
             let c = &mut self.corpus.convs[conv];
             if last.id > c.last_id {
                 c.last_id = last.id;
+                c.unread_count = None;
+                c.unread_snapshot = None;
             }
         }
         self.status = format!("{n} new from Slack");
@@ -2682,6 +2686,8 @@ impl App {
             c.first_id = first.id;
             if last.id > c.last_id {
                 c.last_id = last.id;
+                c.unread_count = None;
+                c.unread_snapshot = None;
             }
         }
         self.status = format!("{n} from Slack");
@@ -2745,6 +2751,8 @@ impl App {
                 left: false,
                 muted: false,
                 unread: false,
+                unread_count: None,
+                unread_snapshot: None,
                 mentions: 0,
                 last_read: 0,
             });
@@ -2762,6 +2770,28 @@ impl App {
         }
     }
 
+    fn apply_unread_counts(&mut self, snapshot: &Value) {
+        for kind in ["channels", "ims", "mpims"] {
+            for entry in snapshot[kind].as_array().into_iter().flatten() {
+                let Some(index) = entry["id"].as_str().and_then(|id| self.corpus.conv_by_channel(id)) else { continue };
+                let conversation = &mut self.corpus.convs[index];
+                if conversation.unread && entry["has_unreads"].as_bool() == Some(true)
+                    && conversation.unread_snapshot.is_some()
+                    && crate::api::unread_fingerprint(entry) == conversation.unread_snapshot
+                {
+                    if let Some(count) = entry["unread_count"].as_i64().filter(|count| *count > 0) {
+                        conversation.unread_count = Some(count);
+                    }
+                }
+            }
+        }
+    }
+
+    fn unread_count_targets(&self) -> Vec<String> {
+        if self.pane_settings.number != crate::conversations_pane::NumberColumn::Unread { return Vec::new(); }
+        self.filtered.iter().map(|&index| self.corpus.convs[index].id.clone()).collect()
+    }
+
     /// Unread markers from `client.counts`, and last activity for
     /// conversations no archive holds. Lists re-render only on a change.
     fn apply_counts(&mut self, v: &Value) {
@@ -2775,7 +2805,7 @@ impl App {
                     continue;
                 };
                 let conv = &mut self.corpus.convs[idx];
-                let before = (conv.unread, conv.mentions, conv.last_read, conv.last_id);
+                let before = (conv.unread, conv.unread_count, conv.mentions, conv.last_read, conv.last_id);
                 conv.unread = c
                     .get("has_unreads")
                     .and_then(Value::as_bool)
@@ -2793,7 +2823,12 @@ impl App {
                         conv.last_id = latest;
                     }
                 }
-                changed |= before != (conv.unread, conv.mentions, conv.last_read, conv.last_id);
+                let fingerprint = crate::api::unread_fingerprint(c);
+                if conv.unread_snapshot != fingerprint || before.0 != conv.unread {
+                    conv.unread_count = None;
+                }
+                conv.unread_snapshot = fingerprint;
+                changed |= before != (conv.unread, conv.unread_count, conv.mentions, conv.last_read, conv.last_id);
             }
         }
         if changed {
@@ -2811,8 +2846,10 @@ impl App {
             if first > 0 {
                 c.first_id = first;
             }
-            if last > 0 {
+            if last > 0 && last != c.last_id {
                 c.last_id = last;
+                c.unread_count = None;
+                c.unread_snapshot = None;
             }
         }
     }
@@ -3383,6 +3420,15 @@ impl App {
             }
         }
         self.pump_files();
+        // Count lookups must not hold up message tails or ordinary unread markers.
+        if let Some(outcome) = self.unread_count_job.as_ref().and_then(|job| job.poll()) {
+            let job = self.unread_count_job.take().expect("polled");
+            if matches!(job.kind, JobKind::Counts { gen } if gen == self.counts_gen) {
+                if let Ok(Done::Counts(snapshot)) = outcome {
+                    self.apply_unread_counts(&snapshot);
+                }
+            }
+        }
         // The quiet slot: sign-in, the conversation list, counts, tails.
         if let Some(outcome) = self.bg.as_ref().and_then(|j| j.poll()) {
             let job = self.bg.take().expect("polled");
@@ -3408,6 +3454,12 @@ impl App {
                     // A counts snapshot taken before a mark would undo it.
                     if matches!(job.kind, JobKind::Counts { gen } if gen == self.counts_gen) {
                         self.apply_counts(&v);
+                        let targets = self.unread_count_targets();
+                        if self.unread_count_job.is_none() && !targets.is_empty() {
+                            if let Some(client) = self.api.clone() {
+                                self.unread_count_job = Some(live::api_unread_counts(client, self.counts_gen, v, targets));
+                            }
+                        }
                     }
                     self.last_counts = Instant::now();
                     self.muted_pending = true;
@@ -3619,6 +3671,8 @@ impl App {
                 let c = &mut self.corpus.convs[conv];
                 c.last_read = id;
                 c.unread = c.last_id > id;
+                c.unread_count = None;
+                c.unread_snapshot = None;
                 self.counts_gen += 1;
                 if !c.unread {
                     c.mentions = 0;
@@ -3654,6 +3708,8 @@ impl App {
                 let c = &mut self.corpus.convs[conv];
                 if msg.id > c.last_id {
                     c.last_id = msg.id;
+                    c.unread_count = None;
+                    c.unread_snapshot = None;
                 }
                 match thread {
                     Some(root) => {
@@ -3680,6 +3736,8 @@ impl App {
                 let c = &mut self.corpus.convs[conv];
                 c.left = true;
                 c.unread = false;
+                c.unread_count = None;
+                c.unread_snapshot = None;
                 c.mentions = 0;
                 let name = c.name.clone();
                 self.apply_filter();
@@ -4894,6 +4952,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unread_counts_preserve_snapshot_identity_and_clear_after_read() {
+        let mut app = mute_test_app();
+        let snapshot = json!({"channels":[{"id":"C1","has_unreads":true,"last_read":"1.000000","latest":"5.000000","unread_count":4}]});
+        app.corpus.convs[0].last_id = 100_000_000;
+        app.apply_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, None);
+        app.apply_unread_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, Some(4));
+        app.apply_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, Some(4));
+        let mut invalidated = snapshot.clone();
+        invalidated["channels"][0]["history_invalid"] = json!("changed");
+        app.apply_counts(&invalidated);
+        app.apply_unread_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, None);
+        let mut newer = snapshot.clone();
+        newer["channels"][0]["latest"] = json!("6.000000");
+        app.apply_counts(&newer);
+        assert_eq!(app.corpus.convs[0].unread_count, None);
+        app.apply_unread_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, None);
+        newer["channels"][0]["has_unreads"] = json!(false);
+        newer["channels"][0]["last_read"] = json!("6.000000");
+        app.apply_counts(&newer);
+        app.apply_unread_counts(&snapshot);
+        assert!(!app.corpus.convs[0].unread);
+        assert_eq!(crate::conversations_pane::NumberColumn::Unread.value(&app.corpus.convs[0], false), None);
+    }
+
+    #[test]
     fn conversation_number_modes_and_menu() {
         use crate::conversations_pane::{Menu, NumberColumn as N, Settings};
         let mut app = App::new(
@@ -4955,6 +5043,16 @@ pub(crate) mod tests {
                 .collect::<String>()
         };
         assert!(row(&terminal).ends_with("123"));
+        app.pane_settings.number = N::Unread;
+        app.corpus.convs[0].unread = true;
+        for (count, expected) in [(Some(1), "1"), (Some(9), "9"), (Some(10), "9+"), (Some(500), "9+"), (None, "—")] {
+            app.corpus.convs[0].unread_count = count;
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            assert!(row(&terminal).ends_with(expected));
+        }
+        app.corpus.convs[0].unread = false;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(row(&terminal).trim_end().ends_with("#one"));
         app.pane_settings.number = N::Hidden;
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         assert!(!row(&terminal).contains("123"));

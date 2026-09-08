@@ -76,6 +76,9 @@ pub struct Conv {
     /// Muted in Slack, from the last confirmed notification-preference snapshot.
     pub muted: bool,
     pub unread: bool,
+    /// Last confirmed live count, capped at ten; None when unavailable.
+    pub unread_count: Option<i64>,
+    pub unread_snapshot: Option<String>,
     pub mentions: i64,
     /// Slack's read marker for the owner, as a message id; 0 when unknown.
     pub last_read: i64,
@@ -848,6 +851,8 @@ impl Archive {
                 left: false,
                 muted: false,
                 unread: false,
+                unread_count: None,
+                unread_snapshot: None,
                 mentions: 0,
                 last_read: 0,
             });

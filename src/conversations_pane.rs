@@ -42,16 +42,18 @@ pub enum NumberColumn {
     Mine,
     Activity,
     Mentions,
+    Unread,
     Hidden,
 }
 
 impl NumberColumn {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Sort,
         Self::Messages,
         Self::Mine,
         Self::Activity,
         Self::Mentions,
+        Self::Unread,
         Self::Hidden,
     ];
 
@@ -63,6 +65,7 @@ impl NumberColumn {
             Self::Activity => "activity",
             Self::Mentions => "mentions",
             Self::Hidden => "hidden",
+            Self::Unread => "unread",
         }
     }
     pub fn label(self) -> &'static str {
@@ -73,6 +76,7 @@ impl NumberColumn {
             Self::Activity => "Your recency-weighted activity score",
             Self::Mentions => "Mentions (last known count)",
             Self::Hidden => "Hidden",
+            Self::Unread => "Unread messages (1–9, then 9+)",
         }
     }
     pub fn heading(self) -> &'static str {
@@ -83,6 +87,7 @@ impl NumberColumn {
             Self::Activity => "score",
             Self::Mentions => "mentions",
             Self::Hidden => "no number",
+            Self::Unread => "unread msgs",
         }
     }
     pub fn next(self) -> Self {
@@ -100,6 +105,7 @@ impl NumberColumn {
                 c.msgs
             }),
             Self::Mentions => Some(c.mentions),
+            Self::Unread => if c.unread { c.unread_count.filter(|count| *count > 0) } else { None },
             _ if c.live_only => None,
             Self::Messages => Some(c.msgs),
             Self::Mine => Some(c.mine),
