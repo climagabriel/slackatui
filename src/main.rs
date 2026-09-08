@@ -174,8 +174,9 @@ the list, on top of the channels muted in Slack itself.
 Ctrl-Shift-P opens the same menu and /keys can rebind it. Terminals must report
 the Shift modifier separately; otherwise use the command or rebind the action.
 Space toggles, Enter saves, Esc cancels; type to search. Reset to default
-enables every category and removes individual overrides. Muted is an additional
-filter across types; individual show/hide overrides take precedence.
+enables every category and removes individual overrides. Muted cycles through include, hide and only.
+Only shows muted conversations across all categories; individual hides apply.
+Include and hide respect categories; individual show/hide overrides take precedence.
 Preferences persist per workspace in conversations-pane.json beside keys.json.
 The Number column row cycles through follow sorting, cached messages, your
 cached messages, activity score, mentions and hidden. Explicit choices are

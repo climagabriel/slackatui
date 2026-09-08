@@ -45,7 +45,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let [help, list] =
             Layout::vertical([Constraint::Length(5), Constraint::Min(1)]).areas(inner);
         frame.render_widget(Paragraph::new(format!(
-            "↑/↓ select · Space toggle · Enter save · Esc cancel\nType to search · Backspace erase · Ctrl-U clear\nIndividuals cycle: category → show → hide. Muted is an additional filter.\nReset: select first row, Space, then Enter.\nSearch: {}", menu.query)), help);
+            "↑/↓ select · Space toggle · Enter save · Esc cancel\nType to search · Backspace erase · Ctrl-U clear\nIndividuals cycle: category → show → hide. Muted cycles: include → hide → only.\nReset: select first row, Space, then Enter.\nSearch: {}", menu.query)), help);
         let items: Vec<_> = menu.rows().into_iter().map(ListItem::new).collect();
         let mut state = ListState::default().with_selected(Some(menu.cursor));
         frame.render_stateful_widget(

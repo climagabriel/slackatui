@@ -31,6 +31,7 @@ pub struct Settings {
     pub hidden: BTreeSet<String>,
     pub overrides: BTreeMap<String, bool>,
     pub number: NumberColumn,
+    pub only_muted: bool,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -109,11 +110,24 @@ impl Settings {
         self.visible_id(&c.id, category(c), c.muted)
     }
     pub fn visible_id(&self, id: &str, category: usize, muted: bool) -> bool {
+        if self.only_muted {
+            return muted && self.overrides.get(id).copied().unwrap_or(true);
+        }
         self.overrides.get(id).copied().unwrap_or(
             !self.hidden.contains(KEYS[category]) && !(muted && self.hidden.contains("muted")),
         )
     }
     pub fn toggle_category(&mut self, category: usize) {
+        if category == 5 {
+            if self.only_muted {
+                self.only_muted = false;
+            } else if self.hidden.remove("muted") {
+                self.only_muted = true;
+            } else {
+                self.hidden.insert("muted".into());
+            }
+            return;
+        }
         if !self.hidden.remove(KEYS[category]) {
             self.hidden.insert(KEYS[category].into());
         }
@@ -150,6 +164,9 @@ impl Settings {
                 .find(|n| Some(n.key()) == number.as_str())
                 .ok_or("invalid number column")?;
         }
+        if let Some(only_muted) = v.get("only_muted") {
+            settings.only_muted = only_muted.as_bool().ok_or("invalid only_muted")?;
+        }
         for value in hidden {
             let key = value
                 .as_str()
@@ -174,7 +191,7 @@ impl Settings {
             .ok_or("invalid settings object")?
             .insert(
                 workspace.into(),
-                json!({"hidden_categories":self.hidden, "overrides":self.overrides, "number":self.number.key()}),
+                json!({"hidden_categories":self.hidden, "overrides":self.overrides, "number":self.number.key(), "only_muted":self.only_muted}),
             );
         save(path, &doc).map_err(|e| e.to_string())
     }
@@ -258,6 +275,35 @@ mod tests {
     }
 
     #[test]
+    fn muted_only_menu_ignores_categories_but_keeps_individual_hides() {
+        let mut menu = Menu::new(Settings::default(), &[]);
+        for category in 0..5 {
+            menu.settings.toggle_category(category);
+        }
+        menu.cursor = 6;
+        menu.toggle(); // Include -> Hide.
+        assert!(menu.rows()[6].starts_with("Muted: Hide"));
+        menu.toggle(); // Hide -> Only.
+        assert!(menu.rows()[6].starts_with("Muted: Only"));
+        for category in 0..5 {
+            assert!(menu.settings.visible_id("muted", category, true));
+            assert!(!menu.settings.visible_id("unmuted", category, false));
+        }
+        menu.settings.cycle("unmuted");
+        assert!(!menu.settings.visible_id("unmuted", 0, false));
+        menu.settings.cycle("muted");
+        menu.settings.cycle("muted");
+        assert!(!menu.settings.visible_id("muted", 0, true));
+        menu.toggle(); // Only -> Include; category preferences survive.
+        assert!(!menu.settings.only_muted);
+        assert!(menu.rows()[6].starts_with("Muted: Include"));
+        assert!(!menu.settings.visible_id("other", 0, true));
+        menu.cursor = 0;
+        menu.toggle();
+        assert_eq!(menu.settings, Settings::default());
+    }
+
+    #[test]
     fn persists_per_workspace_and_preserves_corrupt_files() {
         use std::os::unix::fs::PermissionsExt;
         let stamp = std::time::SystemTime::now()
@@ -272,6 +318,8 @@ mod tests {
         a.toggle_category(5);
         a.cycle("C1");
         a.number = NumberColumn::Mine;
+        a.toggle_category(5);
+        assert!(a.only_muted);
         a.save(Some(&path), "workspace-a").unwrap();
         Settings::default()
             .save(Some(&path), "workspace-b")
@@ -300,6 +348,7 @@ mod tests {
         .unwrap();
         let old = Settings::load(Some(&path), "old").unwrap();
         assert_eq!(old.number, NumberColumn::Sort);
+        assert!(!old.only_muted);
         assert!(old.hidden.contains("muted"));
         assert_eq!(old.overrides.get("C1"), Some(&false));
         std::fs::write(&path, "broken").unwrap();
@@ -352,6 +401,17 @@ impl Menu {
     pub fn rows(&self) -> Vec<String> {
         let mut rows = vec!["Reset to default — show everything".into()];
         for (i, label) in CATEGORIES.iter().enumerate() {
+            if i == 5 {
+                let mode = if self.settings.only_muted {
+                    "Only (all categories; individual hides apply)"
+                } else if self.settings.hidden.contains("muted") {
+                    "Hide"
+                } else {
+                    "Include"
+                };
+                rows.push(format!("Muted: {mode} · Space cycles include → hide → only"));
+                continue;
+            }
             rows.push(format!(
                 "[{}] {label}",
                 if self.settings.hidden.contains(KEYS[i]) {
