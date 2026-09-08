@@ -29,6 +29,7 @@ pub struct Section {
 }
 #[derive(Clone, Debug)]
 pub struct Document {
+    pub permalink: String,
     pub id: String,
     pub title: String,
     pub writable: bool,
@@ -296,6 +297,7 @@ pub fn parse_document(file: &Value, html: &str) -> Result<Document, String> {
     let mut sections = Vec::new();
     collect_sections(root, true, &mut sections);
     Ok(Document {
+        permalink: string(file, "permalink"),
         id: string(file, "id"),
         title: string(file, "title"),
         writable: file.get("editable").and_then(Value::as_bool) == Some(true)
@@ -646,6 +648,7 @@ enum Loaded {
     Entries(Vec<Tab>),
     Canvas(Document),
     Saved(Document, bool),
+    History(crate::canvas_history::Page),
 }
 struct Job {
     receive: Receiver<Result<Loaded, String>>,
@@ -678,6 +681,7 @@ pub struct Browser {
     pub previews: bool,
     pub thumbnails: Vec<(Rect, crate::archive::FileInfo)>,
     document: Option<Document>,
+    history: Option<crate::canvas_history::History>,
     section: usize,
     document_rows: Vec<(usize, String)>,
     draft: Option<Draft>,
@@ -711,6 +715,7 @@ impl Browser {
             previews: true,
             thumbnails: vec![],
             document: None,
+            history: None,
             section: 0,
             document_rows: vec![],
             draft: None,
@@ -730,6 +735,9 @@ impl Browser {
             self.job = None;
             self.notice.clear();
             match result {
+                Ok(Loaded::History(page)) => {
+                    if let Some(history) = &mut self.history { history.append(page); }
+                }
                 Ok(Loaded::Tabs(tabs)) => self.tabs = tabs,
                 Ok(Loaded::Entries(entries)) => {
                     self.entries = Some(entries);
@@ -757,12 +765,21 @@ impl Browser {
                     }
                     self.notice = "Saved to Slack".into();
                 }
-                Err(error) => self.notice = error,
+                Err(error) => {
+                    if let Some(history) = &mut self.history { history.failed = true; }
+                    self.notice = error;
+                }
             }
         }
     }
     pub fn key(&mut self, key: KeyEvent) {
         if self.job.is_some() {
+            if self.history.is_some() && matches!(key.code, KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc) {
+                self.history = None;
+                self.job = None;
+                self.notice.clear();
+                return;
+            }
             if matches!(key.code, KeyCode::Char('T')) {
                 self.visible = false;
             }
@@ -819,6 +836,37 @@ impl Browser {
         }
         if key.code == KeyCode::Char('T') {
             self.visible = false;
+            return;
+        }
+        if let Some(history) = &mut self.history {
+            match key.code {
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+                    if history.details { history.details = false; } else { self.history = None; }
+                }
+                KeyCode::Char('j') | KeyCode::Down if history.details => history.scroll = history.scroll.saturating_add(1),
+                KeyCode::Char('k') | KeyCode::Up if history.details => history.scroll = history.scroll.saturating_sub(1),
+                KeyCode::Char('g') | KeyCode::Home if history.details => history.scroll = 0,
+                KeyCode::Char('G') | KeyCode::End if history.details => history.scroll = usize::MAX,
+                KeyCode::Char('j') | KeyCode::Down if !history.details => history.cursor = (history.cursor + 1).min(history.count().saturating_sub(1)),
+                KeyCode::Char('k') | KeyCode::Up if !history.details => history.cursor = history.cursor.saturating_sub(1),
+                KeyCode::Char('g') | KeyCode::Home if !history.details => history.cursor = 0,
+                KeyCode::Char('G') | KeyCode::End if !history.details => history.cursor = history.count().saturating_sub(1),
+                KeyCode::Char('r') if !history.details => {
+                    self.history = Some(crate::canvas_history::History::default());
+                    self.load_history(None);
+                }
+                KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter if !history.details => {
+                    if history.cursor < history.revisions.len() { history.details = true; history.scroll = 0; }
+                    else if let Some(older) = history.older { self.load_history(Some(older)); }
+                    else if !history.loaded { self.load_history(None); }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('H') && self.document.is_some() {
+            self.history = Some(crate::canvas_history::History::default());
+            self.load_history(None);
             return;
         }
         if matches!(key.code, KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc) {
@@ -928,6 +976,16 @@ impl Browser {
             }
         }
     }
+    fn load_history(&mut self, older: Option<i64>) {
+        let Some(document) = &self.document else { return; };
+        let id = document.id.clone();
+        let api = self.client.clone();
+        let names = self.history.as_ref().map(|history| history.names.clone()).unwrap_or_default();
+        let Some(history) = &self.history else { return; };
+        let cancelled = history.cancelled.clone();
+        self.job = Some(spawn(move || crate::canvas_history::load(&api, &id, older, names, &cancelled).map(Loaded::History)));
+        self.notice = "Loading canvas history…".into();
+    }
     pub fn title(&self) -> String {
         let mut title = format!("{} · channel tabs", self.name);
         if self.entries.is_some() {
@@ -943,6 +1001,9 @@ impl Browser {
             if let Some(entry) = self.entries.as_ref().and_then(|entries| entries.get(self.entry_cursor)) {
                 title.push_str(&format!(" · {}", entry.label));
             }
+        }
+        if let Some(history) = &self.history {
+            title.push_str(if history.details { " · edit history · revision details" } else { " · edit history" });
         }
         title
     }
@@ -974,12 +1035,21 @@ impl Browser {
             )
         } else if self.picture.is_some() {
             "+/- zoom · 0 fit · h/Esc back · T hide".into()
+        } else if let Some(history) = &self.history {
+            if history.details { "j/k scroll · h/Esc back · T hide".into() } else { "j/k select · l/Enter details/load older · r reload · h/Esc back · T hide".into() }
         } else if self.document.is_some() {
-            "j/k lines · i edit section · h back · T hide".into()
+            "j/k lines · i edit section · H edit history · h back · T hide".into()
         } else {
             "j/k select · l/Enter open · h back · T hide".into()
         };
-        frame.render_widget(Paragraph::new(format!("{hint}\n{}", self.notice)), footer);
+        let status = if self.history.as_ref().is_some_and(|history| history.limited) {
+            format!("Slack limits older history. {}", self.notice)
+        } else { self.notice.clone() };
+        frame.render_widget(Paragraph::new(format!("{hint}\n{status}")), footer);
+        if let Some(history) = &mut self.history {
+            history.draw(frame, body, palette, self.document.as_ref().map(|doc| doc.permalink.as_str()).unwrap_or(""));
+            return;
+        }
         if self.picture.is_some() { return; }
         if let Some(draft) = &self.draft {
             let rows = draft.editor.rows();
@@ -1092,7 +1162,7 @@ impl Browser {
 
 }
 
-fn wrap_lines(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_lines(text: &str, width: usize) -> Vec<String> {
     let mut rows = Vec::new();
     for line in text.split('\n') {
         let mut row = String::new();
@@ -1117,6 +1187,53 @@ mod tests {
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
+    #[test]
+    fn history_navigation_is_read_only_and_returns_one_level_at_a_time() {
+        let mut browser = browser();
+        let page = crate::canvas_history::Page {
+            revisions: vec![crate::canvas_history::Revision { id: "revision".into(), sequence: 1, created_ms: 1000, author: "U1".into(), comment: false }],
+            older: None, limited: false, names: Default::default(),
+        };
+        browser.client = Client::for_test(|method, _| {
+            assert_eq!(method, "quip.history.getVersions");
+            Ok(json!({"versions":[],"oldest_created_usec":-1}))
+        }).into();
+        browser.key(key('H'));
+        assert!(browser.history.is_some());
+        let result = browser.job.take().unwrap().receive.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(matches!(result, Ok(Loaded::History(_))));
+        let (sender, receive) = mpsc::channel();
+        browser.job = Some(Job { receive });
+        sender.send(Ok(Loaded::History(page.clone()))).unwrap();
+        browser.tick();
+        browser.history.as_mut().unwrap().limited = true;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|frame| browser.draw(frame, frame.area(), &Palette::default())).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Slack limits older history."));
+        assert!(text.contains("edit history"));
+        browser.key(key('i'));
+        assert!(browser.draft.is_none());
+        browser.key(key('l'));
+        assert!(browser.history.as_ref().unwrap().details);
+        browser.key(key('i'));
+        assert!(browser.draft.is_none());
+        browser.key(key('h'));
+        assert!(!browser.history.as_ref().unwrap().details);
+        browser.key(key('h'));
+        assert!(browser.history.is_none());
+        assert!(browser.document.is_some());
+        // Leaving an in-flight history request discards its late completion.
+        browser.history = Some(crate::canvas_history::History::default());
+        let (sender, receive) = mpsc::channel();
+        browser.job = Some(Job { receive });
+        browser.key(key('h'));
+        let _ = sender.send(Ok(Loaded::History(page)));
+        browser.tick();
+        assert!(browser.history.is_none());
+        assert!(browser.document.is_some());
+    }
+
     #[test]
     fn parses_sections_without_overlapping_and_refuses_unsupported_edits() {
         let doc=parse_document(&json!({"id":"F1","editable":true}),r#"<div class="quip-canvas-content"><h1 class="default-content" id="title">Title</h1><p id="one"><b>Version:</b> <code>1~x</code></p><ul><li id="two"><span id="two">Hello <a>@U123</a></span></li></ul><p id="three"><img src="x"></p></div>"#).unwrap();
@@ -1246,6 +1363,7 @@ mod tests {
             previews: true,
             thumbnails: vec![],
             document: Some(document()),
+            history: None,
             section: 0,
             document_rows: vec![],
             draft: None,

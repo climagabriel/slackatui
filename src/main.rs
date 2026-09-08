@@ -3,6 +3,7 @@
 mod api;
 mod app;
 mod canvas;
+mod canvas_history;
 mod archive;
 mod auth;
 mod clip;
@@ -261,6 +262,7 @@ const READ_ONLY_CALL_METHODS: &[&str] = &[
     "files.info",
     "files.list",
     "pins.list",
+    "quip.history.getVersions",
     "reactions.get",
     "reminders.info",
     "reminders.list",
