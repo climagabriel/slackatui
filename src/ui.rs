@@ -309,7 +309,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         palette,
         ..
     } = app;
-    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Sent { .. })) {
+    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Sent { .. } | View::Search { .. })) {
         let hint = Line::from(Span::styled(
             "  select a conversation and press Enter",
             Style::new().add_modifier(Modifier::DIM),
@@ -734,7 +734,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, area: Rect) {
     else {
         return;
     };
-    let found = complete::complete(&buf.text, &app.conv_names());
+    let found = complete::with_authors(&buf.text, &app.conv_names(), &app.corpus.author_names());
     if found.items.is_empty() || area.height < 4 {
         return;
     }

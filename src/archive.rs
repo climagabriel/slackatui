@@ -445,6 +445,12 @@ impl Corpus {
     }
 
     /// A user's name from the workspace list.
+    pub fn author_names(&self) -> Vec<(String,String)> {
+        let mut users: Vec<_> = self.users.iter().map(|(id,user)|(id.clone(),user.name.clone())).collect();
+        users.sort_by_key(|(id,name)|(name.to_lowercase(),id.clone()));
+        users
+    }
+
     pub fn user_name(&self, uid: &str) -> Option<String> {
         self.users.get(uid).map(|u| u.name.clone())
     }
@@ -1063,7 +1069,7 @@ impl Archive {
         let mut out: Vec<Msg> = Vec::new();
         for r in rows {
             if let Some(last) = out.last_mut() {
-                if last.id == r.id {
+                if last.id == r.id && last.channel_id == r.channel_id {
                     last.is_parent |= r.is_parent;
                     if r.parent_id.is_some()
                         && r.parent_id != Some(r.id)
@@ -1230,6 +1236,10 @@ impl Archive {
     /// included). SQL narrows on the text column and the raw JSON; the
     /// caller confirms against the rendered text.
     pub fn search(&self, cid: &str, needle: &str, limit: usize) -> rusqlite::Result<Vec<Msg>> {
+        self.search_filtered(Some(cid), needle, None, limit)
+    }
+
+    pub fn search_filtered(&self, cid: Option<&str>, needle: &str, author: Option<&str>, limit: usize) -> rusqlite::Result<Vec<Msg>> {
         let esc = |s: &str| {
             s.replace('\\', "\\\\")
                 .replace('%', "\\%")
@@ -1244,17 +1254,17 @@ impl Archive {
             .replace('>', "&gt;");
         let like_stored = format!("%{}%", esc(&stored));
         let sql = format!(
-            "WITH ranked AS (SELECT m.*, ROW_NUMBER() OVER (PARTITION BY m.ID ORDER BY {order}) AS position \
-             FROM MESSAGE m WHERE m.CHANNEL_ID = ?1) \
-             SELECT {cols} FROM ranked m WHERE m.position = 1 AND \
+            "WITH ranked AS (SELECT m.*, ROW_NUMBER() OVER (PARTITION BY m.CHANNEL_ID, m.ID ORDER BY {order}) AS position \
+             FROM MESSAGE m WHERE (?1 IS NULL OR m.CHANNEL_ID = ?1)) \
+             SELECT {cols} FROM ranked m WHERE m.position = 1 AND (?5 IS NULL OR json_extract(CAST(m.DATA AS TEXT), '$.user') = ?5) AND \
              (m.TXT LIKE ?2 ESCAPE '\\' OR m.TXT LIKE ?3 ESCAPE '\\' \
               OR CAST(m.DATA AS TEXT) LIKE ?2 ESCAPE '\\' OR CAST(m.DATA AS TEXT) LIKE ?3 ESCAPE '\\') \
              ORDER BY m.ID DESC, {order} LIMIT ?4",
             cols = Self::COLS,
             order = self.message_order()
         );
-        let mut msgs = self.query_msgs(&sql, &[&cid, &like, &like_stored, &(limit as i64)])?;
-        self.reply_stats(cid, &mut msgs)?;
+        let mut msgs = self.query_msgs(&sql, &[&cid, &like, &like_stored, &(limit as i64), &author])?;
+        if let Some(cid) = cid { self.reply_stats(cid, &mut msgs)?; }
         Ok(msgs)
     }
 }
@@ -1499,6 +1509,23 @@ mod union_tests {
     }
 
     #[test]
+    fn author_search_filters_before_limit_and_keeps_replies_and_channels() {
+        let root=std::env::temp_dir().join(format!("slack-author-test-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        database(&root,100,&[(1,None,"nginx old"),(2,Some(1),"nginx reply"),(3,None,"U1 mentioned by somebody else")]);
+        let connection=Connection::open(root.join("slackdump.sqlite")).unwrap();
+        connection.execute("UPDATE MESSAGE SET DATA=CAST(json_set(CAST(DATA AS TEXT),'$.user','U2') AS BLOB) WHERE ID=3000000",[]).unwrap();
+        connection.execute("INSERT INTO MESSAGE SELECT ID,CHUNK_ID,'D1',TS,PARENT_ID,THREAD_TS,IS_PARENT,LATEST_REPLY,TXT,DATA FROM MESSAGE WHERE ID=2000000",[]).unwrap();
+        drop(connection);
+        let archive=Archive::open("test".into(),&root).unwrap();
+        let messages=archive.search_filtered(Some("C1"),"",Some("U1"),1).unwrap();
+        assert_eq!(messages.len(),1);assert_eq!(messages[0].id,2_000_000);assert_eq!(messages[0].parent_id,Some(1_000_000));
+        assert_eq!(archive.search_filtered(None,"nginx",Some("U1"),10).unwrap().len(),3);
+        assert!(archive.search_filtered(None,"somebody",Some("U1"),10).unwrap().is_empty());
+        assert_eq!(archive.search("C1","somebody",10).unwrap().len(),1);
+        drop(archive);std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn overlapping_archives_preserve_union_pages_threads_and_refreshes() {
         let root = std::env::temp_dir().join(format!("slack-archive-union-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let first = root.join("full/first");
@@ -1521,6 +1548,8 @@ mod union_tests {
         assert_eq!(thread[1].text,"only second reply");
         assert_eq!(archive.search("C1","only second",10).unwrap().len(),1);
         assert!(archive.search("C1","old root",10).unwrap().is_empty());
+        assert!(archive.search_filtered(Some("C1"),"old root",Some("U1"),10).unwrap().is_empty());
+        assert_eq!(archive.search_filtered(Some("C1"),"new root",Some("U1"),10).unwrap().len(),1);
         assert_eq!(archive.source_dirs.len(),2);
         assert!(open_ro(&second.join("slackdump.sqlite")).unwrap().execute("DELETE FROM MESSAGE",[]).is_err());
         assert_eq!(std::fs::read(first.join("slackdump.sqlite")).unwrap(),original);

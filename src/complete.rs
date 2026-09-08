@@ -178,6 +178,32 @@ pub fn complete(line: &str, convs: &[String]) -> Completion {
     }
 }
 
+/// Author suggestions use handles where unambiguous and IDs otherwise.
+pub fn with_authors(line: &str, convs: &[String], users: &[(String,String)]) -> Completion {
+    let mut completion = complete(line, convs);
+    let command = line.trim_start().trim_start_matches('/').split_whitespace().next().unwrap_or("").to_lowercase();
+    let token = completion.token.to_lowercase();
+    if !matches!(command.as_str(), "find" | "search" | "f" | "s") || !token.starts_with("from:@") { return completion; }
+    let want = &token[6..];
+    let mut items = Vec::new();
+    if "me".starts_with(want) { items.push(Item { text:"from:@me".into(),help:"your messages".into() }); }
+    let ids: std::collections::HashSet<_> = users.iter().map(|(id,_)|id.to_lowercase()).collect();
+    let mut counts = std::collections::HashMap::new();
+    for (_,name) in users { *counts.entry(name.to_lowercase()).or_insert(0usize) += 1; }
+    for (id,name) in users {
+        if !name.to_lowercase().starts_with(want) && !id.to_lowercase().starts_with(want) { continue; }
+        let simple = !name.is_empty() && !name.chars().any(char::is_whitespace) && !name.eq_ignore_ascii_case("me")
+            && counts.get(&name.to_lowercase()) == Some(&1) && !ids.contains(&name.to_lowercase());
+        items.push(Item { text:format!("from:@{}",if simple {name}else{id}),help:format!("{name} · {id}") });
+    }
+    completion.items = items;
+    completion
+}
+
+pub fn apply_with_authors(line: &str, convs: &[String], users: &[(String,String)]) -> Option<String> {
+    apply_completion(line, with_authors(line,convs,users))
+}
+
 fn conv_items(convs: &[String]) -> Vec<Item> {
     convs
         .iter()
@@ -191,8 +217,12 @@ fn conv_items(convs: &[String]) -> Vec<Item> {
 /// The line a Tab produces, or None when the token is already the only
 /// candidate. One match completes it; several extend the token to their
 /// common prefix, and when that adds nothing they cycle.
+#[cfg(test)]
 pub fn apply(line: &str, convs: &[String]) -> Option<String> {
-    let c = complete(line, convs);
+    apply_completion(line, complete(line,convs))
+}
+
+fn apply_completion(line: &str, c: Completion) -> Option<String> {
     if c.items.is_empty() {
         return None;
     }
@@ -246,6 +276,19 @@ mod tests {
 
     fn convs() -> Vec<String> {
         vec!["#team-alpha".to_string(), "#tt-ops-room".to_string()]
+    }
+
+    #[test]
+    fn author_suggestions_narrow_case_insensitively_and_complete() {
+        let users=vec![("U1".into(),"gabriel.clima".into()),("U2".into(),"gwen.parker".into()),("U3".into(),"Same Name".into()),("U4".into(),"duplicate".into()),("U5".into(),"duplicate".into())];
+        let all=with_authors("/find from:@",&[],&users);assert_eq!(all.items[0].text,"from:@me");assert_eq!(all.items.len(),6);
+        assert_eq!(with_authors("/find nginx from:@G",&[],&users).items.len(),2);
+        assert_eq!(apply_with_authors("/find nginx from:@Gab",&[],&users).as_deref(),Some("/find nginx from:@gabriel.clima"));
+        assert_eq!(apply_with_authors("/search from:@m",&[],&users).as_deref(),Some("/search from:@me"));
+        assert_eq!(with_authors("/find from:@Same",&[],&users).items[0].text,"from:@U3");
+        assert_eq!(with_authors("/find from:@duplicate",&[],&users).items.iter().map(|i|i.text.as_str()).collect::<Vec<_>>(),["from:@U4","from:@U5"]);
+        assert!(with_authors("/find from:@zzz",&[],&users).items.is_empty());
+        assert!(with_authors("/mute from:@",&[],&users).items.is_empty());
     }
 
     #[test]

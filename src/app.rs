@@ -781,6 +781,10 @@ impl App {
             return;
         }
         if let Some(Command::Find(text)) = parse_command(line) {
+            if crate::author_search::has_author(&text) {
+                if let Mode::Prompt { previous, .. } = &self.mode { self.filter = previous.clone(); }
+                self.apply_filter(); return;
+            }
             self.filter = text;
             self.apply_filter();
         }
@@ -806,7 +810,10 @@ impl App {
                 }
             }
             Some(Command::Find(text)) => {
-                if self.focus == Focus::Convs {
+                if crate::author_search::has_author(&text) {
+                    self.restore_filter(filter_before);
+                    self.run_author_search(&text);
+                } else if self.focus == Focus::Convs {
                     self.filter = text;
                     self.apply_filter();
                 } else if text.is_empty() {
@@ -2141,8 +2148,11 @@ impl App {
     fn invalidate_thread_jobs(&mut self) {
         // A fetch belongs to the view that requested it, even if a new view has
         // the same root timestamp. Cancel navigation, never the cache write.
+        for view in &mut self.stack {
+            if let View::Search {live_pending,..}=view { *live_pending=false; }
+        }
         for slot in [&mut self.job, &mut self.bg] {
-            if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. } | JobKind::Sent { .. })) { *slot = None; }
+            if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. } | JobKind::Sent { .. } | JobKind::Search { .. })) { *slot = None; }
         }
     }
 
@@ -2346,7 +2356,7 @@ impl App {
     /// Open a message's thread wherever it lives: this conversation, another
     /// archived one (switched to underneath the search view), or Slack.
     fn open_hit(&mut self, cid: String, root: i64, focus: i64) {
-        if matches!(self.stack.last(), Some(View::Saved { .. } | View::Sent { .. })) {
+        if matches!(self.stack.last(), Some(View::Saved { .. } | View::Sent { .. } | View::Search { .. })) {
             self.open_thread_in(cid, root, focus);
             return;
         }
@@ -2377,7 +2387,56 @@ impl App {
         self.open_thread_in(cid, root, focus);
     }
 
+    fn run_author_search(&mut self, query: &str) {
+        let parsed = match crate::author_search::parse(query, &self.corpus.author_names(), self.corpus.me.as_deref()) {
+            Ok(parsed) => parsed, Err(error) => { self.status = error; return; }
+        };
+        let cid = if self.focus == Focus::Msgs {
+            match self.stack.last() {
+                Some(View::Search {list,..}) => list.source_channel.clone(),
+                Some(View::Thread {list,..}) => list.source_channel.clone().or_else(||list.msgs.first().map(|m|m.channel_id.clone()))
+                    .or_else(||self.open.as_ref().map(|o|self.corpus.convs[o.conv].id.clone())),
+                _ => self.open.as_ref().map(|o|self.corpus.convs[o.conv].id.clone()),
+            }
+        } else { None };
+        self.invalidate_thread_jobs();
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
+        let mut capped = false;
+        let needle = parsed.text.to_lowercase();
+        if let Some(author) = parsed.user_id.as_deref() {
+            for conversation in self.corpus.convs.iter().filter(|c| !c.live_only && cid.as_ref().is_none_or(|cid|cid==&c.id)) {
+                let archive=&self.corpus.archives[conversation.archive];
+                let candidates = match archive.search_filtered(Some(&conversation.id), &parsed.text, Some(author), SEARCH_CAP) {
+                    Ok(messages) => messages, Err(error) => { self.status = format!("Author search: {error}"); return; }
+                };
+                capped |= candidates.len() >= SEARCH_CAP;
+                let ctx = Ctx { archive:Some(archive),corpus:&self.corpus,tz:self.tz,image_font:self.image_font(),last_read:None,palette:&self.palette };
+                for mut message in candidates {
+                    if !needle.is_empty() && !render::plain(&render::body(&message,&ctx)).to_lowercase().contains(&needle)
+                        && !render::message_urls(&message).iter().any(|url|url.to_lowercase().contains(&needle)) { continue; }
+                    message.channel_name = self.corpus.conv_by_channel(&message.channel_id).map(|index|self.corpus.convs[index].name.clone());
+                    if seen.insert((message.channel_id.clone(),message.id)) { hits.push(message); }
+                }
+            }
+        }
+        hits.sort_by_key(|message|std::cmp::Reverse(message.id));
+        capped |= hits.len() > SEARCH_CAP;hits.truncate(SEARCH_CAP);
+        let go_live = self.live && self.job.is_none() && self.api.is_some();
+        let cached = hits.len();
+        if self.focus == Focus::Convs { self.open=None;self.stack.clear(); }
+        let mut list=MsgList::new(hits,false);list.source_channel=cid.clone();
+        self.stack.push(View::Search { query:query.into(),list,capped,live_hits:None,live_pending:go_live });
+        self.focus=Focus::Msgs;
+        self.status=format!("{cached} cached author matches{}",if go_live { "; searching Slack" } else if self.live && self.job.is_some() { "; Slack was not searched: another request is running; retry when it finishes" } else { "" });
+        if go_live {
+            let slack_query = match cid { Some(cid)=>format!("in:<#{cid}> {}",parsed.slack),None=>parsed.slack };
+            self.job=Some(live::api_search_labeled(self.api.clone().unwrap(),slack_query,query.into()));
+        } else if parsed.user_id.is_none() { self.status="Own user ID unavailable; sign in to search from:@me".into(); }
+    }
+
     pub fn run_search(&mut self, query: &str) {
+        if crate::author_search::has_author(query) { self.run_author_search(query); return; }
         let query = query.trim();
         if query.is_empty() {
             return;
@@ -2441,7 +2500,8 @@ impl App {
             )
         };
         // Newest first; the cursor starts on the newest hit.
-        let list = MsgList::new(hits, false);
+        let mut list = MsgList::new(hits, false);
+        list.source_channel=Some(conv.id.clone());
         self.stack.push(View::Search {
             query: query.to_string(),
             list,
@@ -2483,7 +2543,7 @@ impl App {
                 live_pending,
                 ..
             }) if q == query => {
-                let cursor_id = list.selected().map(|m| m.id);
+                let cursor_id = list.selected().map(|m| (m.channel_id.clone(),m.id));
                 let mut seen: HashSet<(String, i64)> = list
                     .msgs
                     .iter()
@@ -2498,7 +2558,7 @@ impl App {
                 }
                 list.msgs.sort_by(|x, y| y.id.cmp(&x.id));
                 if let Some(id) = cursor_id {
-                    list.cursor = list.msgs.iter().position(|m| m.id == id).unwrap_or(0);
+                    list.cursor = list.msgs.iter().position(|m| (m.channel_id.clone(),m.id) == id).unwrap_or(0);
                 }
                 *live_hits = Some(added);
                 *live_pending = false;
@@ -3831,7 +3891,7 @@ impl App {
                 } else {
                     live_hits
                         .map(|n| format!(" · {n} more from Slack"))
-                        .unwrap_or_default()
+                        .unwrap_or_else(||" · cached results only".into())
                 };
                 format!(
                     "search '{query}' · {} hit{}{}{live}",
@@ -4461,7 +4521,7 @@ impl App {
                     return;
                 }
                 // Unwind one stacked view; from the bare timeline, straight home.
-                if matches!(self.stack.last(), Some(View::Thread { .. })) { self.invalidate_thread_jobs(); }
+                if matches!(self.stack.last(), Some(View::Thread { .. } | View::Search { .. })) { self.invalidate_thread_jobs(); }
                 if self.stack.pop().is_none() || (self.open.is_none() && self.stack.is_empty()) {
                     self.go_home();
                 }
@@ -4523,7 +4583,7 @@ impl App {
             }
             KeyCode::Tab if kind == PromptKind::Command => {
                 let line = buf.text.clone();
-                if let Some(done) = complete::apply(&line, &self.conv_names()) {
+                if let Some(done) = complete::apply_with_authors(&line, &self.conv_names(), &self.corpus.author_names()) {
                     if let Mode::Prompt { buf, .. } = &mut self.mode {
                         *buf = Editor::with(done.clone());
                     }
@@ -5476,6 +5536,46 @@ pub(crate) mod tests {
             app.on_msg_key(Some(Action::Back)); assert!(matches!(app.stack.last(),Some(View::Saved {..})));
             app.on_msg_key(Some(Action::Back)); assert!(app.focus == Focus::Convs);
         }
+    }
+
+    #[test]
+    fn author_command_completion_scope_and_global_rendering() {
+        let mut app=mute_test_app();app.corpus.me=Some("U1".into());
+        app.corpus.merge_profiles(vec![json!({"id":"U1","name":"gabriel.clima"}),json!({"id":"U2","name":"gwen.parker"})]);
+        app.open_command();
+        if let Mode::Prompt {buf,..}=&mut app.mode { *buf=Editor::with("/find from:@gab".into()); }
+        app.on_key(KeyEvent::new(KeyCode::Tab,KeyModifiers::NONE));
+        assert!(matches!(&app.mode,Mode::Prompt {buf,..} if buf.text=="/find from:@gabriel.clima"));
+        app.filter_live("/find from:@gab");assert!(app.filter.is_empty());
+        app.mode=Mode::Normal;
+        app.run_command("/find from:@me","");assert!(app.focus==Focus::Msgs);assert!(app.open.is_none());
+        let mut hit=msg(2,"authored message");hit.channel_id="C1".into();app.merge_hits("from:@me",vec![hit]);
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let text:String=terminal.backend().buffer().content.iter().map(|cell|cell.symbol()).collect();assert!(text.contains("authored message"));
+        app.open_hit("C1".into(),2_000_000,2_000_000);assert!(app.open.is_none());
+        app.on_msg_key(Some(Action::Back));assert!(matches!(app.stack.last(),Some(View::Search {..})));
+        app.on_msg_key(Some(Action::Back));assert!(app.focus==Focus::Convs);
+        let (tx,rx)=std::sync::mpsc::channel();
+        app.api=Some(Arc::new(Client::for_test(move |method,params| {
+            assert_eq!(method,"search.messages");tx.send(params.iter().find(|(key,_)|*key=="query").unwrap().1.to_string()).unwrap();Ok(json!({"messages":{"matches":[]}}))
+        })));
+        app.live=true;app.run_command("/find from:@me nginx","");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"from:U1 nginx");
+        app.go_home();app.open=Some(Open {conv:0,list:MsgList::new(vec![],false),total:0,has_older:false,has_newer:false,api_only:true});app.focus=Focus::Msgs;
+        let expected=format!("in:<#{}> from:U2 cache",app.corpus.convs[0].id);
+        app.run_command("/find from:@gwen.parker cache","");assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),expected);
+        app.go_home();
+        let mut thread=MsgList::new(vec![],true);thread.source_channel=Some("COTHER".into());
+        app.stack.push(View::Thread {root:1,list:thread,live:None,place:None});app.focus=Focus::Msgs;
+        app.run_command("/find from:@me","");assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"in:<#COTHER> from:U1");
+        app.on_msg_key(Some(Action::Back));assert!(app.job.is_none());
+        app.run_command("/find from:@me","");assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"in:<#COTHER> from:U1");
+        app.invalidate_thread_jobs();assert!(!app.title().contains("searching Slack"));assert!(app.title().contains("cached results only"));
+        app.run_command("/find from:@me again","");assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"in:<#COTHER> from:U1 again");
+        app.go_home();app.job=Some(Job::completed_for_test(JobKind::Profiles,Ok(Done::Profiles(vec![],None))));
+        app.run_command("/find from:@me","");assert!(app.status.contains("Slack was not searched"));assert!(app.title().contains("cached results only"));
+        app.job=None;
+        app.go_home();app.run_command("/find from:@unknown","");assert!(app.status.contains("Unknown author"));assert!(app.stack.is_empty());
     }
 
     #[test]

@@ -301,9 +301,13 @@ pub fn api_thread(client: Arc<Client>, cache: &Path, cid: String, root: i64, foc
 }
 
 pub fn api_search(client: Arc<Client>, query: String) -> Job {
-    let q = query.clone();
+    api_search_labeled(client, query.clone(), query)
+}
+
+pub fn api_search_labeled(client: Arc<Client>, query: String, label: String) -> Job {
+    let q = query;
     spawn(
-        JobKind::Search { query },
+        JobKind::Search { query: label },
         format!("searching Slack for '{q}'"),
         move || {
             let matches = client.search(&q, 100)?;

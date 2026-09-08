@@ -20,6 +20,7 @@ mod render;
 mod raw;
 mod saved;
 mod sent;
+mod author_search;
 mod storage;
 mod session_log;
 mod ui;
@@ -74,6 +75,10 @@ selection. PgUp/PgDn scroll long values; g/G select the first/last value or link
 Ctrl-S or /save saves the selected message to Slack Later; Ctrl-Shift-S or /unsave
 removes it from Later. SAVED above starred conversations opens active saved messages;
 r refreshes the list. Terminals that report shortcuts alike can use /unsave.
+/find from:@me or /find from:@name [TEXT] filters by sender. Suggestions narrow;
+Tab completes them. From the sidebar it searches the workspace; while reading a
+conversation it searches that conversation. Ambiguous names use the suggested user ID.
+
 SENT below SAVED shows sent messages newest first, using Slack search.
 Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.
 
