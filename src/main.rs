@@ -665,6 +665,10 @@ fn under_multiplexer() -> bool {
 
 fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::SetTitle("slack-tui")
+    );
     struct KeyboardGuard;
     impl Drop for KeyboardGuard {
         fn drop(&mut self) {
