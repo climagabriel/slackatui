@@ -1149,13 +1149,10 @@ impl App {
         if c.live_only {
             return None;
         }
-        let shared = self
-            .corpus
-            .convs
-            .iter()
-            .filter(|x| !x.live_only && x.archive == c.archive)
-            .count()
-            > 1;
+        let archive = &self.corpus.archives[c.archive];
+        let shared = archive.conn.query_row("SELECT COUNT(DISTINCT CHANNEL_ID) FROM main.MESSAGE", [], |row| row.get::<_,i64>(0))
+            .map(|count| count > 1).unwrap_or(true)
+            || self.corpus.archives.iter().any(|other| other.source_dirs.iter().skip(1).any(|dir| dir == &archive.dir));
         Some((self.corpus.archives[c.archive].dir.clone(), shared))
     }
 
@@ -1188,6 +1185,11 @@ impl App {
             }
         };
         let cname = self.corpus.convs[idx].name.clone();
+        if matches!(op, "stop" | "wipe") && self.corpus.conv_archive(&self.corpus.convs[idx])
+            .is_some_and(|archive| archive.source_dirs.len() > 1) {
+            self.status = format!("{cname} uses multiple archives; stop/wipe needs an explicit source archive");
+            return;
+        }
         match (op, self.archive_dir(idx)) {
             ("start", None) => {
                 let id = self.corpus.convs[idx].id.clone();
@@ -2776,13 +2778,12 @@ impl App {
         if let Some(idx) = self.corpus.conv_by_channel(&f.channel) {
             let conv = &self.corpus.convs[idx];
             if !conv.live_only {
-                let dir = self.corpus.archives[conv.archive]
-                    .dir
-                    .join("__uploads")
-                    .join(&f.id);
-                if let Ok(rd) = std::fs::read_dir(&dir) {
-                    if let Some(e) = rd.flatten().find(|e| e.path().is_file()) {
-                        return Some(e.path());
+                for source in &self.corpus.archives[conv.archive].source_dirs {
+                    let dir = source.join("__uploads").join(&f.id);
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        if let Some(entry) = rd.flatten().find(|entry| entry.path().is_file()) {
+                            return Some(entry.path());
+                        }
                     }
                 }
             }
@@ -5318,6 +5319,43 @@ mod tests {
         terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         assert!((2..10).all(|y| buffer[(2,y)].symbol() != "─"));
+    }
+
+    #[test]
+    fn combined_archives_find_secondary_files_and_refuse_partial_wipes() {
+        let root = std::env::temp_dir().join(format!("slack-union-files-{}", std::process::id()));
+        let first = root.join("first");
+        let second = root.join("second");
+        let file_path = second.join("__uploads/FTEST/image.png");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"fixture").unwrap();
+        let mut app = mute_test_app();
+        let mut archive = crate::archive::Archive::stub(&[], &[]);
+        archive.dir = first.clone();
+        archive.source_dirs = vec![first.clone(), second];
+        app.corpus.archives.push(archive);
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        let file = crate::archive::FileInfo::from_slack(&json!({"id":"FTEST","title":"image.png","mimetype":"image/png"}),"C1");
+        assert_eq!(app.local_file(&file,true),Some(file_path.clone()));
+        app.cache_cmd("wipe","#one");
+        assert!(app.status.contains("multiple archives"));
+        assert!(first.is_dir());
+        assert!(file_path.is_file());
+        let mut secondary = crate::archive::Archive::stub(&[], &[]);
+        secondary.dir = app.corpus.archives[0].source_dirs[1].clone();
+        secondary.source_dirs = vec![secondary.dir.clone()];
+        secondary.conn.execute_batch("CREATE TABLE MESSAGE(CHANNEL_ID TEXT); INSERT INTO MESSAGE VALUES ('D1');").unwrap();
+        app.corpus.archives.push(secondary);
+        app.corpus.convs[1].archive = 1;
+        app.corpus.convs[1].live_only = false;
+        assert!(app.archive_dir(1).unwrap().1);
+        let name = app.corpus.convs[1].name.clone();
+        app.cache_cmd("wipe", &name);
+        assert!(app.status.contains("shared multi-channel archive"));
+        assert!(file_path.is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn mute_test_app() -> App {

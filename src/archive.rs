@@ -46,6 +46,9 @@ pub struct Archive {
     /// `full/team-alpha_20260428`: the directory relative to the root.
     pub rel: String,
     pub dir: PathBuf,
+    pub source_dirs: Vec<PathBuf>,
+    combined_sources: Vec<(PathBuf, Vec<String>)>,
+    source_fingerprints: RefCell<Vec<String>>,
     pub conn: Connection,
     users: RefCell<Option<HashMap<String, User>>>,
     pub channel_names: HashMap<String, String>,
@@ -371,9 +374,6 @@ impl Corpus {
             users: HashMap::new(),
             usergroups: HashMap::new(),
         };
-        if let Some(c) = &cache {
-            c.save();
-        }
         crate::trace("open: conversations scanned");
         if let Some(best) = archives.iter().max_by_key(|a| a.user_count()) {
             crate::trace("open: user counts done");
@@ -384,6 +384,8 @@ impl Corpus {
             corpus.learn_channels(&a);
             corpus.archives.push(a);
         }
+        corpus.combine_archived_conversations(cache.as_mut())?;
+        if let Some(cache) = &cache { cache.save(); }
         Ok(corpus)
     }
 
@@ -412,15 +414,62 @@ impl Corpus {
             .map_err(|e| e.to_string())?;
         self.learn_channels(&a);
         self.archives.push(a);
-        let first = self.convs.len();
-        let n = convs.len();
-        self.convs.extend(convs);
-        Ok((first..first + n).collect())
+        let mut indices = Vec::new();
+        for conv in convs {
+            if let Some(index) = self.conv_by_channel(&conv.id) {
+                if self.convs[index].live_only {
+                    self.convs[index] = conv;
+                } else {
+                    let primary = self.convs[index].archive;
+                    self.archives[primary].combine_sources(&[(dir.to_path_buf(), vec![conv.id.clone()])]).map_err(|e| e.to_string())?;
+                    let updated = self.archives[primary].scan_convs(primary, self.me.as_deref(), self.half_life_days, None).map_err(|e| e.to_string())?;
+                    if let Some(stats) = updated.into_iter().find(|c| c.id == conv.id) {
+                        let existing = &mut self.convs[index];
+                        existing.msgs = stats.msgs;
+                        existing.first_id = stats.first_id;
+                        existing.last_id = stats.last_id;
+                        existing.mine = stats.mine;
+                        existing.score = stats.score;
+                    }
+                }
+                indices.push(index);
+            } else {
+                indices.push(self.convs.len());
+                self.convs.push(conv);
+            }
+        }
+        Ok(indices)
     }
 
     /// A user's name from the workspace list.
     pub fn user_name(&self, uid: &str) -> Option<String> {
         self.users.get(uid).map(|u| u.name.clone())
+    }
+
+    fn combine_archived_conversations(&mut self, mut cache: Option<&mut StatsCache>) -> Result<(), String> {
+        let mut first = HashMap::new();
+        let mut overlaps: HashMap<usize, HashMap<usize, Vec<String>>> = HashMap::new();
+        for conv in &self.convs {
+            if let Some(&primary) = first.get(&conv.id) {
+                if primary != conv.archive {
+                    overlaps.entry(primary).or_default().entry(conv.archive).or_default().push(conv.id.clone());
+                }
+            } else { first.insert(conv.id.clone(), conv.archive); }
+        }
+        for (primary, others) in overlaps {
+            let mut sources: Vec<_> = others.into_iter().map(|(index, ids)| (self.archives[index].dir.clone(), ids)).collect();
+            sources.sort_by(|a, b| a.0.cmp(&b.0));
+            self.archives[primary].combine_sources(&sources).map_err(|error| format!("Combining {}: {error}", self.archives[primary].rel))?;
+            let updated = self.archives[primary].scan_convs(primary, self.me.as_deref(), self.half_life_days, cache.as_deref_mut())
+                .map_err(|error| format!("Combined archive stats: {error}"))?;
+            for conv in updated {
+                if let Some(existing) = self.convs.iter_mut().find(|c| c.archive == primary && c.id == conv.id) {
+                    *existing = conv;
+                }
+            }
+        }
+        self.convs.retain(|conv| first.get(&conv.id) == Some(&conv.archive));
+        Ok(())
     }
 
     /// The id behind a handle, for `@name` in an outgoing message.
@@ -505,6 +554,9 @@ impl Archive {
         Archive {
             rel: "test".to_string(),
             dir: PathBuf::new(),
+            source_dirs: vec![],
+            combined_sources: vec![],
+            source_fingerprints: RefCell::new(vec![]),
             conn: Connection::open_in_memory().expect("in-memory sqlite"),
             users: RefCell::new(Some(map)),
             channel_names: channels
@@ -520,6 +572,9 @@ impl Archive {
         Ok(Archive {
             rel,
             dir: dir.to_path_buf(),
+            source_dirs: vec![dir.to_path_buf()],
+            combined_sources: vec![],
+            source_fingerprints: RefCell::new(vec![]),
             conn,
             users: RefCell::new(None),
             channel_names: HashMap::new(),
@@ -528,6 +583,7 @@ impl Archive {
 
     /// Fresh message stats for one channel: (distinct messages, first id, last id).
     pub fn channel_stats(&self, cid: &str) -> rusqlite::Result<(i64, i64, i64)> {
+        self.ensure_combined_fresh()?;
         self.conn.query_row(
             "SELECT COUNT(DISTINCT TS), IFNULL(MIN(ID), 0), IFNULL(MAX(ID), 0) FROM MESSAGE WHERE CHANNEL_ID = ?1",
             params![cid],
@@ -746,12 +802,13 @@ impl Archive {
         // and keyed by the database's size and mtime: only what a refresh
         // touched is recounted.
         let key = self.stat_key();
-        let stats = match cache.as_ref().and_then(|c| c.get(&self.rel, &key)) {
+        let cache_name = if self.combined_sources.is_empty() { self.rel.clone() } else { format!("{}#combined",self.rel) };
+        let stats = match cache.as_ref().and_then(|c| c.get(&cache_name, &key)) {
             Some(st) => st,
             None => {
                 let st = self.compute_stats(me)?;
                 if let Some(c) = cache {
-                    c.put(&self.rel, &key, &st);
+                    c.put(&cache_name, &key, &st);
                 }
                 st
             }
@@ -799,17 +856,81 @@ impl Archive {
         Ok(convs)
     }
 
+    fn combine_sources(&mut self, sources: &[(PathBuf, Vec<String>)]) -> rusqlite::Result<()> {
+        if self.combined_sources.is_empty() { self.conn.execute_batch("PRAGMA temp_store=MEMORY;")?; }
+        for (dir, channels) in sources {
+            if let Some((_, ids)) = self.combined_sources.iter_mut().find(|(path, _)| path == dir) {
+                ids.extend(channels.iter().cloned());
+                ids.sort();
+                ids.dedup();
+            } else {
+                self.combined_sources.push((dir.clone(), channels.clone()));
+                self.source_dirs.push(dir.clone());
+            }
+        }
+        self.conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS extra_messages (
+            ID INTEGER,CHUNK_ID INTEGER,CHANNEL_ID TEXT,TS TEXT,PARENT_ID INTEGER,THREAD_TS TEXT,
+            IS_PARENT INTEGER,LATEST_REPLY TEXT,TXT TEXT,DATA BLOB,SOURCE_TIME INTEGER);
+            CREATE INDEX IF NOT EXISTS temp.extra_messages_channel ON extra_messages(CHANNEL_ID,ID);
+            CREATE INDEX IF NOT EXISTS temp.extra_messages_parent ON extra_messages(CHANNEL_ID,PARENT_ID);
+            DROP VIEW IF EXISTS temp.MESSAGE;
+            CREATE TEMP VIEW MESSAGE AS
+            SELECT m.ID,m.CHUNK_ID,m.CHANNEL_ID,m.TS,m.PARENT_ID,m.THREAD_TS,m.IS_PARENT,m.LATEST_REPLY,m.TXT,m.DATA,
+                COALESCE((SELECT UNIX_TS FROM main.CHUNK WHERE ID=m.CHUNK_ID),0) AS SOURCE_TIME FROM main.MESSAGE m
+            UNION ALL SELECT * FROM extra_messages;")?;
+        self.source_fingerprints.borrow_mut().clear();
+        self.ensure_combined_fresh()
+    }
+
+    fn ensure_combined_fresh(&self) -> rusqlite::Result<()> {
+        if self.combined_sources.is_empty() { return Ok(()); }
+        let fingerprints: Vec<_> = self.combined_sources.iter().map(|(dir,_)| Self::directory_key(dir)).collect();
+        if *self.source_fingerprints.borrow() == fingerprints { return Ok(()); }
+        self.conn.execute_batch("SAVEPOINT refresh_union; DELETE FROM temp.extra_messages;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            let mut insert = self.conn.prepare("INSERT INTO temp.extra_messages VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?;
+            for (dir, channels) in &self.combined_sources {
+                let source = open_ro(&dir.join("slackdump.sqlite"))?;
+                let mut statement = source.prepare("SELECT m.ID,m.CHUNK_ID,m.CHANNEL_ID,m.TS,m.PARENT_ID,m.THREAD_TS,m.IS_PARENT,m.LATEST_REPLY,m.TXT,m.DATA,
+                    COALESCE((SELECT UNIX_TS FROM CHUNK WHERE ID=m.CHUNK_ID),0) FROM MESSAGE m WHERE m.CHANNEL_ID=?1")?;
+                for channel in channels {
+                    let mut rows = statement.query([channel])?;
+                    while let Some(row) = rows.next()? {
+                        let values: Vec<rusqlite::types::Value> = (0..11).map(|index| row.get(index)).collect::<rusqlite::Result<_>>()?;
+                        insert.execute(rusqlite::params_from_iter(values))?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.conn.execute_batch("ROLLBACK TO refresh_union; RELEASE refresh_union;")?;
+            return Err(error);
+        }
+        self.conn.execute_batch("RELEASE refresh_union;")?;
+        *self.source_fingerprints.borrow_mut() = fingerprints;
+        Ok(())
+    }
+
+    fn message_order(&self) -> &'static str {
+        if self.source_dirs.len() > 1 { "m.SOURCE_TIME DESC, m.CHUNK_ID DESC" }
+        else { "m.CHUNK_ID DESC" }
+    }
+
     /// Size and mtime of the database and its WAL: what a resume changes.
     fn stat_key(&self) -> String {
+        self.source_dirs.iter().map(|dir| format!("{}:{}",dir.display(),Self::directory_key(dir))).collect::<Vec<_>>().join("|")
+    }
+    fn directory_key(dir: &Path) -> String {
         let mut key = String::new();
         for name in ["slackdump.sqlite", "slackdump.sqlite-wal"] {
-            match std::fs::metadata(self.dir.join(name)) {
+            match std::fs::metadata(dir.join(name)) {
                 Ok(md) => {
                     let mtime = md
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
+                        .map(|d| d.as_nanos())
                         .unwrap_or(0);
                     key.push_str(&format!("{}:{}:", md.len(), mtime));
                 }
@@ -823,6 +944,7 @@ impl Archive {
     /// the owner's messages. The LIKE prefilter keeps the JSON parse to rows
     /// that can match: 197 ms -> 56 ms on the largest archive.
     fn compute_stats(&self, me: Option<&str>) -> rusqlite::Result<ArchiveStats> {
+        self.ensure_combined_fresh()?;
         let mut channels: HashMap<String, ChannelStats> = HashMap::new();
         let mut stmt = self.conn.prepare(
             "SELECT CHANNEL_ID, COUNT(DISTINCT TS), MIN(ID), MAX(ID) FROM MESSAGE GROUP BY CHANNEL_ID",
@@ -971,6 +1093,7 @@ impl Archive {
     }
 
     fn query_msgs(&self, sql: &str, p: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<Vec<Msg>> {
+        self.ensure_combined_fresh()?;
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(p, RawRow::from_row)?;
         let mut raw = Vec::new();
@@ -1000,9 +1123,10 @@ impl Archive {
                WHERE CHANNEL_ID = ?1 AND (?2 IS NULL OR ID < ?2) AND (?3 IS NULL OR ID >= ?3) \
                AND {top} ORDER BY ID {dir} LIMIT ?4) \
              SELECT {cols} FROM MESSAGE m JOIN ids ON ids.ID = m.ID \
-             WHERE m.CHANNEL_ID = ?1 ORDER BY m.ID ASC, m.CHUNK_ID DESC",
+             WHERE m.CHANNEL_ID = ?1 ORDER BY m.ID ASC, {order}",
             top = Self::TOP_LEVEL,
             cols = Self::COLS,
+            order = self.message_order(),
         );
         let mut msgs = self.query_msgs(&sql, &[&cid, &before, &after, &(limit as i64)])?;
         self.reply_stats(cid, &mut msgs)?;
@@ -1010,6 +1134,7 @@ impl Archive {
     }
 
     pub fn timeline_count(&self, cid: &str) -> rusqlite::Result<i64> {
+        self.ensure_combined_fresh()?;
         self.conn.query_row(
             &format!(
                 "SELECT COUNT(DISTINCT ID) FROM MESSAGE WHERE CHANNEL_ID = ?1 AND {}",
@@ -1024,8 +1149,9 @@ impl Archive {
     pub fn thread(&self, cid: &str, root: i64) -> rusqlite::Result<Vec<Msg>> {
         let sql = format!(
             "SELECT {cols} FROM MESSAGE m WHERE m.CHANNEL_ID = ?1 AND (m.ID = ?2 OR m.PARENT_ID = ?2) \
-             ORDER BY m.ID ASC, m.CHUNK_ID DESC",
-            cols = Self::COLS
+             ORDER BY m.ID ASC, {order}",
+            cols = Self::COLS,
+            order = self.message_order()
         );
         let mut msgs = self.query_msgs(&sql, &[&cid, &root])?;
         self.reply_stats(cid, &mut msgs)?;
@@ -1034,6 +1160,7 @@ impl Archive {
 
     /// Roots of every thread the owner wrote in.
     pub fn my_threads(&self, me: &str) -> rusqlite::Result<Vec<Msg>> {
+        self.ensure_combined_fresh()?;
         let like = format!("%\"user\":\"{}\"%", me.replace(['%', '_'], ""));
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT CHANNEL_ID, THREAD_TS FROM MESSAGE \
@@ -1046,8 +1173,9 @@ impl Archive {
             .flatten()
             .collect();
         let sql = format!(
-            "SELECT {cols} FROM MESSAGE m WHERE m.CHANNEL_ID = ?1 AND m.ID = ?2 ORDER BY m.ID ASC, m.CHUNK_ID DESC",
-            cols = Self::COLS
+            "SELECT {cols} FROM MESSAGE m WHERE m.CHANNEL_ID = ?1 AND m.ID = ?2 ORDER BY m.ID ASC, {order}",
+            cols = Self::COLS,
+            order = self.message_order()
         );
         let mut out = Vec::new();
         for (cid, ts) in roots {
@@ -1111,11 +1239,14 @@ impl Archive {
             .replace('>', "&gt;");
         let like_stored = format!("%{}%", esc(&stored));
         let sql = format!(
-            "SELECT {cols} FROM MESSAGE m WHERE m.CHANNEL_ID = ?1 AND \
+            "WITH ranked AS (SELECT m.*, ROW_NUMBER() OVER (PARTITION BY m.ID ORDER BY {order}) AS position \
+             FROM MESSAGE m WHERE m.CHANNEL_ID = ?1) \
+             SELECT {cols} FROM ranked m WHERE m.position = 1 AND \
              (m.TXT LIKE ?2 ESCAPE '\\' OR m.TXT LIKE ?3 ESCAPE '\\' \
               OR CAST(m.DATA AS TEXT) LIKE ?2 ESCAPE '\\' OR CAST(m.DATA AS TEXT) LIKE ?3 ESCAPE '\\') \
-             ORDER BY m.ID DESC, m.CHUNK_ID DESC LIMIT ?4",
-            cols = Self::COLS
+             ORDER BY m.ID DESC, {order} LIMIT ?4",
+            cols = Self::COLS,
+            order = self.message_order()
         );
         let mut msgs = self.query_msgs(&sql, &[&cid, &like, &like_stored, &(limit as i64)])?;
         self.reply_stats(cid, &mut msgs)?;
@@ -1337,5 +1468,79 @@ impl Msg {
             channel_name: None,
             data: r.data,
         }
+    }
+}
+
+#[cfg(test)]
+mod union_tests {
+    use super::*;
+
+    fn database(dir: &Path, chunk_time: i64, messages: &[(i64, Option<i64>, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let conn = Connection::open(dir.join("slackdump.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE CHUNK(ID INTEGER, UNIX_TS INTEGER);
+            CREATE TABLE CHANNEL(ID TEXT, NAME TEXT, DATA BLOB, CHUNK_ID INTEGER);
+            CREATE TABLE CHANNEL_USER(CHANNEL_ID TEXT, USER_ID TEXT);
+            CREATE TABLE MESSAGE(ID INTEGER, CHUNK_ID INTEGER, CHANNEL_ID TEXT, TS TEXT,
+                PARENT_ID INTEGER, THREAD_TS TEXT, IS_PARENT INTEGER, LATEST_REPLY TEXT, TXT TEXT, DATA BLOB);
+            INSERT INTO CHANNEL VALUES ('C1','same',CAST('{}' AS BLOB),1);").unwrap();
+        conn.execute("INSERT INTO CHUNK VALUES(1,?1)", [chunk_time]).unwrap();
+        for &(id, parent, text) in messages {
+            let ts = format!("{id}.000000");
+            let data = serde_json::json!({"text":text,"ts":ts,"user":"U1"}).to_string().into_bytes();
+            conn.execute("INSERT INTO MESSAGE VALUES(?1,1,'C1',?2,?3,?4,0,NULL,?5,?6)",
+                params![id*1_000_000, ts, parent.map(|p|p*1_000_000), parent.map(|p|format!("{p}.000000")),text,data]).unwrap();
+        }
+    }
+
+    #[test]
+    fn overlapping_archives_preserve_union_pages_threads_and_refreshes() {
+        let root = std::env::temp_dir().join(format!("slack-archive-union-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let first = root.join("full/first");
+        let second = root.join("dms/second");
+        database(&first, 100, &[(1,None,"old root"),(2,None,"only first")]);
+        database(&second, 200, &[(1,None,"new root"),(3,Some(1),"only second reply")]);
+        let original = std::fs::read(first.join("slackdump.sqlite")).unwrap();
+        let mut corpus = Corpus::open(&root,30.0,None).unwrap();
+        assert_eq!(corpus.convs.len(),1);
+        assert_eq!(corpus.convs[0].msgs,3);
+        let archive = corpus.conv_archive(&corpus.convs[0]).unwrap();
+        assert_eq!(archive.timeline_count("C1").unwrap(),2);
+        let newest = archive.timeline_page("C1",None,None,1).unwrap();
+        assert_eq!(newest[0].text,"only first");
+        let older = archive.timeline_page("C1",Some(newest[0].id),None,1).unwrap();
+        assert_eq!(older[0].text,"new root");
+        assert_eq!(older[0].archived_replies,1);
+        let thread = archive.thread("C1",1_000_000).unwrap();
+        assert_eq!(thread.len(),2);
+        assert_eq!(thread[1].text,"only second reply");
+        assert_eq!(archive.search("C1","only second",10).unwrap().len(),1);
+        assert!(archive.search("C1","old root",10).unwrap().is_empty());
+        assert_eq!(archive.source_dirs.len(),2);
+        assert!(open_ro(&second.join("slackdump.sqlite")).unwrap().execute("DELETE FROM MESSAGE",[]).is_err());
+        assert_eq!(std::fs::read(first.join("slackdump.sqlite")).unwrap(),original);
+        let writer = Connection::open(second.join("slackdump.sqlite")).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        writer.execute("INSERT INTO MESSAGE SELECT 4000000,CHUNK_ID,CHANNEL_ID,'4.000000',NULL,NULL,0,NULL,'refreshed',DATA FROM MESSAGE LIMIT 1",[]).unwrap();
+        assert_eq!(archive.channel_stats("C1").unwrap().0,4);
+        let third = root.join("full/third");
+        database(&third,300,&[(5,None,"added while running")]);
+        corpus.me = Some("U1".into());
+        assert_eq!(corpus.add_archive(&third).unwrap(),vec![0]);
+        assert_eq!(corpus.convs.len(),1);
+        assert_eq!(corpus.convs[0].msgs,5);
+        assert_eq!(corpus.convs[0].mine,5);
+        for id in 6..18 {
+            let path = root.join(format!("full/source{id}"));
+            database(&path,id*100,&[(5,None,"new overlapping message"),(id,None,"another unique message")]);
+            assert_eq!(corpus.add_archive(&path).unwrap(),vec![0]);
+        }
+        assert_eq!(corpus.convs.len(),1);
+        assert_eq!(corpus.convs[0].msgs,17);
+        let archive = corpus.conv_archive(&corpus.convs[0]).unwrap();
+        assert_eq!(archive.search("C1","message",14).unwrap().len(),13);
+        drop(corpus);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
