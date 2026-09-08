@@ -3795,7 +3795,11 @@ impl App {
             && action == Some(Action::Open)
             && matches!(k.code, KeyCode::Char('l') | KeyCode::Right)
         {
-            if self.active_list().is_some_and(|list| list.line_scroll) {
+            if !matches!(self.stack.last(), Some(View::Thread { .. }))
+                && self.selected().is_some_and(|message| message.has_thread() || message.parent_id.is_some())
+            {
+                self.on_msg_key(Some(Action::Open));
+            } else if self.active_list().is_some_and(|list| list.line_scroll) {
                 self.open_raw();
             } else if let Some(list) = self.active_list_mut() {
                 if list.selected().is_some() {
@@ -4047,6 +4051,11 @@ impl App {
                 .to_string();
             }
             Some(Action::Close) | Some(Action::Back) => {
+                if let Some(list) = self.active_list_mut().filter(|list| list.line_scroll) {
+                    list.line_scroll = false;
+                    self.status.clear();
+                    return;
+                }
                 // Unwind one stacked view; from the bare timeline, straight home.
                 if self.stack.pop().is_none() {
                     self.go_home();
@@ -4396,6 +4405,9 @@ mod tests {
         draw(&mut app, &mut terminal);
         assert_eq!(app.active_list().unwrap().scroll, first);
         app.on_key(key(KeyCode::Char('h')));
+        assert!(app.open.is_some());
+        assert!(!app.active_list().unwrap().line_scroll);
+        app.on_key(key(KeyCode::Char('h')));
         assert!(app.open.is_none());
     }
 
@@ -4729,6 +4741,60 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
+    }
+
+    #[test]
+    fn horizontal_navigation_unwinds_one_level_at_a_time() {
+        for (forward, back) in [(KeyCode::Char('l'), KeyCode::Char('h')), (KeyCode::Right, KeyCode::Left)] {
+            let mut app = App::new(
+                Corpus::stub(&[]), Tz::Utc, 30.0, false, false,
+                PathBuf::new(), PathBuf::new(), 60, None, None,
+            );
+            app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
+            let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+            app.on_key(key(forward));
+            assert!(app.focus == Focus::Msgs);
+            let mut root = msg(3, "thread root");
+            root.reply_count = 2;
+            app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1, "first"), msg(2, "second"), root.clone()], false);
+            app.on_key(key(KeyCode::Char('j')));
+            app.on_key(key(KeyCode::Char('j')));
+            assert_eq!(app.active_list().unwrap().cursor, 2);
+            app.on_key(key(forward));
+            assert!(matches!(app.stack.last(), Some(View::Thread { .. })));
+            assert!(!app.open.as_ref().unwrap().list.line_scroll);
+            // Supply offline replies; this test must not access Slack.
+            let View::Thread { list, .. } = app.stack.last_mut().unwrap() else { panic!() };
+            *list = MsgList::new(vec![root, msg(4, "reply"), msg(5, "another reply")], true);
+            app.on_key(key(KeyCode::Char('j')));
+            app.on_key(key(KeyCode::Char('j')));
+            app.on_key(key(back));
+            assert!(app.stack.is_empty());
+            assert_eq!(app.active_list().unwrap().cursor, 2);
+            assert!(app.focus == Focus::Msgs);
+            // Re-enter, then descend through message reading and raw JSON.
+            app.on_key(key(forward));
+            let View::Thread { list, .. } = app.stack.last_mut().unwrap() else { panic!() };
+            *list = MsgList::new(vec![msg(4, "reply")], true);
+            app.on_key(key(forward));
+            assert!(app.active_list().unwrap().line_scroll);
+            app.on_key(key(forward));
+            assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+            app.on_key(key(back));
+            assert!(matches!(app.stack.last(), Some(View::Thread { .. })));
+            assert!(app.active_list().unwrap().line_scroll);
+            app.on_key(key(back));
+            assert!(!app.active_list().unwrap().line_scroll);
+            assert!(matches!(app.stack.last(), Some(View::Thread { .. })));
+            app.on_key(key(back));
+            assert!(app.stack.is_empty());
+            assert!(app.open.is_some());
+            app.on_key(key(back));
+            assert!(app.open.is_none());
+            assert!(app.focus == Focus::Convs);
+            app.on_key(key(back));
+            assert!(app.focus == Focus::Convs);
+        }
     }
 
     #[test]
