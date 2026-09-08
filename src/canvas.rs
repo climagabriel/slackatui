@@ -39,6 +39,7 @@ enum Target {
     Messages,
     Canvas(String),
     Files,
+    Image(crate::archive::FileInfo, String),
     Bookmarks,
     Link(String),
 }
@@ -406,6 +407,8 @@ fn load_entries(client: &Client, channel: &str, files: bool) -> Result<Vec<Tab>,
                         label: string(file, "title"),
                         target: if string(file, "filetype") == "quip" {
                             Target::Canvas(string(file, "id"))
+                        } else if crate::archive::FileInfo::from_slack(file, channel).is_image() {
+                            Target::Image(crate::archive::FileInfo::from_slack(file, channel), string(file, "permalink"))
                         } else {
                             Target::Link(string(file, "permalink"))
                         },
@@ -655,6 +658,13 @@ fn spawn(work: impl FnOnce() -> Result<Loaded, String> + Send + 'static) -> Job 
     Job { receive }
 }
 
+pub struct Picture {
+    pub permalink: String,
+    pub file: crate::archive::FileInfo,
+    pub zoom: u16,
+    pub shown: Option<(String, ratatui_image::protocol::StatefulProtocol)>,
+}
+
 pub struct Browser {
     pub visible: bool,
     pub channel: String,
@@ -671,6 +681,7 @@ pub struct Browser {
     job: Option<Job>,
     notice: String,
     link: Option<String>,
+    pub picture: Option<Picture>,
 }
 impl Browser {
     pub fn can_toggle(&self) -> bool {
@@ -700,6 +711,7 @@ impl Browser {
             job: Some(spawn(move || load_tabs(&api, &cid).map(Loaded::Tabs))),
             notice: "Loading channel tabs…".into(),
             link: None,
+            picture: None,
         }
     }
     pub fn tick(&mut self) {
@@ -803,6 +815,9 @@ impl Browser {
             return;
         }
         if matches!(key.code, KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc) {
+            if self.picture.take().is_some() {
+                return;
+            }
             if self.link.take().is_some() {
                 return;
             }
@@ -813,6 +828,15 @@ impl Browser {
                 return;
             }
             self.visible = false;
+            return;
+        }
+        if let Some(picture) = &mut self.picture {
+            match key.code {
+                KeyCode::Char('+' | '=') => picture.zoom = (picture.zoom + 25).min(800),
+                KeyCode::Char('-' | '_') => picture.zoom = picture.zoom.saturating_sub(25).max(25),
+                KeyCode::Char('0') => picture.zoom = 100,
+                _ => {}
+            }
             return;
         }
         if self.link.is_some() {
@@ -891,19 +915,34 @@ impl Browser {
                     }));
                     self.notice = "Loading bookmarks…".into();
                 }
+                Some(Target::Image(file, permalink)) => self.picture = Some(Picture { file, permalink, zoom: 100, shown: None }),
                 Some(Target::Link(url)) => self.link = Some(url),
                 None => {}
             }
         }
     }
+    pub fn title(&self) -> String {
+        let mut title = format!("{} · channel tabs", self.name);
+        if self.entries.is_some() {
+            if let Some(tab) = self.tabs.get(self.cursor) {
+                title.push_str(&format!(" · {}", tab.label));
+            }
+        }
+        if let Some(picture) = &self.picture {
+            title.push_str(&format!(" · {}", picture.file.name));
+        } else if let Some(document) = &self.document {
+            title.push_str(&format!(" · {}", document.title));
+        } else if self.link.is_some() {
+            if let Some(entry) = self.entries.as_ref().and_then(|entries| entries.get(self.entry_cursor)) {
+                title.push_str(&format!(" · {}", entry.label));
+            }
+        }
+        title
+    }
+
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, palette: &Palette) {
-        let title = self
-            .document
-            .as_ref()
-            .map(|d| d.title.as_str())
-            .unwrap_or(&self.name);
         let block = Block::bordered()
-            .title(format!(" {title} · channel tabs "))
+            .title(format!(" {} ", self.title()))
             .border_style(Style::new().fg(palette.get(Role::Accent)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -925,12 +964,15 @@ impl Browser {
                 if d.insert { "INSERT" } else { "NORMAL" },
                 if d.dirty() { " [+]" } else { "" }
             )
+        } else if self.picture.is_some() {
+            "+/- zoom · 0 fit · h/Esc back · T hide".into()
         } else if self.document.is_some() {
             "j/k lines · i edit section · h back · T hide".into()
         } else {
             "j/k select · l/Enter open · h back · T hide".into()
         };
         frame.render_widget(Paragraph::new(format!("{hint}\n{}", self.notice)), footer);
+        if self.picture.is_some() { return; }
         if let Some(draft) = &self.draft {
             let rows = draft.editor.rows();
             let row = rows.iter().position(|(_, c)| c.is_some()).unwrap_or(0);
@@ -1166,6 +1208,7 @@ mod tests {
             job: None,
             notice: String::new(),
             link: None,
+            picture: None,
         }
     }
     #[test]
@@ -1310,4 +1353,71 @@ mod tests {
         .unwrap();
         assert!(!numbered.sections[0].editable);
     }
+    #[test]
+    fn files_breadcrumb_and_picture_rendering_return_one_level_at_a_time() {
+        use crate::app::{App, ImageState};
+        use crate::archive::Corpus;
+        use crate::render::Tz;
+        use std::path::PathBuf;
+        let client = Client::for_test(|method, _| match method {
+            "files.list" => Ok(json!({"files":[
+                {"id":"FIMAGE","title":"diagram.png","permalink":"https://slack.com/diagram","mimetype":"image/png","url_private":"https://files.slack.com/diagram.png","original_w":128,"original_h":128},
+                {"id":"FTEXT","title":"notes.txt","mimetype":"text/plain","permalink":"https://slack.com/notes"}
+            ]})),
+            "bookmarks.list" => Ok(json!({"bookmarks":[]})),
+            _ => panic!("unexpected API call"),
+        });
+        let mut browser = browser();
+        browser.name = "#team-cdn-alpha".into();
+        browser.document = None;
+        browser.tabs = vec![Tab { label: "Files & links".into(), target: Target::Files }];
+        browser.entries = Some(load_entries(&client, "C1", true).unwrap());
+        assert!(matches!(browser.entries.as_ref().unwrap()[1].target, Target::Link(_)));
+        assert_eq!(browser.title(), "#team-cdn-alpha · channel tabs · Files & links");
+        browser.key(key('l'));
+        assert_eq!(browser.title(), "#team-cdn-alpha · channel tabs · Files & links · diagram.png");
+        let file = &browser.picture.as_ref().unwrap().file;
+        assert_eq!(file.channel, "C1");
+        assert_eq!(file.url.as_deref(), Some("https://files.slack.com/diagram.png"));
+        let mut app = App::new(Corpus::stub(&[]), Tz::Utc, 30.0, false, false,
+            PathBuf::new(), PathBuf::new(), 0, None, None);
+        app.channel_browser = Some(browser);
+        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        let image_key = "FIMAGE:full".to_string();
+        for (state, expected) in [(ImageState::Loading, "loading the original"),
+            (ImageState::Failed("download denied".into()), "image failed: download denied")] {
+            app.images.insert(image_key.clone(), state);
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains(expected));
+            assert!(text.contains("https://slack.com/diagram"));
+        }
+        app.picker = None;
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Image display is disabled"));
+        assert!(text.contains("https://slack.com/diagram"));
+        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        app.images.insert(image_key.clone(), ImageState::Ready(image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_pixel(128, 128, image::Rgb([255, 0, 0])))));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(terminal.backend().buffer().content.iter().any(|cell| cell.fg == ratatui::style::Color::Rgb(255, 0, 0)));
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("#team-cdn-alpha · channel tabs · Files & links · diagram.png"));
+        app.on_key(key('+'));
+        assert_eq!(app.channel_browser.as_ref().unwrap().picture.as_ref().unwrap().zoom, 125);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(app.channel_browser.as_ref().unwrap().picture.as_ref().unwrap().shown.as_ref().unwrap().0.contains(":125:"));
+        app.on_key(key('h'));
+        assert!(!app.images.contains_key(&image_key));
+        let browser = app.channel_browser.as_ref().unwrap();
+        assert!(browser.picture.is_none());
+        assert!(browser.entries.is_some());
+        assert_eq!(browser.entry_cursor, 0);
+        assert_eq!(browser.title(), "#team-cdn-alpha · channel tabs · Files & links");
+        app.on_key(key('h'));
+        assert_eq!(app.channel_browser.as_ref().unwrap().title(), "#team-cdn-alpha · channel tabs");
+    }
+
 }

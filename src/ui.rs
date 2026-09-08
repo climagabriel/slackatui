@@ -192,8 +192,15 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
-    if let Some(browser) = app.channel_browser.as_mut().filter(|b| b.visible) {
+    if app.channel_browser.as_ref().is_some_and(|browser| browser.visible) {
+        let mut browser = app.channel_browser.take().expect("visible browser");
         browser.draw(frame, area, &app.palette);
+        if let Some(picture) = &mut browser.picture {
+            let inner = Block::bordered().inner(area);
+            let body = Rect { height: inner.height.saturating_sub(2), ..inner };
+            draw_picture(frame, app, body, &picture.file, picture.zoom, &mut picture.shown, Some(&picture.permalink));
+        }
+        app.channel_browser = Some(browser);
         return;
     }
 
@@ -648,18 +655,33 @@ fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
 }
 
 fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
-    let Some(View::Image {
-        files, index, zoom, ..
-    }) = app.stack.last()
-    else {
-        return;
-    };
+    let Some(View::Image { files, index, zoom, shown }) = app.stack.last_mut() else { return; };
+    let file = files[*index].clone();
     let zoom = *zoom;
-    if inner.is_empty() {
+    let mut protocol = shown.take();
+    draw_picture(frame, app, inner, &file, zoom, &mut protocol, None);
+    if let Some(View::Image { shown, .. }) = app.stack.last_mut() { *shown = protocol; }
+}
+
+fn draw_picture(
+    frame: &mut Frame,
+    app: &mut App,
+    inner: Rect,
+    file: &crate::archive::FileInfo,
+    zoom: u16,
+    shown: &mut Option<(String, ratatui_image::protocol::StatefulProtocol)>,
+    permalink: Option<&str>,
+) {
+    if inner.is_empty() { return; }
+    let fallback = |message: &str| match permalink.filter(|link| !link.is_empty()) {
+        Some(link) => format!("{message}\n{link}"),
+        None => message.to_string(),
+    };
+    if app.picker.is_none() {
+        frame.render_widget(Paragraph::new(fallback("Image display is disabled; restart without --no-images.")), inner);
         return;
     }
-    let file = files[*index].clone();
-    app.ensure_image(&file, true);
+    app.ensure_image(file, true);
     let key = format!("{}:full", file.id);
     let dim = Style::new().add_modifier(Modifier::DIM);
     let note = match app.images.get(&key) {
@@ -668,18 +690,12 @@ fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
         _ => Some("  loading the original from Slack".to_string()),
     };
     if let Some(text) = note {
-        frame.render_widget(Paragraph::new(Span::styled(text, dim)), inner);
+        frame.render_widget(Paragraph::new(Span::styled(fallback(&text), dim)), inner);
         return;
     }
     let render_key = format!("{key}:{zoom}:{}:{}", inner.width, inner.height);
     // Rebuild for zoom or terminal-size changes as well as image changes.
-    let stale = match app.stack.last() {
-        Some(View::Image { shown, .. }) => shown
-            .as_ref()
-            .map(|(k, _)| k != &render_key)
-            .unwrap_or(true),
-        _ => return,
-    };
+    let stale = shown.as_ref().is_none_or(|(key, _)| key != &render_key);
     if stale {
         let img = match app.images.get(&key) {
             Some(ImageState::Ready(img)) => img.clone(),
@@ -696,15 +712,9 @@ fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
             zoom,
         );
         let fresh = picker.new_resize_protocol(img);
-        if let Some(View::Image { shown, .. }) = app.stack.last_mut() {
-            *shown = Some((render_key, fresh));
-        }
+        *shown = Some((render_key, fresh));
     }
-    if let Some(View::Image {
-        shown: Some((_, proto)),
-        ..
-    }) = app.stack.last_mut()
-    {
+    if let Some((_, proto)) = shown {
         frame.render_stateful_widget(StatefulImage::new(), inner, proto);
     }
 }

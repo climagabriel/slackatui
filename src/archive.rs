@@ -143,6 +143,52 @@ pub struct FileInfo {
 }
 
 impl FileInfo {
+    pub fn from_slack(f: &Value, channel: &str) -> Self {
+        let s = |k: &str| f.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let mut name = s("title");
+        if name.is_empty() {
+            name = s("name");
+        }
+        if name.is_empty() {
+            name = s("id");
+        }
+        let n = |k: &str| {
+            f.get(k)
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32
+        };
+        let opt = |k: &str| {
+            f.get(k)
+                .and_then(Value::as_str)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+        };
+        // A width and a height from the same rendition, or none.
+        let (width, height) = if n("original_w") > 0 && n("original_h") > 0 {
+            (n("original_w"), n("original_h"))
+        } else if n("thumb_360_w") > 0 && n("thumb_360_h") > 0 {
+            (n("thumb_360_w"), n("thumb_360_h"))
+        } else {
+            (0, 0)
+        };
+        Self {
+            id: s("id"),
+            channel: channel.to_string(),
+            name,
+            filetype: s("filetype"),
+            size: f.get("size").and_then(Value::as_i64),
+            mode: s("mode"),
+            mimetype: s("mimetype"),
+            width,
+            height,
+            thumb: opt("thumb_720")
+                .or_else(|| opt("thumb_480"))
+                .or_else(|| opt("thumb_360")),
+            url: opt("url_private_download").or_else(|| opt("url_private")),
+        }
+    }
+
     pub fn is_image(&self) -> bool {
         self.mimetype.starts_with("image/") && !self.mimetype.contains("svg")
     }
@@ -181,49 +227,7 @@ impl Msg {
         let mut out = Vec::new();
         if let Some(files) = self.data.get("files").and_then(Value::as_array) {
             for f in files {
-                let s = |k: &str| f.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-                let mut name = s("title");
-                if name.is_empty() {
-                    name = s("name");
-                }
-                if name.is_empty() {
-                    name = s("id");
-                }
-                let n = |k: &str| {
-                    f.get(k)
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        .min(u32::MAX as u64) as u32
-                };
-                let opt = |k: &str| {
-                    f.get(k)
-                        .and_then(Value::as_str)
-                        .filter(|u| !u.is_empty())
-                        .map(str::to_string)
-                };
-                // A width and a height from the same rendition, or none.
-                let (width, height) = if n("original_w") > 0 && n("original_h") > 0 {
-                    (n("original_w"), n("original_h"))
-                } else if n("thumb_360_w") > 0 && n("thumb_360_h") > 0 {
-                    (n("thumb_360_w"), n("thumb_360_h"))
-                } else {
-                    (0, 0)
-                };
-                out.push(FileInfo {
-                    id: s("id"),
-                    channel: self.channel_id.clone(),
-                    name,
-                    filetype: s("filetype"),
-                    size: f.get("size").and_then(Value::as_i64),
-                    mode: s("mode"),
-                    mimetype: s("mimetype"),
-                    width,
-                    height,
-                    thumb: opt("thumb_720")
-                        .or_else(|| opt("thumb_480"))
-                        .or_else(|| opt("thumb_360")),
-                    url: opt("url_private_download").or_else(|| opt("url_private")),
-                });
+                out.push(FileInfo::from_slack(f, &self.channel_id));
             }
         }
         out

@@ -2755,6 +2755,13 @@ impl App {
         cached.is_file().then_some(cached)
     }
 
+    fn release_picture(&mut self, key: &str) {
+        self.images.remove(key);
+        if self.file_job.as_ref().is_some_and(|job| matches!(&job.kind, JobKind::File { id } if id == key)) {
+            self.file_job = None;
+        }
+    }
+
     /// Have a file's pixels ready or on their way. `full` wants the original.
     /// A download waits in the queue until a sign-in provides the client, so
     /// an image first seen before sign-in still arrives.
@@ -3766,8 +3773,12 @@ impl App {
 
     pub fn on_key(&mut self, k: KeyEvent) {
         if let Some(browser) = self.channel_browser.as_mut().filter(|b| b.visible) {
+            let picture_key = browser.picture.as_ref().map(|picture| format!("{}:full", picture.file.id));
             if browser.can_toggle() && self.keymap.action(k)==Some(Action::ChannelTabs) {browser.visible=false;}
             else {browser.key(k);}
+            if browser.picture.is_none() {
+                if let Some(key) = picture_key { self.release_picture(&key); }
+            }
             return;
         }
 
@@ -3805,6 +3816,10 @@ impl App {
                 if let Some(browser) = &mut self.channel_browser { browser.visible = true; }
             } else if let (Some(client), Some(index)) = (self.api.clone(), index) {
                 if self.focus == Focus::Convs { self.open_conv(index); }
+                if let Some(key) = self.channel_browser.as_ref().and_then(|browser| browser.picture.as_ref())
+                    .map(|picture| format!("{}:full", picture.file.id)) {
+                    self.release_picture(&key);
+                }
                 let conv = &self.corpus.convs[index];
                 self.channel_browser = Some(crate::canvas::Browser::new(client, conv.id.clone(), conv.name.clone()));
                 self.focus = Focus::Msgs;
@@ -5306,6 +5321,21 @@ mod tests {
         app.bg = Some(live::completed_job(JobKind::MutedChannels { gen: generation }, Ok(Done::MutedChannels(vec!["D1".into()]))));
         app.tick();
         assert!(app.muted.is_empty());
+    }
+
+    #[test]
+    fn release_picture_drops_pending_completion_and_keeps_other_images() {
+        let mut app = mute_test_app();
+        app.images.insert("F1:full".into(), ImageState::Loading);
+        app.images.insert("F2:full".into(), ImageState::Loading);
+        app.file_job = Some(live::completed_job(JobKind::File { id: "F1:full".into() },
+            Ok(Done::EmojiImage(image::DynamicImage::new_rgb8(2, 2)))));
+        app.release_picture("F2:full");
+        assert!(app.file_job.is_some());
+        app.release_picture("F1:full");
+        assert!(app.file_job.is_none());
+        app.tick();
+        assert!(!app.images.contains_key("F1:full"));
     }
 
 }
