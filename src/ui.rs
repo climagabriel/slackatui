@@ -196,6 +196,15 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     app.conv_offset = state.offset();
 }
 
+fn muted_message_style(mut style: Style) -> Style {
+    style.fg = Some(Color::Rgb(160, 160, 160));
+    style.bg = Some(Color::Reset);
+    style.underline_color = Some(Color::Rgb(160, 160, 160));
+    style.sub_modifier |= Modifier::REVERSED;
+    style.add_modifier.remove(Modifier::REVERSED);
+    style
+}
+
 fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.channel_browser.as_ref().is_some_and(|browser| browser.visible) {
         let mut browser = app.channel_browser.take().expect("visible browser");
@@ -322,52 +331,47 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         last_read,
         palette,
     };
-    let text_w = inner.width as usize - 1;
+    let text_w = inner.width as usize - 2;
     list.rebuild(&ctx, text_w);
     list.ensure_visible(inner.height as usize);
     let cursor = list.cursor;
-    let gutter_on = Span::styled(
-        "▎",
-        Style::new().fg(if focused {
-            palette.get(Role::Accent)
-        } else {
-            palette.get(Role::InactiveAccent)
-        }),
-    );
-    let header_line = list.first.get(cursor).copied();
+    let first = list.first.get(cursor).copied();
+    let last = list.last.get(cursor).copied();
+    let scroll = list.scroll;
+    let outline = Style::reset().fg(Color::Rgb(112, 112, 112)).bg(palette.get(Role::Background));
     let mut shown: Vec<Line> = Vec::with_capacity(inner.height as usize);
-    for (i, fl) in list
-        .flat
-        .iter()
-        .enumerate()
-        .skip(list.scroll)
-        .take(inner.height as usize)
-    {
+    for (i, fl) in list.flat.iter().enumerate().skip(list.scroll).take(inner.height as usize) {
         let selected = fl.msg == Some(cursor);
-        let mut spans: Vec<Span> = Vec::with_capacity(fl.line.spans.len() + 1);
-        spans.push(if selected {
-            gutter_on.clone()
-        } else {
-            Span::raw(" ")
-        });
-        spans.extend(fl.line.spans.iter().cloned());
-        let mut line = Line::from(spans);
-        if selected && header_line == Some(i) {
-            line = palette.highlight_line(on_cursor(line, focused, palette));
+        if selected && (first == Some(i) || last == Some(i)) {
+            let (left, right) = if first == Some(i) { ("╭", "╮") } else { ("╰", "╯") };
+            shown.push(Line::styled(format!("{left}{}{right}", "─".repeat(text_w)), outline));
+            continue;
+        }
+        let mut spans = vec![Span::styled(if selected { "│" } else { " " }, outline)];
+        spans.extend(clip_line(fl.line.clone(), text_w).spans);
+        let mut line = Line::from(spans).style(fl.line.style);
+        if !selected {
+            frame.buffer_mut().set_style(
+                Rect::new(inner.x, inner.y + (i - scroll) as u16, inner.width, 1),
+                muted_message_style(Style::default()),
+            );
+            // Apply after word highlighting, so no message color leaks through.
+            line.style = muted_message_style(line.style);
+            for span in &mut line.spans { span.style = muted_message_style(span.style); }
         }
         shown.push(line);
     }
     frame.render_widget(Paragraph::new(Text::from(shown)), inner);
     // Inline images: one rect per slot whose first row is on screen.
-    let slots: Vec<(u16, crate::render::ImageSlot, String)> = list
+    let slots: Vec<(u16, crate::render::ImageSlot, String, bool)> = list
         .flat
         .iter()
         .enumerate()
         .skip(list.scroll)
         .take(inner.height as usize)
-        .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s, fl.line.to_string())))
+        .filter_map(|(i, fl)| fl.image.clone().map(|s| ((i - list.scroll) as u16, s, fl.line.to_string(), fl.msg == Some(cursor))))
         .collect();
-    for (row, slot, fallback) in slots {
+    for (row, slot, fallback, selected) in slots {
         let emoji = matches!(slot.source, render::ImageSource::Emoji(_));
         let key = match &slot.source {
             render::ImageSource::File(file) => {
@@ -378,7 +382,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         let x = inner.x + 3;
         let y = inner.y + row;
-        let width = slot.cols.min(inner.width.saturating_sub(3));
+        let width = slot.cols.min(inner.width.saturating_sub(4));
         let height = slot.rows.min(inner.bottom().saturating_sub(y));
         if width == 0 || height == 0 {
             continue;
@@ -404,7 +408,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
                 Rect { height: 1, ..area },
             ),
             None => {
-                if let Some(proto) = app.inline_protocol(key.as_deref().expect("ready image key"), slot.cols, slot.rows) {
+                if let Some(proto) = app.message_protocol(key.as_deref().expect("ready image key"), slot.cols, slot.rows, !selected) {
                     if let render::ImageSource::Emoji(name) = &slot.source {
                         if let Some(count) = fallback.strip_suffix(&format!(" :{name}:")) {
                             // Keep the count; the shortcode is only a fallback.
@@ -415,6 +419,16 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
                         }
                     }
                     frame.render_widget(Image::new(proto).allow_clipping(true), area);
+                }
+            }
+        }
+    }
+    if let (Some(first), Some(last)) = (first, last) {
+        for row in 0..inner.height {
+            let index = scroll + row as usize;
+            if index > first && index < last {
+                for x in [inner.x, inner.right() - 1] {
+                    frame.buffer_mut()[(x, inner.y + row)].set_symbol("│").set_style(outline);
                 }
             }
         }
@@ -1153,5 +1167,121 @@ mod highlight_tests {
         terminal.draw(|frame| frame.render_widget(Paragraph::new(line.clone()), frame.area())).unwrap();
         assert_eq!(terminal.backend().buffer()[(1,0)].fg, Color::Green);
         assert_eq!(terminal.backend().buffer()[(1,0)].bg, palette.get(Role::SelectionBackground));
+    }
+}
+
+#[cfg(test)]
+mod message_focus_tests {
+    use super::*;
+    use crate::app::{MsgList, tests::mute_test_app};
+    use crate::archive::Msg;
+    use serde_json::json;
+
+    #[test]
+    fn long_wide_header_cannot_cover_border_or_color_nonselected_background() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        app.palette.set(Role::Background, Color::Blue);
+        app.palette.set(Role::OtherUsername, Color::Red);
+        let messages = [1, 2].into_iter().map(|second| Msg::from_api("C1".into(), json!({
+            "ts": format!("{second}.000000"), "user": "界界界界界界界界界", "text": "nginx"
+        })).unwrap()).collect();
+        app.open.as_mut().unwrap().list = MsgList::new(messages, false);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).unwrap();
+        terminal.draw(|frame| {
+            frame.render_widget(Block::default().style(Style::new().bg(Color::Blue)), frame.area());
+            draw_msgs(frame, &mut app, frame.area());
+        }).unwrap();
+        let list = app.active_list().unwrap();
+        let first = list.first[0] - list.scroll + 1;
+        let header = first + 1;
+        let buffer = terminal.backend().buffer();
+        let cell = &buffer[(32, header as u16)];
+        assert_eq!(cell.symbol(), "│");
+        assert_eq!(cell.modifier, Modifier::empty());
+        assert_eq!(cell.fg, Color::Rgb(112,112,112));
+        assert_eq!(cell.bg, Color::Blue);
+        assert!(buffer[(31, header as u16)].symbol().width() <= 1);
+        let other_header = list.first[1] - list.scroll + 2;
+        for column in 1..33 {
+            assert_ne!(buffer[(column, other_header as u16)].bg, Color::Blue);
+        }
+    }
+
+    #[test]
+    fn focus_box_and_grayscale_follow_cursor_for_text_files_and_custom_reactions() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        app.inline_images = true;
+        let url = "https://emoji.slack-edge.com/test/focus.png";
+        app.custom_emoji.insert("focus-test".into(), url.into());
+        let emoji_key = crate::custom_emoji::image_key(url);
+        let pixels = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(128, 128, image::Rgba([255, 0, 0, 255])));
+        app.images.insert(emoji_key, ImageState::Ready(pixels.clone()));
+        app.images.insert("F1".into(), ImageState::Ready(pixels));
+        let messages: Vec<Msg> = [1, 2].into_iter().map(|second| Msg::from_api("C1".into(), json!({
+            "ts": format!("{second}.000000"), "user": "U1", "text": "nginx colored text",
+            "files": [{"id":"F1", "name":"test.png", "mimetype":"image/png", "filetype":"png", "original_w":64, "original_h":32}],
+            "reactions": [{"name":"focus-test", "count":3}]
+        })).unwrap()).collect();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+        for thread in [false, true] {
+            if thread {
+                app.stack.push(View::Thread { root: messages[0].id, list: MsgList::new(messages.clone(), true), live: None, place: None });
+            } else {
+                app.open.as_mut().unwrap().list = MsgList::new(messages.clone(), false);
+            }
+            for selected in [0, 1, 0] {
+                app.active_list_mut().unwrap().cursor = selected;
+                terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
+                let list = app.active_list().unwrap();
+                let buffer = terminal.backend().buffer();
+                for index in 0..2 {
+                    let first = list.first[index] - list.scroll + 1;
+                    let last = list.last[index] - list.scroll + 1;
+                    let rows = first..=last;
+                    let mut red = 0;
+                    let mut gray_pixels = 0;
+                    for row in rows {
+                        for x in 1..79 {
+                            let cell = &buffer[(x, row as u16)];
+                            if cell.fg == Color::Rgb(255, 0, 0) || cell.bg == Color::Rgb(255, 0, 0) { red += 1; }
+                            if matches!(cell.bg, Color::Rgb(r,g,b) if r == g && g == b && r > 0) { gray_pixels += 1; }
+                            if index != selected {
+                                assert!(!matches!(cell.fg, Color::Rgb(r,g,b) if r != g || g != b), "nonselected color: {cell:?}");
+                            }
+                        }
+                    }
+                    if index == selected {
+                        assert_eq!(buffer[(1, first as u16)].symbol(), "╭");
+                        assert_eq!(buffer[(78, first as u16)].symbol(), "╮");
+                        assert_eq!(buffer[(1, last as u16)].symbol(), "╰");
+                        assert_eq!(buffer[(78, last as u16)].symbol(), "╯");
+                        assert!(red > 0);
+                    } else {
+                        assert_eq!(red, 0);
+                        assert!(gray_pixels > 0);
+                        assert_eq!(buffer[(1, first as u16)].symbol(), " ");
+                    }
+                    let text_row = first + 2;
+                    assert_eq!(buffer[(4, text_row as u16)].fg, if index == selected { Color::Green } else { Color::Rgb(160, 160, 160) });
+                }
+            }
+        }
+        // A message taller than the viewport retains its sides when scrolled;
+        // no false top/bottom cap is drawn through its text or images.
+        terminal.backend_mut().resize(24, 6);
+        terminal.resize(Rect::new(0, 0, 24, 6)).unwrap();
+        terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
+        let list = app.active_list_mut().unwrap();
+        list.line_scroll = true;
+        list.scroll = list.first[list.cursor] + 2;
+        terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "│");
+        assert_eq!(terminal.backend().buffer()[(22, 1)].symbol(), "│");
+        // Originals remain colored after encoding both variants.
+        let ImageState::Ready(original) = &app.images["F1"] else { panic!() };
+        assert_eq!(original.to_rgba8().get_pixel(0,0).0, [255,0,0,255]);
     }
 }

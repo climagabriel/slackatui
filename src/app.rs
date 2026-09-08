@@ -164,8 +164,9 @@ impl MsgList {
                 new_marked = true;
             }
             let rendered = render::message_lines(m, ctx, width, self.in_thread);
+            self.first.push(self.flat.len());
+            self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
             let base = self.flat.len();
-            self.first.push(base);
             for line in rendered.lines {
                 self.flat.push(FlatLine {
                     msg: Some(i),
@@ -178,6 +179,7 @@ impl MsgList {
                     fl.image = Some(slot);
                 }
             }
+            self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
             self.last.push(self.flat.len().saturating_sub(1));
             if self.in_thread && i == 0 && self.msgs.len() > 1 {
                 let n = self.msgs.len() - 1;
@@ -2955,7 +2957,11 @@ impl App {
 
     /// The inline encoding of a thumbnail for a cell box, cached by size.
     pub fn inline_protocol(&mut self, id: &str, cols: u16, rows: u16) -> Option<&Protocol> {
-        let encoding_key = format!("{id}:{cols}x{rows}");
+        self.message_protocol(id, cols, rows, false)
+    }
+
+    pub fn message_protocol(&mut self, id: &str, cols: u16, rows: u16, grayscale: bool) -> Option<&Protocol> {
+        let encoding_key = format!("{id}:{cols}x{rows}{}", if grayscale { ":gray" } else { "" });
         let fresh = matches!(self.inline.get(&encoding_key), Some((c, r, _)) if *c == cols && *r == rows);
         if !fresh {
             let picker = self.picker.as_ref()?;
@@ -2965,7 +2971,7 @@ impl App {
             };
             let size = ratatui::layout::Size::new(cols, rows);
             let proto = picker
-                .new_protocol(img.clone(), size, ratatui_image::Resize::Fit(None))
+                .new_protocol(if grayscale { img.grayscale() } else { img.clone() }, size, ratatui_image::Resize::Fit(None))
                 .ok()?;
             self.inline.insert(encoding_key.clone(), (cols, rows, proto));
         }
