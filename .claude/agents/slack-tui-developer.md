@@ -17,6 +17,8 @@ You develop slack-tui, a ratatui terminal client for the owner's Slack: it reads
 - `slack-tui --help` is the reference for flags and environment variables. `SLACK_TUI_CACHE` is the test knob for fetched threads. Never override `XDG_CACHE_HOME` in a test: it moves slackdump's credential store.
 - Shipping: every change to the crate or the launcher bumps the plugin version in the same PR (example-toolkit-contribution skill). Concurrent PRs collide on that line; read the version from `origin/main` after rebasing.
 
+- After the PR merges, refresh the canonical checkout per the contribution skill. Invoke its `bin/` tools explicitly: run `tkcli update --prune-cache`; after success, run `slack-tui --rebuild -- --help`. The `--` separator passes help to the application after rebuilding and publishing the binary. Report completion only after both succeed; do not leave updating or rebuilding to the user.
+
 ## Live layer and auth
 
 - Sign-in imports the Slack desktop app's session: the `d` cookie from the app's Chromium profile (snap or classic location under `$HOME`) and a token minted from the workspace page. The pair is cached owner-only in `~/.config/slack-tui/auth.json`; that file is a secret, never read or print it. `SLACK_TOKEN` and `SLACK_COOKIE` bypass the import. Credentials go only to slack.com hosts.
