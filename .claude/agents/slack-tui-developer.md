@@ -30,7 +30,7 @@ You develop slack-tui, a ratatui terminal client for the owner's Slack: it reads
 
 ## Web API writes the tool makes
 
-`conversations.mark` (`m`/`M`), `chat.postMessage` (compose, `c`), `chat.delete` (`D` on your own message, and `--delete-message URL`), `files.getUploadURLExternal` plus `files.completeUploadExternal` (`/upload`, `Ctrl-v` image paste), `conversations.leave` (`/leave`), `stars.add`/`stars.remove` (`/star`, `/unstar`, aliases `/pin`, `/unpin`; conversation ID only, verified with `stars.list`), `users.prefs.setNotifications` (`/mute`, `/unmute`), `canvases.edit` (`:w`/`:wq` in the channel canvas section editor). Any new write goes on this list and gets the test discipline below.
+`conversations.mark` (`m`/`M`), `chat.postMessage` (compose, `c`), `chat.delete` (`D` on your own message, and `--delete-message URL`), `files.getUploadURLExternal` plus `files.completeUploadExternal` (`/upload`, `Ctrl-v` image paste), `conversations.leave` (`/leave`), `stars.add`/`stars.remove` (`/star`, `/unstar`, aliases `/pin`, `/unpin`; conversation ID only, verified with `stars.list`), `users.prefs.setNotifications` (`/mute`, `/unmute`), `canvases.edit` (`:w`/`:wq` in the channel canvas section editor), `saved.add`/`saved.delete` (`Ctrl-S`/`Ctrl-Shift-S`, `/save`/`/unsave`; message channel and timestamp, verified with `saved.get`). Any new write goes on this list and gets the test discipline below.
 
 ## Test discipline: the tool posts under the owner's name
 

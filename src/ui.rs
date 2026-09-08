@@ -155,7 +155,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             if Some(i) == open_idx {
                 name_style = name_style.add_modifier(Modifier::BOLD);
             }
-            let selected = app.filtered.get(app.conv_cursor) == Some(&i);
+            let selected = !app.saved_selected && app.filtered.get(app.conv_cursor) == Some(&i);
             let mut name_line = Line::from(Span::styled(name, name_style));
             if selected { name_line = on_cursor(name_line, focused, &app.palette); }
             let mut line = clip_line(app.palette.highlight_line(name_line), room);
@@ -181,17 +181,17 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .collect();
+    let mut items = items;
+    let mut saved = Line::from(Span::styled("SAVED", Style::new().add_modifier(Modifier::BOLD)));
+    if app.saved_selected { saved = on_cursor(saved, focused, &app.palette); }
+    items.insert(0, ListItem::new(vec![saved, Line::from(Span::styled("─".repeat(width), dim))]));
     let list = List::new(items).block(block);
     // The offset carries over from the last frame: rebuilt at zero, ratatui
     // would rescroll to the minimum that shows the cursor, pinning it to the
     // bottom row and moving the whole pane on every step upward.
     let mut state = ListState::default()
-        .with_offset(app.conv_offset.min(app.filtered.len().saturating_sub(1)))
-        .with_selected(if app.filtered.is_empty() {
-            None
-        } else {
-            Some(app.conv_cursor)
-        });
+        .with_offset(app.conv_offset.min(app.filtered.len()))
+        .with_selected(Some(if app.saved_selected || app.filtered.is_empty() { 0 } else { app.conv_cursor + 1 }));
     frame.render_stateful_widget(list, area, &mut state);
     app.conv_offset = state.offset();
 }
@@ -305,7 +305,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         palette,
         ..
     } = app;
-    let Some(open) = open.as_mut() else {
+    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. })) {
         let hint = Line::from(Span::styled(
             "  select a conversation and press Enter",
             Style::new().add_modifier(Modifier::DIM),
@@ -313,16 +313,17 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(hint), inner);
         return;
     };
-    let conv = &corpus.convs[open.conv];
-    let conv_archive = corpus.conv_archive(conv);
+    let conv = open.as_ref().map(|open| &corpus.convs[open.conv]);
+    let conv_archive = conv.and_then(|conv| corpus.conv_archive(conv));
     let (list, archive) = match stack
         .iter_mut()
         .rev()
         .find(|v| !matches!(v, View::Raw { .. }))
     {
         Some(View::Thread { list, live, .. }) => (list, live.as_deref().or(conv_archive)),
+        Some(View::Saved { list }) => (list, None),
         Some(View::Search { list, .. }) | Some(View::Threads { list }) => (list, conv_archive),
-        _ => (&mut open.list, conv_archive),
+        _ => { let Some(open) = open.as_mut() else { return }; (&mut open.list, conv_archive) },
     };
     let ctx = Ctx {
         archive,
@@ -337,7 +338,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new("Enlarge pane to show a whole message"), inner);
         return;
     }
-    list.set_unread_count(last_read.and(conv.unread_count));
+    list.set_unread_count(last_read.and(conv.and_then(|conv| conv.unread_count)));
     list.rebuild_for_pane(&ctx, text_w, inner.height as usize);
     let end = if list.line_scroll {
         list.ensure_visible(inner.height as usize);
@@ -930,6 +931,8 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(Action::Help, "this guide"),
     HelpRow::Bound(Action::RawJson, "raw JSON of the selected message"),
+    HelpRow::Bound(Action::Save, "save selected message to Slack Later; /save"),
+    HelpRow::Bound(Action::Unsave, "remove selected message from Slack Later; /unsave"),
     HelpRow::Fixed("in raw JSON", "j/k select leaf values or Slack links; Enter follows the selected link; h returns; PgUp/PgDn scroll long values; g/G select first/last value or link"),
     HelpRow::Bound(Action::Reload, "reload the conversation from the archive"),
     HelpRow::Bound(

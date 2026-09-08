@@ -69,6 +69,8 @@ pub struct FlatLine {
 /// message; the viewport is lines.
 #[derive(Default)]
 pub struct MsgList {
+    /// Channel requested for an empty thread, so a failed fetch can be retried.
+    pub source_channel: Option<String>,
     pub msgs: Vec<Msg>,
     pub cursor: usize,
     pub scroll: usize,
@@ -369,6 +371,7 @@ pub struct Open {
 }
 
 pub enum View {
+    Saved { list: MsgList },
     Thread {
         root: i64,
         list: MsgList,
@@ -455,6 +458,8 @@ pub struct App {
     pub filter: String,
     pub filtered: Vec<usize>,
     pub conv_cursor: usize,
+    pub saved_selected: bool,
+    pub saved_messages: Vec<Msg>,
     pub open: Option<Open>,
     pub stack: Vec<View>,
     pub mode: Mode,
@@ -601,6 +606,8 @@ impl App {
             filter: String::new(),
             filtered: Vec::new(),
             conv_cursor: 0,
+            saved_selected: false,
+            saved_messages: Vec::new(),
             open: None,
             stack: Vec::new(),
             mode: Mode::Normal,
@@ -678,6 +685,7 @@ impl App {
     /// threads hit replies in the hit's thread, a timeline posts to its
     /// conversation, the list posts to the highlighted conversation.
     fn compose_target(&self) -> Result<Compose, String> {
+        if self.focus == Focus::Convs && self.saved_selected { return Err("Select a message or conversation first".into()); }
         let known = |cid: &str| -> Result<usize, String> {
             self.corpus
                 .conv_by_channel(cid)
@@ -702,7 +710,7 @@ impl App {
                     label: format!("reply in this thread in {name}"),
                 })
             }
-            Some(View::Search { .. }) | Some(View::Threads { .. }) => {
+            Some(View::Search { .. }) | Some(View::Threads { .. }) | Some(View::Saved { .. }) => {
                 let m = self.selected().ok_or("no message selected")?;
                 let conv = known(&m.channel_id)?;
                 let name = self.corpus.convs[conv].name.clone();
@@ -798,6 +806,10 @@ impl App {
             Some(Command::Cache(op, name)) => {
                 self.restore_filter(filter_before);
                 self.cache_cmd(&op, &name);
+            }
+            Some(Command::Save(on)) => {
+                self.restore_filter(filter_before);
+                self.change_saved(on);
             }
             Some(Command::Star(on, name)) => {
                 self.restore_filter(filter_before);
@@ -1162,6 +1174,7 @@ impl App {
     }
 
     fn target_conv(&self, name: &str) -> Result<usize, String> {
+        if name.is_empty() && ((self.focus == Focus::Convs && self.saved_selected) || (self.focus == Focus::Msgs && self.open.is_none())) { return Err("Select a conversation first".into()); }
         if !name.is_empty() {
             return self
                 .corpus
@@ -1320,6 +1333,69 @@ impl App {
         }
     }
 
+    fn open_saved(&mut self) {
+        self.invalidate_thread_jobs();
+        if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
+        self.refresh_saved(None);
+        self.open = None;
+        self.stack.clear();
+        self.stack.push(View::Saved { list: MsgList::new(self.saved_messages.clone(), false) });
+        self.focus = Focus::Msgs;
+        self.saved_selected = true;
+    }
+
+    fn change_saved(&mut self, save: bool) {
+        if self.focus != Focus::Msgs { self.status = "Select a message first".into(); return; }
+        let Some(message) = self.selected().cloned() else { self.status = "No message selected".into(); return; };
+        if save && message.data["saved_unavailable"] == true { self.status = "Message content unavailable; refresh SAVED first".into(); return; }
+        self.refresh_saved(Some((message, save)));
+    }
+
+    fn refresh_saved(&mut self, change: Option<(Msg, bool)>) {
+        if self.job.is_some() { self.status = "A request is running; retry when it finishes".into(); return; }
+        let Some(client) = self.api.clone() else { self.status = "Saved messages need a Slack sign-in; r refreshes SAVED after signing in".into(); return; };
+        let mut known = self.saved_messages.clone();
+        if let Some(open) = &self.open { known.extend(open.list.msgs.clone()); }
+        for view in &self.stack {
+            if let View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } = view { known.extend(list.msgs.clone()); }
+        }
+        if let Some((message, _)) = &change { known.push(message.clone()); }
+        let sources = self.corpus.convs.iter().filter(|conv| !conv.live_only).map(|conv| {
+            let archive = &self.corpus.archives[conv.archive];
+            let mut dirs = archive.source_dirs.clone();
+            if !dirs.contains(&archive.dir) { dirs.push(archive.dir.clone()); }
+            (conv.id.clone(), dirs)
+        }).collect();
+        let cache = self.cache_dir.clone();
+        self.job = Some(live::spawn(JobKind::Saved, if change.is_some() { "updating saved message" } else { "loading saved messages" }.into(), move || {
+            let changed = change.is_some();
+            if let Some((message, save)) = change { crate::saved::change(&client, &message, save)?; }
+            crate::saved::fetch(&client, known, sources, cache).map(Done::Saved).map_err(|error| {
+                if changed { format!("Saved state verified, but list refresh failed: {error}; r refreshes SAVED") } else { error }
+            })
+        }));
+        self.status = "Loading Slack Later…".into();
+    }
+
+    fn apply_saved(&mut self, mut messages: Vec<Msg>) {
+        for message in &mut messages {
+            message.channel_name = self.corpus.conv_by_channel(&message.channel_id).map(|index| self.corpus.convs[index].name.clone())
+                .or_else(|| self.corpus.channel_names.get(&message.channel_id).cloned())
+                .or_else(|| Some(message.channel_id.clone()));
+        }
+        self.saved_messages = messages;
+        for view in &mut self.stack {
+            if let View::Saved { list } = view {
+                let selected = list.selected().map(|m| (m.channel_id.clone(), m.id));
+                let cursor = list.cursor;
+                *list = MsgList::new(self.saved_messages.clone(), false);
+                list.cursor = selected.and_then(|(cid, id)| list.msgs.iter().position(|m| m.channel_id == cid && m.id == id))
+                    .unwrap_or(cursor).min(list.len().saturating_sub(1));
+            }
+        }
+        self.status = format!("{} saved messages from Slack", self.saved_messages.len());
+    }
+
     fn star_cmd(&mut self, on: bool, name: &str) {
         let index = match self.target_conv(name) {
             Ok(index) => index,
@@ -1456,7 +1532,7 @@ impl App {
         }
         for view in self.stack.iter_mut() {
             match view {
-                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } => {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } => {
                     lists.push(list)
                 }
                 _ => {}
@@ -1755,6 +1831,8 @@ impl App {
     }
 
     pub fn open_conv(&mut self, idx: usize) -> bool {
+        self.invalidate_thread_jobs();
+        self.saved_selected = false;
         let conv = &self.corpus.convs[idx];
         let cid = conv.id.clone();
         if conv.live_only {
@@ -1999,7 +2077,16 @@ impl App {
 
     /// A thread by channel id: the archive first, then the thread cache,
     /// then Slack in the background.
+    fn invalidate_thread_jobs(&mut self) {
+        // A fetch belongs to the view that requested it, even if a new view has
+        // the same root timestamp. Cancel navigation, never the cache write.
+        for slot in [&mut self.job, &mut self.bg] {
+            if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. })) { *slot = None; }
+        }
+    }
+
     pub fn open_thread_in(&mut self, cid: String, root: i64, focus: i64) {
+        self.invalidate_thread_jobs();
         let here = self
             .open
             .as_ref()
@@ -2034,6 +2121,7 @@ impl App {
         let have = msgs.len().saturating_sub(1) as i64;
         let complete = !msgs.is_empty() && have >= wanted;
         let mut list = MsgList::new(msgs, true);
+        list.source_channel = Some(cid.clone());
         list.cursor = list.msgs.iter().position(|m| m.id == focus).unwrap_or(0);
         list.align_top = list.cursor > 0;
         self.stack.push(View::Thread {
@@ -2197,6 +2285,10 @@ impl App {
     /// Open a message's thread wherever it lives: this conversation, another
     /// archived one (switched to underneath the search view), or Slack.
     fn open_hit(&mut self, cid: String, root: i64, focus: i64) {
+        if matches!(self.stack.last(), Some(View::Saved { .. })) {
+            self.open_thread_in(cid, root, focus);
+            return;
+        }
         let here = self
             .open
             .as_ref()
@@ -2365,8 +2457,8 @@ impl App {
             let focus = list.selected().map(|m| m.id).unwrap_or(root);
             let cid = match list.msgs.first() {
                 Some(m) => m.channel_id.clone(),
-                None => match self.open.as_ref() {
-                    Some(o) => self.corpus.convs[o.conv].id.clone(),
+                None => match list.source_channel.clone().or_else(|| self.open.as_ref().map(|o| self.corpus.convs[o.conv].id.clone())) {
+                    Some(cid) => cid,
                     None => return,
                 },
             };
@@ -2726,7 +2818,7 @@ impl App {
         }
         for v in &mut self.stack {
             match v {
-                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } => {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } => {
                     list.mark_dirty()
                 }
                 _ => {}
@@ -2964,10 +3056,11 @@ impl App {
         }).flatten().collect();
         for key in image_keys { self.release_picture(&key); }
         self.go_home();
-        if at_home { self.conv_cursor = 0; self.conv_offset = 0; }
+        if at_home { self.conv_cursor = 0; self.conv_offset = 0; self.saved_selected = true; }
     }
 
     fn go_home(&mut self) {
+        self.invalidate_thread_jobs();
         if !self.filter.is_empty() {
             self.filter.clear();
             self.apply_filter();
@@ -3245,7 +3338,7 @@ impl App {
                 Ok(Done::MuteChanged { cid, muted, ids }) => self.finish_mute(&cid, muted, ids),
                 Ok(Done::ThreadMsgs(msgs)) => {
                     if let JobKind::Thread { root, .. } = job.kind {
-                        self.extend_thread(msgs, root);
+                        if job.navigate_on_completion { self.extend_thread(msgs, root); }
                     }
                 }
                 Ok(Done::Messages(msgs)) => {
@@ -3356,6 +3449,7 @@ impl App {
             return;
         };
         let job = self.job.take().expect("a job was polled");
+        if matches!(job.kind, JobKind::Thread { .. }) && !job.navigate_on_completion { return; }
         if let JobKind::MessageLink { raw_id, .. } = &job.kind {
             if !matches!(self.stack.last(), Some(View::Raw { browser, .. }) if browser.id == *raw_id) { return; }
         }
@@ -3409,6 +3503,7 @@ impl App {
                     if new == 1 { "" } else { "s" }
                 );
             }
+            (JobKind::Saved, Done::Saved(messages)) => self.apply_saved(messages),
             (JobKind::MessageLink { raw_id, link }, Done::ThreadMsgs(messages)) => {
                 self.show_linked_message(raw_id, &link, messages);
             }
@@ -3569,7 +3664,7 @@ impl App {
         }) {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
-            | Some(View::Threads { list }) => Some(list),
+            | Some(View::Threads { list }) | Some(View::Saved { list }) => Some(list),
             _ => self.open.as_ref().map(|o| &o.list),
         }
     }
@@ -3586,7 +3681,7 @@ impl App {
         }) {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
-            | Some(View::Threads { list }) => Some(list),
+            | Some(View::Threads { list }) | Some(View::Saved { list }) => Some(list),
             _ => self.open.as_mut().map(|o| &mut o.list),
         }
     }
@@ -3615,14 +3710,13 @@ impl App {
         if matches!(self.stack.last(), Some(View::ColorPalette { .. })) {
             return "color palette · live preview".to_string();
         }
-        let Some(o) = self.open.as_ref() else {
-            return "messages".to_string();
-        };
-        let conv = &self.corpus.convs[o.conv];
+        let o = self.open.as_ref();
+        let conv = o.map(|o| &self.corpus.convs[o.conv]);
         match self.stack.last() {
             Some(View::ColorPalette { .. }) | Some(View::Keys { .. }) => {
                 unreachable!("handled before opening a conversation")
             }
+            Some(View::Saved { list }) => format!("SAVED · {} messages · r: refresh · /unsave", list.len()),
             Some(View::Raw { title, .. }) => title.clone(),
             Some(View::Reactions { title, .. }) => title.clone(),
             Some(View::Image {
@@ -3655,8 +3749,8 @@ impl App {
                     (Some(a), Some(m)) => a
                         .channel_name(&m.channel_id)
                         .map(|c| format!("#{c}"))
-                        .unwrap_or_else(|| conv.name.clone()),
-                    _ => conv.name.clone(),
+                        .unwrap_or_else(|| conv.map(|c| c.name.clone()).unwrap_or_default()),
+                    _ => conv.map(|c| c.name.clone()).unwrap_or_default(),
                 };
                 let from = if live.is_some()
                     || list.msgs.first().is_some_and(|m| m.channel_name.is_some())
@@ -3695,13 +3789,14 @@ impl App {
                     if *capped { " (capped)" } else { "" }
                 )
             }
-            None if o.api_only => format!(
+            None if o.is_some_and(|o| o.api_only) => format!(
                 "{} · {} · {} loaded · live from Slack, not cached",
-                conv.name,
-                conv.kind.label(),
-                o.list.len()
+                conv.unwrap().name,
+                conv.unwrap().kind.label(),
+                o.unwrap().list.len()
             ),
             None => {
+                let (Some(o), Some(conv)) = (o, conv) else { return "messages".into() };
                 let span = format!(
                     "{} → {}",
                     self.tz.fmt(conv.first_id / 1_000_000, "%Y-%m-%d"),
@@ -3836,6 +3931,14 @@ impl App {
             return;
         }
         let action = self.keymap.action(k);
+        if matches!(action, Some(Action::Save | Action::Unsave)) {
+            self.pending_delete = None;
+            self.change_saved(action == Some(Action::Save));
+            return;
+        }
+        if action == Some(Action::ChannelTabs) && self.focus == Focus::Convs && self.saved_selected {
+            self.status = "Select a channel first".into(); return;
+        }
         if action == Some(Action::ChannelTabs) {
             let index = if self.focus == Focus::Convs { self.filtered.get(self.conv_cursor).copied() }
                 else { self.open.as_ref().map(|o| o.conv) };
@@ -4035,6 +4138,7 @@ impl App {
             self.status = "Linked message is unavailable".into();
             return;
         };
+        self.invalidate_thread_jobs();
         let root = messages[cursor].thread_root();
         let mut list = MsgList::new(messages, true);
         list.cursor = cursor;
@@ -4075,17 +4179,22 @@ impl App {
     }
 
     fn on_conv_key(&mut self, action: Option<Action>) {
-        let n = self.filtered.len();
-        let last = n.saturating_sub(1);
+        let delta = match action {
+            Some(Action::Down) => Some(1), Some(Action::Up) => Some(-1),
+            Some(Action::HalfPageDown) => Some(10), Some(Action::HalfPageUp) => Some(-10),
+            Some(Action::PageDown) => Some(20), Some(Action::PageUp) => Some(-20),
+            Some(Action::First) => Some(isize::MIN), Some(Action::Last) => Some(isize::MAX), _ => None,
+        };
+        if let Some(delta) = delta {
+            let row = if self.saved_selected { 0 } else { self.conv_cursor + 1 };
+            let row = row.saturating_add_signed(delta).min(self.filtered.len());
+            self.saved_selected = row == 0; self.conv_cursor = row.saturating_sub(1); return;
+        }
+        if (self.saved_selected || self.filtered.is_empty()) && action == Some(Action::Open) { self.open_saved(); return; }
+        if self.saved_selected && matches!(action, Some(Action::Compose | Action::MarkRead | Action::MarkUnread | Action::React | Action::Archive)) {
+            self.status = "Open SAVED and select a message first".into(); return;
+        }
         match action {
-            Some(Action::Down) => self.conv_cursor = (self.conv_cursor + 1).min(last),
-            Some(Action::Up) => self.conv_cursor = self.conv_cursor.saturating_sub(1),
-            Some(Action::First) => self.conv_cursor = 0,
-            Some(Action::Last) => self.conv_cursor = last,
-            Some(Action::HalfPageDown) => self.conv_cursor = (self.conv_cursor + 10).min(last),
-            Some(Action::HalfPageUp) => self.conv_cursor = self.conv_cursor.saturating_sub(10),
-            Some(Action::PageDown) => self.conv_cursor = (self.conv_cursor + 20).min(last),
-            Some(Action::PageUp) => self.conv_cursor = self.conv_cursor.saturating_sub(20),
             Some(Action::Open) => {
                 if let Some(&idx) = self.filtered.get(self.conv_cursor) {
                     if self.open.as_ref().map(|o| o.conv) == Some(idx) {
@@ -4096,7 +4205,7 @@ impl App {
                 }
             }
             Some(Action::OtherPane) => {
-                if self.open.is_some() {
+                if self.active_list().is_some() {
                     self.focus = Focus::Msgs;
                 }
             }
@@ -4129,7 +4238,7 @@ impl App {
     }
 
     fn on_msg_key(&mut self, action: Option<Action>) {
-        if self.open.is_none() {
+        if self.active_list().is_none() {
             self.focus = Focus::Convs;
             return;
         }
@@ -4258,6 +4367,8 @@ impl App {
                     previous: String::new(),
                 };
             }
+            Some(Action::Reload) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
+            Some(Action::Refresh) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
             Some(Action::Reload) => self.reload(),
             Some(Action::Refresh) => self.refresh(),
             Some(Action::Archive) => self.prompt_archive(),
@@ -4287,7 +4398,8 @@ impl App {
                     return;
                 }
                 // Unwind one stacked view; from the bare timeline, straight home.
-                if self.stack.pop().is_none() {
+                if matches!(self.stack.last(), Some(View::Thread { .. })) { self.invalidate_thread_jobs(); }
+                if self.stack.pop().is_none() || (self.open.is_none() && self.stack.is_empty()) {
                     self.go_home();
                 }
             }
@@ -4382,6 +4494,7 @@ enum Command {
     /// `mute [#name]` (true) and `unmute [#name]` (false).
     Mute(bool, String),
     Star(bool, String),
+    Save(bool),
     /// `colorpalette [name]`: edit and persist the semantic UI colors,
     /// starting from a named palette when one is given.
     ColorPalette(String),
@@ -4404,6 +4517,8 @@ fn parse_command(line: &str) -> Option<Command> {
     match word.to_lowercase().as_str() {
         "find" | "search" | "f" | "s" => Some(Command::Find(rest.to_string())),
         "leave" => Some(Command::Leave(rest.to_string())),
+        "save" if rest.is_empty() => Some(Command::Save(true)),
+        "unsave" if rest.is_empty() => Some(Command::Save(false)),
         "star" | "pin" => Some(Command::Star(true, rest.to_string())),
         "unstar" | "unpin" => Some(Command::Star(false, rest.to_string())),
         "mute" => Some(Command::Mute(true, rest.to_string())),
@@ -4870,7 +4985,7 @@ pub(crate) mod tests {
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
             (1..29)
-                .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
                 .collect::<String>()
         };
         assert!(row(&terminal).ends_with("123"));
@@ -5266,6 +5381,90 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn empty_saved_thread_can_retry_and_releases_obsolete_read_slots() {
+        let mut app=mute_test_app(); app.open_saved();
+        app.job=Some(Job::completed_for_test(JobKind::Thread {cid:"COLD".into(),root:1,focus:1},Err("late failure".into())));
+        app.open_thread_in("CNEW".into(),2_000_000,2_000_000);
+        assert!(app.job.is_none());
+        let View::Thread {list,..}=app.stack.last().unwrap() else {panic!()};
+        assert_eq!(list.source_channel.as_deref(),Some("CNEW")); assert!(list.msgs.is_empty());
+        app.api=Some(Arc::new(Client::for_test(|method,params| {
+            assert_eq!(method,"conversations.replies");assert!(params.contains(&("channel","CNEW")));
+            Err("offline retry".into())
+        })));
+        app.refresh(); assert!(matches!(app.job.as_ref().map(|job|&job.kind),Some(JobKind::Thread {cid,..}) if cid=="CNEW"));
+        app.job=Some(Job::completed_for_test(JobKind::SetMuted,Err("write in progress".into())));
+        app.invalidate_thread_jobs(); assert!(matches!(app.job.as_ref().map(|job|&job.kind),Some(JobKind::SetMuted)));
+    }
+
+    #[test]
+    fn saved_thread_navigation_invalidates_old_foreground_and_background_reads() {
+        for background in [false,true] {
+            let mut app=mute_test_app();
+            app.open_saved();
+            let mut wrong=msg(10,"old channel response"); wrong.channel_id="COLD".into();
+            let old=Job::completed_for_test(JobKind::Thread {cid:"COLD".into(),root:wrong.id,focus:wrong.id},Ok(Done::ThreadMsgs(vec![wrong])));
+            if background {app.bg=Some(old)} else {app.job=Some(old)}
+            app.open_thread_in("CNEW".into(),10_000_000,10_000_000);
+            let mut correct=msg(10,"new channel cached root");correct.channel_id="CNEW".into();
+            if let Some(View::Thread {list,..})=app.stack.last_mut() { *list=MsgList::new(vec![correct],true); }
+            app.tick();assert_eq!(app.selected().unwrap().channel_id,"CNEW");
+            assert_eq!(app.selected().unwrap().text,"new channel cached root");
+            app.on_msg_key(Some(Action::Back)); assert!(matches!(app.stack.last(),Some(View::Saved {..})));
+            app.on_msg_key(Some(Action::Back)); assert!(app.focus == Focus::Convs);
+        }
+    }
+
+    #[test]
+    fn saved_row_navigation_rendering_commands_and_async_results() {
+        let mut app = mute_test_app();
+        let key = |code| KeyEvent::new(code,KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Char('g')));
+        assert!(app.saved_selected);
+        assert!(app.target_conv("").is_err());
+        assert!(app.compose_target().is_err());
+        app.on_key(key(KeyCode::Char('j')));
+        assert!(!app.saved_selected); assert_eq!(app.conv_cursor,0);
+        app.on_key(key(KeyCode::Char('k')));
+        assert!(app.saved_selected);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.open.is_none()); assert!(matches!(app.stack.last(),Some(View::Saved {..})));
+        assert!(app.target_conv("").is_err());
+        let mut message = msg(1,"saved body"); message.channel_id="D1".into();
+        app.job=Some(Job::completed_for_test(JobKind::Saved,Ok(Done::Saved(vec![message.clone()]))));
+        app.tick(); assert_eq!(app.selected().unwrap().text,"saved body");
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let buffer=terminal.backend().buffer();
+        let row:String=(1..20).map(|x|buffer[(x,1)].symbol()).collect(); assert!(row.starts_with("SAVED"));
+        let text:String=buffer.content.iter().map(|cell|cell.symbol()).collect(); assert!(text.contains("saved body"));
+        app.on_key(key(KeyCode::Char('l')));assert!(matches!(app.stack.last(),Some(View::Raw {..})));
+        app.on_key(key(KeyCode::Char('h')));assert!(matches!(app.stack.last(),Some(View::Saved {..})));
+        for (code,modifiers,command) in [('s',KeyModifiers::CONTROL,"/save"),('s',KeyModifiers::CONTROL|KeyModifiers::SHIFT,"/unsave")] {
+            let expected = command == "/save";
+            assert_eq!(parse_command(command),Some(Command::Save(expected)));
+            assert_eq!(app.keymap.action(KeyEvent::new(KeyCode::Char(code),modifiers)),Some(if expected {Action::Save}else{Action::Unsave}));
+            app.pending_delete = Some(PendingDelete {cid:"D1".into(),id:1});
+            app.on_key(KeyEvent::new(KeyCode::Char(code),modifiers));
+            assert!(app.pending_delete.is_none());
+            assert!(app.status.contains("sign-in")); assert!(app.job.is_none());
+            app.run_command(command,"");assert!(app.status.contains("sign-in"));
+        }
+        app.job=Some(Job::completed_for_test(JobKind::Saved,Err("denied".into())));app.tick();
+        assert_eq!(app.saved_messages.len(),1);assert_eq!(app.active_list().unwrap().len(),1);
+        app.on_key(key(KeyCode::Esc));
+        app.job=Some(Job::completed_for_test(JobKind::Saved,Ok(Done::Saved(vec![message]))));app.tick();
+        assert!(app.stack.is_empty());assert!(app.open.is_none()); // No late navigation.
+        app.on_key(key(KeyCode::Esc));assert!(app.saved_selected);assert_eq!(app.conv_cursor,0);
+        app.open_saved();app.apply_saved(vec![]);assert_eq!(app.active_list().unwrap().len(),0);
+        app.on_key(key(KeyCode::Char('h')));assert!(app.stack.is_empty());
+        assert!(app.focus == Focus::Convs);
+        app.on_key(key(KeyCode::Char('j'))); assert!(!app.saved_selected);
+        app.corpus.convs.clear(); app.filtered.clear();app.open_saved();
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap(); // Empty workspaces need no fake conversation.
+    }
+
+    #[test]
     fn raw_enter_follows_cached_link_and_h_restores_highlight() {
         let mut app = mute_test_app();
         app.corpus.workspace_url = "https://myorg.slack.com".into();
@@ -5650,7 +5849,7 @@ pub(crate) mod tests {
         app.apply_filter();
         terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
-        assert!((2..10).all(|y| buffer[(2,y)].symbol() != "─"));
+        assert_eq!((2..10).filter(|&y| buffer[(2,y)].symbol() == "─").count(), 1); // SAVED divider remains.
     }
 
     #[test]

@@ -12,6 +12,8 @@ pub struct Cmd {
 /// The canonical names, in the order the suggestions list them. Aliases
 /// (`s`, `palette`, ...) still parse; only these complete.
 pub const COMMANDS: &[Cmd] = &[
+    Cmd { name: "save", args: "", help: "save the selected message to Slack Later" },
+    Cmd { name: "unsave", args: "", help: "remove the selected message from Slack Later" },
     Cmd {
         name: "conversations-pane",
         args: "",

@@ -18,6 +18,7 @@ mod word_highlights;
 mod profiles;
 mod render;
 mod raw;
+mod saved;
 mod storage;
 mod session_log;
 mod ui;
@@ -68,6 +69,10 @@ In raw JSON, j/k or Up/Down select leaf values, skipping nonempty containers. Sl
 message links are separate selections within a leaf; Enter follows the
 link inside slack-tui. After following a link, h returns to the raw
 selection. PgUp/PgDn scroll long values; g/G select the first/last value or link. Links use the current workspace.
+
+Ctrl-S or /save saves the selected message to Slack Later; Ctrl-Shift-S or /unsave
+removes it from Later. SAVED above starred conversations opens active saved messages;
+r refreshes the list. Terminals that report shortcuts alike can use /unsave.
 
 Conversations default to recent order: newest message first. Starred, muted,
 unread and search-match grouping take precedence. Press s to cycle recent,
@@ -294,6 +299,8 @@ const READ_ONLY_CALL_METHODS: &[&str] = &[
     "search.files",
     "search.messages",
     "stars.list",
+    "saved.list",
+    "saved.get",
     "team.info",
     "team.preferences.list",
     "usergroups.list",
