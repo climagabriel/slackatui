@@ -219,15 +219,6 @@ impl MsgList {
             }
             self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
             self.last.push(self.flat.len().saturating_sub(1));
-            if self.in_thread && i == 0 && self.msgs.len() > 1 {
-                let n = self.msgs.len() - 1;
-                let text = format!("{n} {}", if n == 1 { "reply" } else { "replies" });
-                self.flat.push(FlatLine {
-                    msg: None,
-                    line: render::divider(&text, width),
-                    image: None,
-                });
-            }
         }
         if let Some(note) = &self.bottom_note {
             self.flat.push(FlatLine {
