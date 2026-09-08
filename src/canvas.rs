@@ -695,6 +695,10 @@ pub struct Browser {
     pub picture: Option<Picture>,
 }
 impl Browser {
+    pub fn escape_edits(&self) -> bool {
+        self.draft.as_ref().is_some_and(|draft| draft.insert || draft.command.is_some())
+    }
+
     pub fn hide(&mut self) {
         self.visible = false;
         self.message = None;
@@ -1070,13 +1074,13 @@ impl Browser {
                 if d.dirty() { " [+]" } else { "" }
             )
         } else if self.picture.is_some() {
-            "+/- zoom · 0 fit · m message · h/Esc back · T hide".into()
+            "+/- zoom · 0 fit · m message · h back · Esc home · T hide".into()
         } else if let Some(history) = &self.history {
-            if history.details { "j/k scroll · h/Esc back · T hide".into() } else { "j/k select · l/Enter details/load older · r reload · h/Esc back · T hide".into() }
+            if history.details { "j/k scroll · h back · Esc home · T hide".into() } else { "j/k select · l/Enter details/load older · r reload · h back · Esc home · T hide".into() }
         } else if self.document.is_some() {
-            "j/k lines · i edit section · H edit history · h back · T hide".into()
+            "j/k lines · i edit section · H edit history · h back · Esc home · T hide".into()
         } else {
-            "j/k select · l/Enter open · m message · h back · T hide".into()
+            "j/k select · l/Enter open · m message · h back · Esc home · T hide".into()
         };
         let status = if self.history.as_ref().is_some_and(|history| history.limited) {
             format!("Slack limits older history. {}", self.notice)
@@ -1227,6 +1231,33 @@ mod tests {
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
+    #[test]
+    fn escape_leaves_canvas_insert_mode_then_goes_home_preserving_draft() {
+        let mut app = crate::app::tests::mute_test_app();
+        let mut browser = browser();
+        let section = browser.document.as_ref().unwrap().sections[0].clone();
+        let mut draft = Draft::new(section);
+        draft.editor.text.push_str(" unsaved");
+        browser.draft = Some(draft);
+        app.channel_browser = Some(browser);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let browser = app.channel_browser.as_ref().unwrap();
+        assert!(browser.visible && !browser.draft.as_ref().unwrap().insert);
+        app.channel_browser.as_mut().unwrap().draft.as_mut().unwrap().command = Some(Editor::with("w".into()));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.channel_browser.as_ref().unwrap().visible);
+        assert!(app.channel_browser.as_ref().unwrap().draft.as_ref().unwrap().command.is_none());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let browser = app.channel_browser.as_ref().unwrap();
+        assert!(!browser.visible && browser.draft.as_ref().unwrap().dirty());
+        assert!(app.open.is_none() && app.stack.is_empty());
+        app.channel_browser.as_mut().unwrap().visible = true;
+        app.channel_browser.as_mut().unwrap().draft = None;
+        app.channel_browser.as_mut().unwrap().history = Some(crate::canvas_history::History::default());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.channel_browser.as_ref().unwrap().visible);
+    }
+
     #[test]
     fn completed_file_lookup_reaches_application_and_navigation_cancels_pending_result() {
         use crate::archive::Msg;

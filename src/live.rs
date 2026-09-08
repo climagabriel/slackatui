@@ -135,6 +135,7 @@ pub enum Done {
 }
 
 pub struct Job {
+    pub navigate_on_completion: bool,
     pub kind: JobKind,
     pub label: String,
     pub started: Instant,
@@ -162,6 +163,7 @@ fn spawn(
         let _ = tx.send(work());
     });
     Job {
+        navigate_on_completion: true,
         kind,
         label,
         started: Instant::now(),
@@ -749,6 +751,7 @@ pub fn completed_job(kind: JobKind, result: Result<Done, String>) -> Job {
     let (tx, rx) = mpsc::channel();
     tx.send(result).unwrap();
     Job {
+        navigate_on_completion: true,
         kind,
         label: String::new(),
         started: Instant::now(),
@@ -759,7 +762,7 @@ pub fn completed_job(kind: JobKind, result: Result<Done, String>) -> Job {
 #[cfg(test)]
 pub fn pending_job(kind: JobKind) -> (Job, mpsc::Sender<Result<Done, String>>) {
     let (sender, rx) = mpsc::channel();
-    (Job { kind, label: String::new(), started: Instant::now(), rx }, sender)
+    (Job { navigate_on_completion: true, kind, label: String::new(), started: Instant::now(), rx }, sender)
 }
 
 pub fn api_starred_channels(client: Arc<Client>, gen: u64) -> Job {

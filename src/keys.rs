@@ -59,7 +59,7 @@ impl Action {
             Action::Last => "newest / last",
             Action::Open => "open: conversation, thread, raw JSON",
             Action::Back => "back one view, then the list",
-            Action::Close => "close the view, then the conversation",
+            Action::Close => "home; again: first conversation",
             Action::OtherPane => "the other pane",
             Action::Command => "a command line",
             Action::Keys => "this key editor",

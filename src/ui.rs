@@ -45,7 +45,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let [help, list] =
             Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(inner);
         frame.render_widget(Paragraph::new(
-            "Outside Search: j/k or ↑/↓ select · h/l unset/set · Space cycle · Enter save · Esc cancel\nSearch row: type · Backspace erase · Ctrl-U clear · ↓/Tab/Enter leave\nMuted and Number: h/l previous/next. Individuals: h hide, l show; Space cycles category/show/hide.\nReset: select Reset, Space, then Enter."), help);
+            "Outside Search: j/k or ↑/↓ select · h/l unset/set · Space cycle · Enter save · Esc cancel/home\nSearch row: type · Backspace erase · Ctrl-U clear · ↓/Tab/Enter leave\nMuted and Number: h/l previous/next. Individuals: h hide, l show; Space cycles category/show/hide.\nReset: select Reset, Space, then Enter."), help);
         let items: Vec<_> = menu.rows().into_iter().map(ListItem::new).collect();
         let mut state = ListState::default().with_selected(Some(menu.cursor));
         frame.render_stateful_widget(
@@ -611,7 +611,7 @@ fn draw_keys(frame: &mut Frame, app: &App, inner: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " j/k action · e bind · A add · d reset action · D reset all · Enter save · Esc cancel",
+        " j/k action · e bind · A add · d reset action · D reset all · Enter save · Esc cancel/home",
         Style::new().add_modifier(Modifier::DIM),
     )));
     frame.render_widget(Paragraph::new(lines), inner);
@@ -672,7 +672,7 @@ fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " j/k select · h/l color · W word highlights · e type color · d/D reset · Enter save · Esc cancel",
+        " j/k select · h/l color · W word highlights · e type color · d/D reset · Enter save · Esc cancel/home",
         Style::new().add_modifier(Modifier::DIM),
     )));
     frame.render_widget(Paragraph::new(lines), inner);
@@ -987,7 +987,7 @@ const HELP: &[HelpRow] = &[
     HelpRow::Bound(Action::UnreadsFirst, "unread conversations on top on/off"),
     HelpRow::Bound(
         Action::Compose,
-        "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Ctrl-v attaches the clipboard's image, Ctrl-j and Alt-Enter break the line, Enter sends, Esc keeps the draft",
+        "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Ctrl-v attaches the clipboard's image, Ctrl-j and Alt-Enter break the line, Enter sends, Esc keeps the draft and returns home",
     ),
     HelpRow::Bound(
         Action::Delete,

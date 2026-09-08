@@ -3062,6 +3062,37 @@ impl App {
     }
 
     /// Esc in the list: the home view, with no filter and nothing open.
+    fn escape_home(&mut self) {
+        let at_home = self.focus == Focus::Convs && self.open.is_none() && self.stack.is_empty()
+            && self.pane_menu.is_none() && !self.help && self.filter.is_empty()
+            && matches!(self.mode, Mode::Normal)
+            && !self.channel_browser.as_ref().is_some_and(|browser| browser.visible);
+        if matches!(self.mode, Mode::Prompt { .. }) {
+            // Preserve compose drafts and perform the normal prompt cancellation.
+            self.on_prompt_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        if let Some(browser) = &mut self.channel_browser { browser.hide(); }
+        if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
+        for view in self.stack.iter().rev() {
+            match view {
+                View::Keys { original, .. } => self.keymap = original.clone(),
+                View::ColorPalette { original, .. } => self.palette = original.clone(),
+                _ => {}
+            }
+        }
+        self.mark_all_dirty();
+        self.pane_menu = None;
+        self.help = false;
+        self.pending_delete = None;
+        let image_keys: Vec<String> = self.stack.iter().filter_map(|view| match view {
+            View::Image { files, .. } => Some(files.iter().map(|file| format!("{}:full", file.id))),
+            _ => None,
+        }).flatten().collect();
+        for key in image_keys { self.release_picture(&key); }
+        self.go_home();
+        if at_home { self.conv_cursor = 0; self.conv_offset = 0; }
+    }
+
     fn go_home(&mut self) {
         if !self.filter.is_empty() {
             self.filter.clear();
@@ -3132,7 +3163,7 @@ impl App {
 
     /// Name a freshly written archive after its conversation, as the
     /// refresh scripts expect, and open it.
-    fn finish_archive(&mut self, dir: &Path, spec: &str) {
+    fn finish_archive(&mut self, dir: &Path, spec: &str, navigate: bool) {
         let name = match Archive::open("new".to_string(), dir) {
             Ok(mut a) => a
                 .scan_convs(
@@ -3183,7 +3214,7 @@ impl App {
         match self.corpus.add_archive(&final_dir) {
             Ok(new) => {
                 self.apply_filter();
-                if let Some(&idx) = new.first() {
+                if let Some(&idx) = new.first().filter(|_| navigate) {
                     self.conv_cursor = self.filtered.iter().position(|&i| i == idx).unwrap_or(0);
                     self.open_conv(idx);
                 }
@@ -3494,8 +3525,10 @@ impl App {
             (JobKind::EmojiList, Done::EmojiList(catalog)) => self.take_emoji_list(catalog),
             (JobKind::Refresh { conv, before }, Done::Refreshed) => {
                 self.refresh_conv_stats(conv);
-                self.open_conv(conv);
-                let new = self.open.as_ref().map(|o| o.total).unwrap_or(before) - before;
+                if job.navigate_on_completion { self.open_conv(conv); }
+                let conversation = &self.corpus.convs[conv];
+                let new = self.corpus.archives[conversation.archive]
+                    .timeline_count(&conversation.id).unwrap_or(before) - before;
                 self.status = format!(
                     "refreshed: {new} new top-level message{}",
                     if new == 1 { "" } else { "s" }
@@ -3517,7 +3550,7 @@ impl App {
             }
             (JobKind::Search { query }, Done::Search(dir)) => self.merge_live_search(&query, &dir),
             (JobKind::Search { query }, Done::SearchHits(hits)) => self.merge_hits(&query, hits),
-            (JobKind::ArchiveNew { spec }, Done::Archived(dir)) => self.finish_archive(&dir, &spec),
+            (JobKind::ArchiveNew { spec }, Done::Archived(dir)) => self.finish_archive(&dir, &spec, job.navigate_on_completion),
             (JobKind::Tail { conv }, Done::Messages(msgs)) => self.append_tail(conv, msgs, false),
             (JobKind::Older { conv }, Done::OlderMessages(msgs, more)) => self.prepend_older(conv, msgs, more),
             (JobKind::Newer { conv }, Done::NewerMessages(msgs, more)) => {
@@ -3904,6 +3937,12 @@ impl App {
     // ----------------------------------------------------------------- keys
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Esc {
+            if let Some(browser) = self.channel_browser.as_mut().filter(|browser| browser.visible && browser.escape_edits()) {
+                browser.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            } else { self.escape_home(); }
+            return;
+        }
         if let Some(browser) = self.channel_browser.as_mut().filter(|b| b.visible) {
             let picture_key = browser.picture.as_ref().map(|picture| format!("{}:full", picture.file.id));
             if browser.can_toggle() && self.keymap.action(k)==Some(Action::ChannelTabs) {browser.hide();}
@@ -4018,8 +4057,6 @@ impl App {
                 }
                 KeyCode::Char('k')
                 | KeyCode::Up
-                | KeyCode::Char('h')
-                | KeyCode::Left
                 | KeyCode::Char('p') => {
                     if *index > 0 {
                         *index -= 1;
@@ -4027,7 +4064,7 @@ impl App {
                         *shown = None;
                     }
                 }
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i' | 'h') | KeyCode::Left => {
                     // The originals are large; keep only thumbnails once the viewer closes.
                     if let Some(View::Image { files, .. }) = self.stack.pop() {
                         for f in files {
@@ -4053,7 +4090,7 @@ impl App {
                 if list.selected().is_some() {
                     list.line_scroll = true;
                     list.scroll = list.first.get(list.cursor).copied().unwrap_or(0);
-                    self.status = "read message · j/k or arrows: one line · PgUp/PgDn: page · l: raw · Enter: thread · h/Esc: back".into();
+                    self.status = "read message · j/k or arrows: one line · PgUp/PgDn: page · l: raw · Enter: thread · h: back · Esc: home".into();
                 }
             }
             return;
@@ -4120,7 +4157,7 @@ impl App {
                 }
             }
             Some(Action::Command) => self.open_command(),
-            Some(Action::Close) => self.go_home(),
+            Some(Action::Close) => self.escape_home(),
             Some(Action::Archive) => self.prompt_archive(),
             Some(Action::MyThreads) => self.open_my_threads(),
             Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
@@ -4298,7 +4335,8 @@ impl App {
                 }
                 .to_string();
             }
-            Some(Action::Close) | Some(Action::Back) => {
+            Some(Action::Close) => self.escape_home(),
+            Some(Action::Back) => {
                 if let Some(list) = self.active_list_mut().filter(|list| list.line_scroll) {
                     list.line_scroll = false;
                     self.status.clear();
@@ -4619,6 +4657,61 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn escape_rolls_back_settings_and_disables_late_job_navigation() {
+        let mut app = mute_test_app();
+        let old_keys = app.keymap.text(Action::Down);
+        app.open_keys();
+        app.keymap.bind(Action::Down,crate::keys::Chord::parse("z").unwrap(),false);
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!(app.keymap.text(Action::Down),old_keys);
+        let original = app.palette.get(crate::palette::Role::Accent);
+        app.open_color_palette("");
+        app.palette.set(crate::palette::Role::Accent,ratatui::style::Color::Red);
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!(app.palette.get(crate::palette::Role::Accent),original);
+        app.corpus.archives.push(Archive::stub(&[],&[]));
+        app.corpus.convs[0].archive = 0;
+        let (job,sender) = live::pending_job(JobKind::Refresh {conv:0,before:0});
+        app.job = Some(job);
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert!(!app.job.as_ref().unwrap().navigate_on_completion);
+        sender.send(Ok(Done::Refreshed)).unwrap();
+        app.tick();
+        assert!(app.open.is_none() && app.focus == Focus::Convs);
+        app.stack.push(View::Image {files:vec![],index:0,shown:None,zoom:100});
+        app.on_key(KeyEvent::new(KeyCode::Char('h'),KeyModifiers::NONE));
+        assert!(app.stack.is_empty());
+    }
+
+    #[test]
+    fn escape_returns_home_then_resets_conversation_cursor_and_scroll() {
+        let mut app = mute_test_app();
+        app.conv_cursor = 1;
+        let index = app.filtered[1];
+        app.open_conv(index);
+        app.stack.push(View::Thread {root:1000000,list:MsgList::new(vec![msg(1,"thread")],true),live:None,place:None});
+        app.stack.push(View::Raw {title:"nested".into(),lines:vec![],scroll:0});
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert!(app.stack.is_empty() && app.open.is_none() && app.focus == Focus::Convs);
+        assert_eq!(app.conv_cursor,1);
+        app.conv_offset = 1;
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!((app.conv_cursor,app.conv_offset),(0,0));
+        app.help = true;
+        app.open_conversations_pane();
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert!(app.pane_menu.is_none() && !app.help);
+        app.mode = Mode::Prompt {kind:PromptKind::Command,buf:Editor::with("filter".into()),previous:String::new()};
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert!(matches!(app.mode,Mode::Normal));
+        app.compose = Some(Compose {conv:0,cid:"C1".into(),thread:None,label:"test".into()});
+        app.mode = Mode::Prompt {kind:PromptKind::Compose,buf:Editor::with("unsent text".into()),previous:String::new()};
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!(app.draft.as_ref().unwrap().text,"unsent text");
+        assert!(app.open.is_none());
+    }
+
+    #[test]
     fn word_menu_quit_keys_reach_the_application() {
         let mut app = mute_test_app();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
@@ -4726,7 +4819,7 @@ pub(crate) mod tests {
         assert_eq!(app.active_list().unwrap().scroll, first + 11);
         app.on_key(key(KeyCode::Char('l')));
         assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
-        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('h')));
         draw(&mut app, &mut terminal);
         assert_eq!(app.active_list().unwrap().scroll, first + 11);
         app.on_key(key(KeyCode::End));
@@ -5255,7 +5348,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn back_clears_the_message_pane_like_escape() {
+    fn back_unwinds_one_view_before_returning_home() {
         let mut app = App::new(
             Corpus::stub(&[]),
             Tz::Utc,
@@ -5269,7 +5362,7 @@ pub(crate) mod tests {
             None,
         );
         app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
-        for action in [Action::Back, Action::Close] {
+        for action in [Action::Back] {
             app.open_conv(0);
             app.stack.push(View::Raw {
                 title: "raw".into(),
