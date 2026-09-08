@@ -385,11 +385,7 @@ pub enum View {
         live_hits: Option<usize>,
         live_pending: bool,
     },
-    Raw {
-        title: String,
-        lines: Vec<String>,
-        scroll: usize,
-    },
+    Raw { title: String, browser: crate::raw::Browser },
     Reactions { title: String, lines: Vec<String>, scroll: usize },
     /// Roots of the threads the owner wrote in, across every archive.
     Threads { list: MsgList },
@@ -3360,6 +3356,9 @@ impl App {
             return;
         };
         let job = self.job.take().expect("a job was polled");
+        if let JobKind::MessageLink { raw_id, .. } = &job.kind {
+            if !matches!(self.stack.last(), Some(View::Raw { browser, .. }) if browser.id == *raw_id) { return; }
+        }
         let done = match outcome {
             Ok(d) => d,
             Err(e) => {
@@ -3409,6 +3408,9 @@ impl App {
                     "refreshed: {new} new top-level message{}",
                     if new == 1 { "" } else { "s" }
                 );
+            }
+            (JobKind::MessageLink { raw_id, link }, Done::ThreadMsgs(messages)) => {
+                self.show_linked_message(raw_id, &link, messages);
             }
             (JobKind::Thread { cid, root, focus }, Done::Thread(dir)) => {
                 if matches!(self.stack.last(), Some(View::Thread { root: r, .. }) if *r == root) {
@@ -3523,14 +3525,10 @@ impl App {
         let Some(m) = self.active_list().and_then(|l| l.selected()).cloned() else {
             return;
         };
-        let title = format!("raw · {}", m.ts);
-        let text = serde_json::to_string_pretty(&m.data).unwrap_or_default();
-        let lines = text.lines().map(str::to_string).collect();
-        self.stack.push(View::Raw {
-            title,
-            lines,
-            scroll: 0,
-        });
+        let place = self.corpus.channel_names.get(&m.channel_id).map(|name| format!("#{name}"))
+            .unwrap_or_else(|| m.channel_id.clone());
+        let title = format!("raw · {} · {place}", m.ts);
+        self.stack.push(View::Raw { title, browser: crate::raw::Browser::new(&m.data) });
     }
 
     fn goto_date(&mut self, text: &str) {
@@ -3625,7 +3623,7 @@ impl App {
             Some(View::ColorPalette { .. }) | Some(View::Keys { .. }) => {
                 unreachable!("handled before opening a conversation")
             }
-            Some(View::Raw { title, .. }) => format!("{title} · {}", conv.name),
+            Some(View::Raw { title, .. }) => title.clone(),
             Some(View::Reactions { title, .. }) => title.clone(),
             Some(View::Image {
                 files, index, zoom, ..
@@ -3880,7 +3878,7 @@ impl App {
             _ => {}
         }
         if let Some(View::Raw { .. }) = self.stack.last() {
-            self.on_raw_key(k, ctrl);
+            self.on_json_key(k, ctrl);
             return;
         }
         if let Some(View::Image {
@@ -3962,9 +3960,94 @@ impl App {
         }
     }
 
+    fn on_json_key(&mut self, key: KeyEvent, control: bool) {
+        let height = self.msgs_height.saturating_sub(2).max(1) as isize;
+        if key.code == KeyCode::Enter && !control {
+            self.follow_raw_link();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) && !control {
+            self.stack.pop();
+            return;
+        }
+        let Some(View::Raw { browser, .. }) = self.stack.last_mut() else { return };
+        match (key.code, control) {
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => browser.move_cursor(1),
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => browser.move_cursor(-1),
+            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => browser.move_cursor(isize::MIN),
+            (KeyCode::Char('G'), false) | (KeyCode::End, _) => browser.move_cursor(isize::MAX),
+            (KeyCode::Char('d'), true) => browser.scroll_lines(height / 2),
+            (KeyCode::Char('u'), true) => browser.scroll_lines(-height / 2),
+            (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => browser.scroll_lines(height),
+            (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => browser.scroll_lines(-height),
+            _ => {}
+        }
+    }
+
+    fn follow_raw_link(&mut self) {
+        let Some(View::Raw { browser, .. }) = self.stack.last() else { return };
+        let raw_id = browser.id;
+        let Some(link) = browser.selected().and_then(|leaf| leaf.link.clone()) else {
+            self.status = "Select a Slack message link with j/k, then Enter".into();
+            return;
+        };
+        if !link.in_workspace(&self.corpus.workspace_url) {
+            self.status = "This link belongs to another Slack workspace".into();
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "A fetch is running; retry Enter when it finishes".into();
+            return;
+        }
+        // Leave the source conversation and view stack intact for h to return to.
+        let mut root = link.root.unwrap_or(link.focus);
+        let archive = self.corpus.conv_by_channel(&link.channel)
+            .and_then(|index| self.corpus.conv_archive(&self.corpus.convs[index]));
+        let mut messages = archive.and_then(|archive| archive.thread(&link.channel, root).ok()).unwrap_or_default();
+        if link.root.is_none() {
+            if let Some(message) = messages.iter().find(|message| message.id == link.focus) {
+                root = message.thread_root();
+                if root != link.focus {
+                    messages = archive.and_then(|archive| archive.thread(&link.channel, root).ok()).unwrap_or_default();
+                }
+            }
+        }
+        if !messages.iter().any(|message| message.id == link.focus) {
+            messages = live::cached_thread(&self.cache_dir, &link.channel, root).unwrap_or_default();
+        }
+        if !messages.iter().any(|message| message.id == link.focus) && link.root.is_none() {
+            messages = crate::raw::cached_reply(&self.cache_dir, &link.channel, link.focus).unwrap_or_default();
+        }
+        if messages.iter().any(|message| message.id == link.focus) {
+            self.show_linked_message(raw_id, &link, messages);
+        } else if let Some(client) = self.api.clone() {
+            let mut link = link;
+            if root != link.focus { link.root = Some(root); }
+            self.job = Some(live::api_message_link(client, raw_id, link));
+        } else {
+            self.status = "Linked message is not cached; sign in to Slack to fetch it".into();
+        }
+    }
+
+    fn show_linked_message(&mut self, raw_id: u64, link: &crate::raw::Link, messages: Vec<Msg>) {
+        if !matches!(self.stack.last(), Some(View::Raw { browser, .. }) if browser.id == raw_id) { return; }
+        let Some(cursor) = messages.iter().position(|message| message.id == link.focus && message.channel_id == link.channel) else {
+            self.status = "Linked message is unavailable".into();
+            return;
+        };
+        let root = messages[cursor].thread_root();
+        let mut list = MsgList::new(messages, true);
+        list.cursor = cursor;
+        list.align_top = true;
+        let place = self.corpus.channel_names.get(&link.channel).map(|name| format!("#{name}"))
+            .unwrap_or_else(|| link.channel.clone());
+        self.stack.push(View::Thread { root, list, live: None, place: Some(place) });
+        self.status = "Opened linked Slack message · h: back".into();
+    }
+
     fn on_raw_key(&mut self, k: KeyEvent, ctrl: bool) {
         let height = self.msgs_height.max(1);
-        let Some(View::Raw { lines, scroll, .. } | View::Reactions { lines, scroll, .. }) = self.stack.last_mut() else {
+        let Some(View::Reactions { lines, scroll, .. }) = self.stack.last_mut() else {
             return;
         };
         let max = lines.len().saturating_sub(height);
@@ -4525,7 +4608,7 @@ pub(crate) mod tests {
         let index = app.filtered[1];
         app.open_conv(index);
         app.stack.push(View::Thread {root:1000000,list:MsgList::new(vec![msg(1,"thread")],true),live:None,place:None});
-        app.stack.push(View::Raw {title:"nested".into(),lines:vec![],scroll:0});
+        app.stack.push(View::Raw {title:"nested".into(),browser:crate::raw::Browser::new(&json!({}))});
         app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
         assert!(app.stack.is_empty() && app.open.is_none() && app.focus == Focus::Convs);
         assert_eq!(app.conv_cursor,1);
@@ -5183,6 +5266,101 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn raw_enter_follows_cached_link_and_h_restores_highlight() {
+        let mut app = mute_test_app();
+        app.corpus.workspace_url = "https://myorg.slack.com".into();
+        let cache = std::env::temp_dir().join(format!("slack-raw-link-test-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        app.cache_dir = cache.clone();
+        app.open_conv(0);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1,
+            "https://myorg.slack.com/archives/COTHER/p1788811422381186?thread_ts=1788765950.129609")],false);
+        std::fs::create_dir_all(cache.join("threads")).unwrap();
+        std::fs::write(live::thread_file(&cache,"COTHER",1788765950129609),json!([
+            {"ts":"1788765950.129609","text":"linked root","reply_count":1},
+            {"ts":"1788811422.381186","thread_ts":"1788765950.129609","text":"linked reply"}
+        ]).to_string()).unwrap();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,28)).unwrap();
+        let key = |code| KeyEvent::new(code,KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Char('l')));
+        terminal.draw(|frame| crate::ui::draw(frame,&mut app)).unwrap();
+        let original = terminal.backend().buffer().clone();
+        assert!(original.content.iter().any(|cell| cell.bg == app.palette.get(Role::SelectionBackground)));
+        let source = app.open.as_ref().unwrap().conv;
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.selected().unwrap().text,"linked reply");
+        assert_eq!(app.open.as_ref().unwrap().conv,source);
+        assert!(app.title().contains("COTHER"));
+        app.on_key(key(KeyCode::Char('h')));
+        terminal.draw(|frame| crate::ui::draw(frame,&mut app)).unwrap();
+        let before = match app.stack.last().unwrap() {View::Raw {browser,..}=>(browser.cursor,browser.scroll),_=>panic!()};
+        app.on_key(key(KeyCode::Down));
+        let after = match app.stack.last().unwrap() {View::Raw {browser,..}=>browser.cursor,_=>panic!()};
+        assert_eq!(after,before.0+1);
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.selected().unwrap().text,"linked reply");
+        app.on_key(key(KeyCode::Char('h')));
+        if let Some(View::Raw {browser,..}) = app.stack.last_mut() {
+            *browser = crate::raw::Browser::new(&json!({"text":"https://myorg.slack.com/archives/COTHER/p1788811422381186"}));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.selected().unwrap().text,"linked reply"); // Resolve rootless links from root-keyed caches.
+        app.on_key(key(KeyCode::Char('h')));
+        app.corpus.workspace_url = "https://other.slack.com".into();
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.status.contains("another Slack workspace"));
+        assert!(matches!(app.stack.last(),Some(View::Raw {..})));
+        assert!(app.job.is_none());
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn raw_links_keep_source_stack_and_ignore_late_navigation() {
+        let mut app = mute_test_app();
+        app.corpus.workspace_url = "https://myorg.slack.com".into();
+        app.open_conv(0);
+        let source = app.open.as_ref().unwrap().conv;
+        let url = "https://myorg.slack.com/archives/COTHER/p1788811422381186?thread_ts=1788765950.129609";
+        let mut message = msg(1, url);
+        message.data["text"] = json!(url);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![message],false);
+        app.open_raw();
+        let key = |code| KeyEvent::new(code,KeyModifiers::NONE);
+        let (raw_id, cursor) = match app.stack.last_mut().unwrap() {
+            View::Raw {browser,..} => {browser.scroll=3; (browser.id,browser.cursor)}, _=>panic!()
+        };
+        let link = crate::raw::Link::parse(url).unwrap();
+        let messages = vec![
+            Msg::from_api("COTHER".into(),json!({"ts":"1788765950.129609","text":"root","reply_count":1})).unwrap(),
+            Msg::from_api("COTHER".into(),json!({"ts":"1788811422.381186","text":"reply","thread_ts":"1788765950.129609"})).unwrap(),
+        ];
+        app.job = Some(Job::completed_for_test(JobKind::MessageLink {raw_id,link:link.clone()},Ok(Done::ThreadMsgs(messages.clone()))));
+        app.tick();
+        assert_eq!(app.open.as_ref().unwrap().conv,source);
+        assert_eq!(app.stack.len(),2);
+        assert_eq!(app.selected().unwrap().id,link.focus);
+        app.on_key(key(KeyCode::Char('h')));
+        let View::Raw {browser,..} = app.stack.last().unwrap() else {panic!()};
+        assert_eq!((browser.id,browser.cursor,browser.scroll),(raw_id,cursor,3));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.stack.is_empty());
+        app.open_raw();
+        app.job = Some(Job::completed_for_test(JobKind::MessageLink {raw_id,link:link.clone()},Ok(Done::ThreadMsgs(messages))));
+        app.tick();
+        assert_eq!(app.stack.len(),1); // An old fetch cannot hijack a newly opened raw view.
+        app.status = "current view status".into();
+        app.job = Some(Job::completed_for_test(JobKind::MessageLink {raw_id,link},Err("old fetch failure".into())));
+        app.tick();
+        assert_eq!(app.status,"current view status");
+        app.on_key(key(KeyCode::Home));
+        app.on_key(key(KeyCode::Enter)); // Nonlink leaf: stay in raw view.
+        assert_eq!(app.stack.len(),1);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.stack.is_empty() && app.open.is_none());
+    }
+
+    #[test]
     fn horizontal_open_reads_only_collapsed_messages() {
         for forward in [KeyCode::Char('l'), KeyCode::Right] {
             for thread in [false, true] {
@@ -5298,8 +5476,7 @@ pub(crate) mod tests {
             app.open_conv(0);
             app.stack.push(View::Raw {
                 title: "raw".into(),
-                lines: vec!["test".into()],
-                scroll: 0,
+                browser: crate::raw::Browser::new(&json!({"text":"test"})),
             });
             app.on_msg_key(Some(action));
             assert!(app.open.is_some());

@@ -17,6 +17,7 @@ use crate::archive::Msg;
 use crate::auth;
 
 pub enum JobKind {
+    MessageLink { raw_id: u64, link: crate::raw::Link },
     /// Resume one archive directory; `conv` is the conversation to reload.
     Refresh {
         conv: usize,
@@ -93,6 +94,7 @@ pub enum JobKind {
 impl JobKind {
     fn log_name(&self) -> &'static str {
         match self {
+            Self::MessageLink {..} => "message_link",
             Self::Refresh {..} => "refresh", Self::Thread {..} => "thread", Self::Search {..} => "search",
             Self::ArchiveNew {..} => "archive", Self::Auth => "auth", Self::Tail {..} => "tail",
             Self::Older {..} => "older", Self::Newer {..} => "newer", Self::Conversations => "conversations",
@@ -147,6 +149,13 @@ pub struct Job {
 }
 
 impl Job {
+    #[cfg(test)]
+    pub(crate) fn completed_for_test(kind: JobKind, outcome: Result<Done, String>) -> Self {
+        let (sender, rx) = mpsc::channel();
+        sender.send(outcome).unwrap();
+        Self { navigate_on_completion: true, kind, label: "test".into(), started: Instant::now(), rx }
+    }
+
     /// The outcome, once; None while the job is still running.
     pub fn poll(&self) -> Option<Result<Done, String>> {
         match self.rx.try_recv() {
@@ -259,6 +268,13 @@ pub fn cached_thread(cache: &Path, cid: &str, root: i64) -> Option<Vec<Msg>> {
     let values: Vec<Value> = serde_json::from_str(&text).ok()?;
     let msgs = msgs_from_values(cid, values);
     (!msgs.is_empty()).then_some(msgs)
+}
+
+pub fn api_message_link(client: Arc<Client>, raw_id: u64, link: crate::raw::Link) -> Job {
+    let target = link.clone();
+    spawn(JobKind::MessageLink { raw_id, link }, "fetching linked message".into(), move || {
+        crate::raw::fetch(&client, &target).map(Done::ThreadMsgs)
+    })
 }
 
 pub fn api_thread(client: Arc<Client>, cache: &Path, cid: String, root: i64, focus: i64) -> Job {

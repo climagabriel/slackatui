@@ -274,14 +274,13 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(shown), inner);
         return;
     }
-    if let Some(View::Raw { lines, scroll, .. }) = app.stack.last() {
-        let shown: Vec<Line> = lines
-            .iter()
-            .skip(*scroll)
-            .take(inner.height as usize)
-            .map(|s| render::json_line(s, &app.palette))
-            .collect();
-        frame.render_widget(Paragraph::new(Text::from(shown)), inner);
+    if let Some(View::Raw { browser, .. }) = app.stack.last_mut() {
+        let height = inner.height.saturating_sub(2);
+        let rows = browser.rows(inner.width as usize, height as usize, &app.palette);
+        frame.render_widget(Paragraph::new(rows), Rect { height, ..inner });
+        let help = vec![Line::raw(browser.label()),
+            Line::raw("j/k: leaf/link · Enter: follow · h: back · PgUp/PgDn: scroll · Esc: home")];
+        frame.render_widget(Paragraph::new(help), Rect { y: inner.y + height, height: inner.height - height, ..inner });
         return;
     }
     let image_font = app.image_font();
@@ -881,7 +880,7 @@ const HELP: &[HelpRow] = &[
     HelpRow::Bound(Action::OtherPane, "the other pane"),
     HelpRow::Bound(
         Action::Open,
-        "open conversation; on messages l/Right first reads by line (j/k, arrows, PgUp/PgDn, Home/End), then opens raw JSON; Enter opens the thread, or raw JSON inside a thread",
+        "open conversation; l/Right opens a known thread, expands a collapsed message, or opens raw JSON; Enter opens the thread, or raw JSON inside a thread",
     ),
     HelpRow::Bound(
         Action::Back,
@@ -931,6 +930,7 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(Action::Help, "this guide"),
     HelpRow::Bound(Action::RawJson, "raw JSON of the selected message"),
+    HelpRow::Fixed("in raw JSON", "j/k select leaf values or Slack links; Enter follows the selected link; h returns; PgUp/PgDn scroll long values; g/G select first/last value or link"),
     HelpRow::Bound(Action::Reload, "reload the conversation from the archive"),
     HelpRow::Bound(
         Action::Refresh,

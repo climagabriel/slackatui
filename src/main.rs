@@ -17,6 +17,7 @@ mod palette;
 mod word_highlights;
 mod profiles;
 mod render;
+mod raw;
 mod storage;
 mod session_log;
 mod ui;
@@ -55,14 +56,18 @@ usage: slack-tui [--root DIR] [--channel NAME] [--local]
 Opens every slackdump.sqlite under <root>/full/ and <root>/dms/ read-only
 (a resume writing the same database at the same time is fine) and shows
 the conversations on the left, the messages of the selected one on the
-right. Enter on a message opens its thread; Esc goes back.
+right. Enter on a message opens its thread; Esc returns home.
 l or Right opens the selected message's thread from the conversation.
 On a message without a thread, or inside a thread, it opens raw JSON unless
 the message is collapsed to two lines and a remaining-line count. Collapsed
 messages open for line-by-line reading: j/k or Up/Down scroll one line, PageUp/PageDown scroll a page,
 Home/End reach its start/end. l or Right again for raw JSON.
-h/Left or Esc returns one level along the path you entered, ending at
-the conversation list. JSON colors follow /colorpalette.
+h/Left returns one level along the path you entered, ending at
+the conversation list. Esc returns home; a second Esc selects its first row. JSON colors follow /colorpalette.
+In raw JSON, j/k or Up/Down select leaf values, skipping nonempty containers. Slack
+message links are separate selections within a leaf; Enter follows the
+link inside slack-tui. After following a link, h returns to the raw
+selection. PgUp/PgDn scroll long values; g/G select the first/last value or link. Links use the current workspace.
 
 Conversations default to recent order: newest message first. Starred, muted,
 unread and search-match grouping take precedence. Press s to cycle recent,

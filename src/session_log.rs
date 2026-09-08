@@ -268,7 +268,7 @@ pub fn state(app: &App) -> Value {
             View::Thread { root, .. } => json!({"view":"thread","root":root}),
             View::Search { .. } => json!({"view":"search"}),
             View::Threads { .. } => json!({"view":"threads"}),
-            View::Raw { scroll, .. } => json!({"view":"raw","scroll":scroll}),
+            View::Raw { browser, .. } => json!({"view":"raw","scroll":browser.scroll,"cursor":browser.cursor}),
             View::Reactions { scroll, .. } => json!({"view":"reactions","scroll":scroll}),
             View::ColorPalette { cursor, .. } => json!({"view":"palette","cursor":cursor}),
             View::Keys { cursor, .. } => json!({"view":"keys","cursor":cursor}),
@@ -444,8 +444,11 @@ mod tests {
         };
         app.stack.push(View::Raw {
             title: "private title payload".into(),
-            lines: vec!["private raw payload".into()],
-            scroll: 3,
+            browser: {
+                let mut browser = crate::raw::Browser::new(&json!({"text":"private raw payload"}));
+                browser.scroll = 3;
+                browser
+            },
         });
         let snapshot = state(&app);
         let serialized = snapshot.to_string();
