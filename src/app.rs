@@ -473,6 +473,7 @@ pub struct App {
     pub saved_messages: Vec<Msg>,
     pub open: Option<Open>,
     pub stack: Vec<View>,
+    browser_jobs: Vec<live::Job>,
     sent_return: Option<(Option<Open>, Vec<View>, usize)>,
     pub mode: Mode,
     pub help: bool,
@@ -624,6 +625,7 @@ impl App {
             saved_messages: Vec::new(),
             open: None,
             stack: Vec::new(),
+            browser_jobs: Vec::new(),
             sent_return: None,
             mode: Mode::Normal,
             help: false,
@@ -3395,6 +3397,14 @@ impl App {
 
     /// Advance the spinner and collect a finished job.
     pub fn tick(&mut self) {
+        let mut browser_status = None;
+        self.browser_jobs.retain(|job| match job.poll() {
+            None => true,
+            Some(Ok(_)) => { browser_status = Some("Opened link in browser".to_string()); false }
+            Some(Err(error)) => { browser_status = Some(error); false }
+        });
+        if let Some(status) = browser_status { self.status = status; }
+
         if let Some(browser) = &mut self.channel_browser { browser.tick(); }
         if let Some(location) = self.channel_browser.as_mut().filter(|browser| browser.visible).and_then(|browser| browser.message.take()) {
             self.open_file_message(location);
@@ -4261,8 +4271,15 @@ impl App {
     fn follow_raw_link(&mut self) {
         let Some(View::Raw { browser, .. }) = self.stack.last() else { return };
         let raw_id = browser.id;
+        if let Some(url) = browser.selected().filter(|leaf| leaf.link.is_none()).and_then(|leaf| leaf.web_url.clone()) {
+            self.browser_jobs.push(live::spawn(JobKind::OpenBrowser, "opening browser".into(), move || {
+                crate::raw::open_browser(&url).map(|()| Done::BrowserOpened)
+            }));
+            self.status = "Opening link in browser".into();
+            return;
+        }
         let Some(link) = browser.selected().and_then(|leaf| leaf.link.clone()) else {
-            self.status = "Select a Slack message link with j/k, then Enter".into();
+            self.status = "Select a link with j/k, then Enter".into();
             return;
         };
         if !link.in_workspace(&self.corpus.workspace_url) {
@@ -5712,6 +5729,20 @@ pub(crate) mod tests {
         let target=app.compose_target().unwrap();
         assert_eq!(target.cid,app.corpus.convs[app.filtered[1]].id);assert!(target.thread.is_none());
         for section in [TopSection::Saved,TopSection::Sent] {app.top_section=Some(section);assert!(app.compose_target().is_err());}
+    }
+
+    #[test]
+    fn browser_completion_preserves_raw_navigation_and_reports_failure() {
+        let mut app=mute_test_app();
+        app.stack.push(View::Raw { title:"raw".into(), browser:crate::raw::Browser::new(&json!({"url":"https://example.org/"})) });
+        for outcome in [Ok(Done::BrowserOpened),Err("Browser opener failed".into())] {
+            let success=outcome.is_ok();
+            app.browser_jobs.push(Job::completed_for_test(JobKind::OpenBrowser,outcome));
+            app.tick();
+            assert!(app.browser_jobs.is_empty()); assert!(app.job.is_none());
+            assert!(matches!(app.stack.last(),Some(View::Raw {..})));
+            assert!(app.status.contains(if success {"Opened link"} else {"Browser opener failed"}));
+        }
     }
 
     #[test]

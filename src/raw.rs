@@ -1,4 +1,4 @@
-//! Leaf-value navigation over JSON, with read-only Slack message links.
+//! Leaf-value navigation over JSON, with Slack message and browser links.
 use crate::{
     archive::Msg,
     palette::{Palette, Role},
@@ -104,6 +104,7 @@ pub struct Leaf {
     pub value: Range<usize>,
     pub path: String,
     pub link: Option<Link>,
+    pub web_url: Option<String>,
 }
 
 pub struct Browser {
@@ -132,7 +133,7 @@ impl Browser {
         browser.cursor = browser
             .leaves
             .iter()
-            .position(|leaf| leaf.link.is_some())
+            .position(|leaf| leaf.web_url.is_some())
             .unwrap_or(0);
         browser
     }
@@ -173,25 +174,28 @@ impl Browser {
                 let line = self.lines.len();
                 let mut links = Vec::new();
                 if let Some(text) = value.as_str() {
-                    for (start, _) in text.match_indices("https://") {
+                    for (start, _) in text.to_ascii_lowercase().match_indices("http") {
                         let end = text[start..]
-                            .find(|c: char| {
-                                c.is_whitespace()
-                                    || matches!(c, '<' | '>' | '|' | '"' | '\'' | ')' | ']')
-                            })
-                            .map(|length| start + length)
-                            .unwrap_or(text.len());
-                        let candidate = text[start..end].trim_end_matches([',', '.', ';']);
-                        if let Some(link) = Link::parse(candidate) {
-                            // Map decoded string offsets back into its JSON-escaped spelling.
+                            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '|' | '"'))
+                            .map(|length| start + length).unwrap_or(text.len());
+                        let mut candidate = text[start..end].trim_end_matches([',', '.', ';']);
+                        if text[..start].ends_with('\'') { candidate = candidate.trim_end_matches('\''); }
+                        loop {
+                            let previous = candidate.len();
+                            for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+                                while candidate.ends_with(close) && candidate.matches(close).count() > candidate.matches(open).count() {
+                                    candidate = candidate.strip_suffix(close).unwrap();
+                                }
+                            }
+                            if candidate.len() == previous { break; }
+                        }
+                        if let Some(url) = web_url(&candidate.replace("&amp;", "&")) {
                             let escaped_prefix = serde_json::to_string(&text[..start]).unwrap();
                             let escaped_link = serde_json::to_string(candidate).unwrap();
                             let begin = prefix.len() + escaped_prefix.len() - 1;
                             links.push(Leaf {
-                                line,
-                                value: begin..begin + escaped_link.len() - 2,
-                                path: path.clone(),
-                                link: Some(link),
+                                line, value: begin..begin + escaped_link.len() - 2,
+                                path: path.clone(), link: Link::parse(candidate), web_url: Some(url),
                             });
                         }
                     }
@@ -202,6 +206,7 @@ impl Browser {
                         value: prefix.len()..prefix.len() + serialized.len(),
                         path,
                         link: None,
+                        web_url: None,
                     });
                 } else {
                     self.leaves.extend(links);
@@ -235,6 +240,8 @@ impl Browser {
                     leaf.path,
                     if leaf.link.is_some() {
                         " · Enter: follow Slack message"
+                    } else if leaf.web_url.is_some() {
+                        " · Enter: open in browser"
                     } else {
                         ""
                     }
@@ -306,6 +313,28 @@ impl Browser {
         self.scroll = self.scroll.min(rows.len().saturating_sub(height));
         rows.into_iter().skip(self.scroll).take(height).collect()
     }
+}
+
+fn web_url(text: &str) -> Option<String> {
+    let url = text;
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") { return None; }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || url.chars().any(|c| c.is_control() || c.is_whitespace()) { return None; }
+    Some(url.to_string())
+}
+
+pub fn browser_command(url: &str) -> Result<std::process::Command, String> {
+    let url = web_url(url).ok_or("Only HTTP and HTTPS links can open in the browser")?;
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(url).stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    Ok(command)
+}
+
+pub fn open_browser(url: &str) -> Result<(), String> {
+    let status = browser_command(url)?.status().map_err(|error| format!("Could not start browser: {error}"))?;
+    if status.success() { Ok(()) } else { Err(format!("Browser opener failed: {status}")) }
 }
 
 /// A reply permalink may omit its thread timestamp; cached filenames use the root.
@@ -425,6 +454,42 @@ mod tests {
             browser.lines.join("\n"),
             serde_json::to_string_pretty(&data).unwrap()
         );
+    }
+
+    #[test]
+    fn web_links_are_selectable_and_browser_arguments_are_literal() {
+        let external = "https://example.org/page_(details)?a=1&amp;b=2";
+        let data=json!({"text":format!("é \"quoted\" <{external}|label> then (http://example.org/second). {FIRST}")});
+        let mut browser=Browser::new(&data);
+        assert_eq!(browser.leaves.len(),3);
+        assert!(browser.selected().unwrap().link.is_none());
+        assert_eq!(browser.selected().unwrap().web_url.as_deref(),Some("https://example.org/page_(details)?a=1&b=2"));
+        assert!(browser.label().contains("open in browser"));
+        assert_eq!(&browser.lines[browser.selected().unwrap().line][browser.selected().unwrap().value.clone()],external);
+        browser.move_cursor(1);
+        assert_eq!(browser.selected().unwrap().web_url.as_deref(),Some("http://example.org/second"));
+        browser.move_cursor(1);
+        assert_eq!(browser.selected().unwrap().link.as_ref().unwrap().url,FIRST);
+        assert!(browser.label().contains("follow Slack message"));
+        assert_eq!(browser.lines.join("\n"),serde_json::to_string_pretty(&data).unwrap());
+        for text in [format!("[({SECOND})]"),format!("({SECOND})")] {
+            let browser=Browser::new(&json!({"text":text}));
+            assert_eq!(browser.selected().unwrap().link.as_ref().unwrap().url,SECOND);
+        }
+        for text in ["https://example.org/O'Reilly", "<https://example.org/O'Reilly|label>"] {
+            let browser=Browser::new(&json!({"text":text}));
+            assert_eq!(browser.selected().unwrap().web_url.as_deref(),Some("https://example.org/O'Reilly"));
+        }
+        let browser=Browser::new(&json!({"url":"https://example.org/?x=&amp;amp;y=1"}));
+        let command=browser_command(browser.selected().unwrap().web_url.as_ref().unwrap()).unwrap();
+        assert_eq!(command.get_args().next().unwrap(),"https://example.org/?x=&amp;y=1");
+        let url="https://example.org/?value=$(touch%20/tmp/should-not-exist)&x=1";
+        let command=browser_command(url).unwrap();
+        assert_eq!(command.get_program(),"xdg-open");
+        assert_eq!(command.get_args().collect::<Vec<_>>(),vec![std::ffi::OsStr::new(url)]);
+        for bad in ["file:///etc/passwd","javascript:alert(1)","--help","https:///missing-host","http://example.org/\n"] {
+            assert!(browser_command(bad).is_err());
+        }
     }
 
     #[test]
