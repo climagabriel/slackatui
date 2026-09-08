@@ -1254,19 +1254,15 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i
         if !row.is_empty() { lines.push(Line::from(Span::styled(format!("  {row}"), dim))); }
     }
     if !in_thread && m.has_thread() {
-        let last = m
-            .latest_reply_id
-            .map(|id| format!(" · last {}", ctx.tz.fmt(id / 1_000_000, "%Y-%m-%d %H:%M")))
-            .unwrap_or_default();
         let n = m.archived_replies;
         let total = m.reply_count.max(n);
         let plural = |k: i64| if k == 1 { "reply" } else { "replies" };
         let s = if n == 0 {
             format!("  ↳ {total} {} · not archived", plural(total))
         } else if n < total {
-            format!("  ↳ {n} of {total} {} archived{last}", plural(total))
+            format!("  ↳ {n} of {total} {} archived", plural(total))
         } else {
-            format!("  ↳ {n} {}{last}", plural(n))
+            format!("  ↳ {n} {}", plural(n))
         };
         lines.push(Line::from(Span::styled(
             s,
