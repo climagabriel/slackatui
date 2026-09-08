@@ -2048,7 +2048,14 @@ impl App {
         let Some(o) = self.open.as_mut() else {
             return;
         };
-        if !o.has_newer || o.api_only {
+        if !o.has_newer { return; }
+        if o.api_only {
+            if self.job.is_none() {
+                if let Some(client) = self.api.clone() {
+                    let since = o.list.msgs.last().map(|message| message.id).unwrap_or(0);
+                    self.job = Some(live::api_newer(client, o.conv, self.corpus.convs[o.conv].id.clone(), since));
+                }
+            }
             return;
         }
         let conv = &self.corpus.convs[o.conv];
@@ -2070,6 +2077,39 @@ impl App {
             o.list.mark_dirty();
         }
         self.status = format!("loaded {n} newer");
+        self.update_notes();
+    }
+
+    fn open_file_message(&mut self, location: crate::file_message::Location) {
+        let Some(conv) = self.corpus.conv_by_channel(&location.channel) else {
+            if let Some(browser) = &mut self.channel_browser { browser.message_unavailable(); }
+            return;
+        };
+        // Foreground fetches can replace the current view; wait instead of discarding a write.
+        if self.job.is_some() {
+            if let Some(browser) = &mut self.channel_browser { browser.message = Some(location); }
+            return;
+        }
+        if self.bg.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Tail { .. } | JobKind::Thread { .. })) {
+            self.bg = None;
+        }
+        self.last_poll = Instant::now();
+        let mut list = MsgList::new(location.timeline, false);
+        list.cursor = list.msgs.iter().position(|m| m.id == location.root).unwrap_or(0);
+        list.align_top = true;
+        self.open = Some(Open { conv, total: self.corpus.convs[conv].msgs, list,
+            has_older: location.has_older, has_newer: location.has_newer, api_only: true });
+        self.stack.clear();
+        if location.focus != location.root {
+            let mut list = MsgList::new(location.replies, true);
+            list.cursor = list.msgs.iter().position(|m| m.id == location.focus).unwrap_or(0);
+            list.align_top = true;
+            self.stack.push(View::Thread { root: location.root, list, live: None, place: None });
+        }
+        self.focus = Focus::Msgs;
+        if let Some(index) = self.filtered.iter().position(|index| *index == conv) { self.conv_cursor = index; }
+        if let Some(browser) = &mut self.channel_browser { browser.visible = false; }
+        self.status = "Opened file sharing message".into();
         self.update_notes();
     }
 
@@ -2557,7 +2597,7 @@ impl App {
     }
 
     /// An older page from Slack for a conversation with no archive.
-    fn prepend_older(&mut self, conv: usize, mut msgs: Vec<Msg>) {
+    fn prepend_older(&mut self, conv: usize, mut msgs: Vec<Msg>, more: bool) {
         let Some(o) = self.open.as_mut() else {
             return;
         };
@@ -2568,7 +2608,7 @@ impl App {
         msgs.retain(|m| !known.contains(&m.id));
         let n = msgs.len();
         let was_empty = o.list.msgs.is_empty();
-        o.has_older = n >= PAGE;
+        o.has_older = more;
         if n > 0 {
             o.list.msgs.splice(0..0, msgs);
             o.list.cursor = if was_empty {
@@ -3197,6 +3237,9 @@ impl App {
     /// Advance the spinner and collect a finished job.
     pub fn tick(&mut self) {
         if let Some(browser) = &mut self.channel_browser { browser.tick(); }
+        if let Some(location) = self.channel_browser.as_mut().filter(|browser| browser.visible).and_then(|browser| browser.message.take()) {
+            self.open_file_message(location);
+        }
         if let Some(outcome) = self.emoji_job.as_ref().and_then(|job| job.poll()) {
             self.emoji_job = None;
             match outcome {
@@ -3476,7 +3519,16 @@ impl App {
             (JobKind::Search { query }, Done::SearchHits(hits)) => self.merge_hits(&query, hits),
             (JobKind::ArchiveNew { spec }, Done::Archived(dir)) => self.finish_archive(&dir, &spec),
             (JobKind::Tail { conv }, Done::Messages(msgs)) => self.append_tail(conv, msgs, false),
-            (JobKind::Older { conv }, Done::Messages(msgs)) => self.prepend_older(conv, msgs),
+            (JobKind::Older { conv }, Done::OlderMessages(msgs, more)) => self.prepend_older(conv, msgs, more),
+            (JobKind::Newer { conv }, Done::NewerMessages(msgs, more)) => {
+                if let Some(open) = self.open.as_mut().filter(|open| open.conv == conv && open.api_only) {
+                    open.has_newer = more;
+                    let known: HashSet<i64> = open.list.msgs.iter().map(|message| message.id).collect();
+                    open.list.msgs.extend(msgs.into_iter().filter(|message| !known.contains(&message.id)));
+                    open.list.mark_dirty();
+                }
+                self.update_notes();
+            }
             (JobKind::Mark { conv, id }, Done::Marked) => {
                 let c = &mut self.corpus.convs[conv];
                 c.last_read = id;
@@ -3854,7 +3906,7 @@ impl App {
     pub fn on_key(&mut self, k: KeyEvent) {
         if let Some(browser) = self.channel_browser.as_mut().filter(|b| b.visible) {
             let picture_key = browser.picture.as_ref().map(|picture| format!("{}:full", picture.file.id));
-            if browser.can_toggle() && self.keymap.action(k)==Some(Action::ChannelTabs) {browser.visible=false;}
+            if browser.can_toggle() && self.keymap.action(k)==Some(Action::ChannelTabs) {browser.hide();}
             else {browser.key(k);}
             if browser.picture.is_none() {
                 if let Some(key) = picture_key { self.release_picture(&key); }
@@ -4532,7 +4584,7 @@ fn link_mentions(text: &str, user_id: impl Fn(&str) -> Option<String>) -> String
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::archive::{Archive, Corpus, Msg};
     use crate::render::{line_text, Ctx, Tz};
@@ -4544,6 +4596,26 @@ mod tests {
             json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn file_message_opens_timeline_then_thread_and_back_returns_to_root() {
+        let mut app = mute_test_app();
+        let location = |thread| crate::file_message::Location {
+            channel: "C1".into(), root: 1000000, focus: if thread {2000000} else {1000000},
+            timeline: vec![msg(1,"root")], replies: vec![msg(1,"root"),msg(2,"file reply")],
+            has_older: false, has_newer: true,
+        };
+        app.bg = Some(live::api_tail(Arc::new(Client::for_test(|_,_| Ok(json!({"messages":[]})))), 0, "C1".into(), 0, true));
+        app.open_file_message(location(false));
+        assert!(app.bg.is_none());
+        assert_eq!(app.open.as_ref().unwrap().list.selected().unwrap().id,1000000);
+        assert!(app.stack.is_empty());
+        app.open_file_message(location(true));
+        assert_eq!(app.active_list().unwrap().selected().unwrap().id,2000000);
+        app.on_key(KeyEvent::new(KeyCode::Char('h'),KeyModifiers::NONE));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.open.as_ref().unwrap().list.selected().unwrap().id,1000000);
     }
 
     #[test]
@@ -5443,7 +5515,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn mute_test_app() -> App {
+    pub(crate) fn mute_test_app() -> App {
         let mut app = App::new(
             Corpus::stub(&[]),
             Tz::Utc,

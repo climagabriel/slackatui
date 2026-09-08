@@ -46,6 +46,7 @@ enum Target {
 }
 #[derive(Clone, Debug)]
 struct Tab {
+    file: Option<crate::file_message::Metadata>,
     label: String,
     target: Target,
 }
@@ -318,7 +319,7 @@ pub fn load_document(client: &Client, id: &str) -> Result<Document, String> {
 }
 
 fn tabs_from(info: &Value) -> Vec<Tab> {
-    let mut tabs = vec![Tab {
+    let mut tabs = vec![Tab { file: None,
         label: "Messages".into(),
         target: Target::Messages,
     }];
@@ -359,17 +360,17 @@ fn tabs_from(info: &Value) -> Vec<Tab> {
             } else {
                 label
             };
-            tabs.push(Tab { label, target });
+            tabs.push(Tab { file: None, label, target });
         }
     }
     if !tabs.iter().any(|t| matches!(t.target, Target::Files)) {
-        tabs.push(Tab {
+        tabs.push(Tab { file: None,
             label: "Files & links".into(),
             target: Target::Files,
         });
     }
     if !tabs.iter().any(|t| matches!(t.target, Target::Bookmarks)) {
-        tabs.push(Tab {
+        tabs.push(Tab { file: None,
             label: "Bookmarks".into(),
             target: Target::Bookmarks,
         });
@@ -405,7 +406,7 @@ fn load_entries(client: &Client, channel: &str, files: bool) -> Result<Vec<Tab>,
             )?;
             if let Some(rows) = response["files"].as_array() {
                 for file in rows {
-                    entries.push(Tab {
+                    entries.push(Tab { file: Some(crate::file_message::Metadata::from_file(file)),
                         label: string(file, "title"),
                         target: if string(file, "filetype") == "quip" {
                             Target::Canvas(string(file, "id"))
@@ -431,7 +432,7 @@ fn load_entries(client: &Client, channel: &str, files: bool) -> Result<Vec<Tab>,
     let response = client.call("bookmarks.list", &[("channel_id", channel)])?;
     if let Some(rows) = response["bookmarks"].as_array() {
         for bookmark in rows {
-            entries.push(Tab {
+            entries.push(Tab { file: None,
                 label: string(bookmark, "title"),
                 target: Target::Link(string(bookmark, "link")),
             });
@@ -649,6 +650,7 @@ enum Loaded {
     Canvas(Document),
     Saved(Document, bool),
     History(crate::canvas_history::Page),
+    Message(crate::file_message::Location),
 }
 struct Job {
     receive: Receiver<Result<Loaded, String>>,
@@ -669,6 +671,8 @@ pub struct Picture {
 }
 
 pub struct Browser {
+    pub message: Option<crate::file_message::Location>,
+    message_loading: bool,
     pub visible: bool,
     pub channel: String,
     name: String,
@@ -691,6 +695,16 @@ pub struct Browser {
     pub picture: Option<Picture>,
 }
 impl Browser {
+    pub fn hide(&mut self) {
+        self.visible = false;
+        self.message = None;
+        if self.message_loading {
+            self.job = None;
+            self.message_loading = false;
+            self.notice.clear();
+        }
+    }
+    pub fn message_unavailable(&mut self) { self.notice = "Conversation is no longer available.".into(); }
     pub fn can_toggle(&self) -> bool {
         self.draft
             .as_ref()
@@ -703,6 +717,8 @@ impl Browser {
         let api = client.clone();
         let cid = channel.clone();
         Self {
+            message: None,
+            message_loading: false,
             visible: true,
             channel,
             name,
@@ -733,8 +749,10 @@ impl Browser {
         });
         if let Some(result) = result {
             self.job = None;
+            self.message_loading = false;
             self.notice.clear();
             match result {
+                Ok(Loaded::Message(location)) => { self.message = Some(location); }
                 Ok(Loaded::History(page)) => {
                     if let Some(history) = &mut self.history { history.append(page); }
                 }
@@ -773,6 +791,14 @@ impl Browser {
         }
     }
     pub fn key(&mut self, key: KeyEvent) {
+        self.message = None;
+        if self.message_loading && matches!(key.code, KeyCode::Char('T' | 'h') | KeyCode::Esc | KeyCode::Left) {
+            self.job = None;
+            self.message_loading = false;
+            self.notice.clear();
+            if key.code == KeyCode::Char('T') { self.visible = false; }
+            return;
+        }
         if self.job.is_some() {
             if self.history.is_some() && matches!(key.code, KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc) {
                 self.history = None;
@@ -883,6 +909,16 @@ impl Browser {
                 return;
             }
             self.visible = false;
+            return;
+        }
+        if key.code == KeyCode::Char('m') && self.entries.is_some() && self.document.is_none() {
+            if let Some(file) = self.entries.as_ref().and_then(|entries| entries.get(self.entry_cursor)).and_then(|entry| entry.file.clone()) {
+                let api = self.client.clone();
+                let channel = self.channel.clone();
+                self.message_loading = true;
+                self.job = Some(spawn(move || crate::file_message::load(&api, &channel, &file.id).map(Loaded::Message)));
+                self.notice = "Finding latest sharing message in this channel…".into();
+            } else { self.notice = "This entry has no file sharing message.".into(); }
             return;
         }
         if let Some(picture) = &mut self.picture {
@@ -1034,13 +1070,13 @@ impl Browser {
                 if d.dirty() { " [+]" } else { "" }
             )
         } else if self.picture.is_some() {
-            "+/- zoom · 0 fit · h/Esc back · T hide".into()
+            "+/- zoom · 0 fit · m message · h/Esc back · T hide".into()
         } else if let Some(history) = &self.history {
             if history.details { "j/k scroll · h/Esc back · T hide".into() } else { "j/k select · l/Enter details/load older · r reload · h/Esc back · T hide".into() }
         } else if self.document.is_some() {
             "j/k lines · i edit section · H edit history · h back · T hide".into()
         } else {
-            "j/k select · l/Enter open · h back · T hide".into()
+            "j/k select · l/Enter open · m message · h back · T hide".into()
         };
         let status = if self.history.as_ref().is_some_and(|history| history.limited) {
             format!("Slack limits older history. {}", self.notice)
@@ -1150,7 +1186,11 @@ impl Browser {
             let style = if index == self.entry_cursor {
                 Style::new().bg(palette.get(Role::SelectionBackground)).fg(palette.get(Role::SelectionText))
             } else { Style::new() };
-            frame.render_widget(Paragraph::new(entry.label.as_str()).style(style), Rect::new(body.x, y, body.width, 1));
+            let label = match &entry.file {
+                Some(file) => format!("{} · {}", file.date(), entry.label),
+                None => entry.label.clone(),
+            };
+            frame.render_widget(Paragraph::new(label).style(style), Rect::new(body.x, y, body.width, 1));
             if rows > 1 {
                 if let Target::Image(file, _) = &entry.target {
                     self.thumbnails.push((Rect::new(body.x, y + 1, body.width.min(64), preview_rows), file.clone()));
@@ -1187,6 +1227,60 @@ mod tests {
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
+    #[test]
+    fn completed_file_lookup_reaches_application_and_navigation_cancels_pending_result() {
+        use crate::archive::Msg;
+        let message = || Msg::from_api("C1".into(),json!({"ts":"1.000000","files":[{"id":"F1"}]})).unwrap();
+        let location = || crate::file_message::Location { channel: "C1".into(), root:1000000, focus:1000000, timeline:vec![message()], replies:vec![], has_older:false,has_newer:false };
+        let mut browser = browser();
+        browser.document = None;
+        browser.entries = Some(vec![]);
+        browser.message = Some(location());
+        browser.key(key('j'));
+        assert!(browser.message.is_none());
+        let (sender,receive) = mpsc::channel();
+        browser.job = Some(Job {receive});
+        browser.message_loading = true;
+        browser.key(key('h'));
+        assert!(sender.send(Ok(Loaded::Message(location()))).is_err());
+        let (sender,receive) = mpsc::channel();
+        browser.job = Some(Job {receive});
+        browser.message_loading = true;
+        sender.send(Ok(Loaded::Message(location()))).unwrap();
+        let mut app = crate::app::tests::mute_test_app();
+        app.channel_browser = Some(browser);
+        app.tick();
+        assert!(!app.channel_browser.as_ref().unwrap().visible);
+        assert_eq!(app.open.as_ref().unwrap().list.selected().unwrap().id,1000000);
+        let browser = app.channel_browser.as_mut().unwrap();
+        browser.visible = true;
+        browser.message = Some(location());
+        app.on_key(key('T'));
+        let browser = app.channel_browser.as_ref().unwrap();
+        assert!(!browser.visible);
+        assert!(browser.message.is_none());
+    }
+
+    #[test]
+    fn file_rows_display_dates_and_message_key_starts_read_only_lookup() {
+        let mut browser = browser();
+        browser.document = None;
+        browser.entries = Some(vec![Tab { label: "example.png".into(), target: Target::Link("https://example.invalid".into()), file: Some(crate::file_message::Metadata { id: "F1".into(), created: Some(0) }) }]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90,12)).unwrap();
+        terminal.draw(|frame| browser.draw(frame,frame.area(),&Palette::default())).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("1970-01-01 00:00 UTC · example.png"));
+        browser.client = Client::for_test(|method, params| {
+            assert_eq!(method,"files.info");
+            assert_eq!(params,&[("file","F1")]);
+            Ok(json!({"file":{}}))
+        }).into();
+        browser.key(key('m'));
+        let result = browser.job.take().unwrap().receive.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(matches!(result,Err(error) if error.contains("no sharing message")));
+        assert!(browser.visible);
+    }
+
     #[test]
     fn history_navigation_is_read_only_and_returns_one_level_at_a_time() {
         let mut browser = browser();
@@ -1347,6 +1441,8 @@ mod tests {
     }
     fn browser() -> Browser {
         Browser {
+            message: None,
+            message_loading: false,
             visible: true,
             channel: "C1".into(),
             name: "channel".into(),
@@ -1523,12 +1619,12 @@ mod tests {
         use std::path::PathBuf;
         let mut browser = browser();
         browser.document = None;
-        browser.tabs = vec![Tab { label: "Files & links".into(), target: Target::Files }];
+        browser.tabs = vec![Tab { file: None, label: "Files & links".into(), target: Target::Files }];
         browser.entries = Some((0..20).map(|index| {
             let id = format!("F{index}");
             let file = FileInfo::from_slack(&json!({"id":id,"title":format!("image{index}.png"),
                 "mimetype":"image/png","thumb_360":"https://example.invalid/thumb.png"}), "C1");
-            Tab { label: file.name.clone(), target: Target::Image(file, String::new()) }
+            Tab { file: None, label: file.name.clone(), target: Target::Image(file, String::new()) }
         }).collect());
         let mut app = App::new(Corpus::stub(&[]), Tz::Utc, 30.0, false, false,
             PathBuf::new(), PathBuf::new(), 0, None, None);
@@ -1583,7 +1679,7 @@ mod tests {
         let mut browser = browser();
         browser.name = "#team-cdn-alpha".into();
         browser.document = None;
-        browser.tabs = vec![Tab { label: "Files & links".into(), target: Target::Files }];
+        browser.tabs = vec![Tab { file: None, label: "Files & links".into(), target: Target::Files }];
         browser.entries = Some(load_entries(&client, "C1", true).unwrap());
         assert!(matches!(browser.entries.as_ref().unwrap()[1].target, Target::Link(_)));
         assert_eq!(browser.title(), "#team-cdn-alpha · channel tabs · Files & links");

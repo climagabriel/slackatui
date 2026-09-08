@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod canvas;
 mod canvas_history;
+mod file_message;
 mod archive;
 mod auth;
 mod clip;

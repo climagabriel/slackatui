@@ -46,6 +46,7 @@ pub enum JobKind {
     Older {
         conv: usize,
     },
+    Newer { conv: usize },
     /// The conversations the user is a member of.
     Conversations,
     Profiles,
@@ -106,6 +107,8 @@ pub enum Done {
     Archived(PathBuf),
     Auth(Arc<Client>, String),
     Messages(Vec<Msg>),
+    NewerMessages(Vec<Msg>, bool),
+    OlderMessages(Vec<Msg>, bool),
     Conversations(Vec<Value>),
     Profiles(Vec<Value>, Option<String>),
     Usergroups(Vec<Value>, Option<String>),
@@ -314,12 +317,17 @@ pub fn api_older(client: Arc<Client>, conv: usize, cid: String, before: i64) -> 
         "fetching older messages".to_string(),
         move || {
             let latest = (before > 0).then(|| id_to_ts(before));
-            let values = client.history(&cid, latest.as_deref(), None, 200)?;
-            let mut msgs = msgs_from_values(&cid, values);
-            msgs.sort_by_key(|m| m.id);
-            Ok(Done::Messages(msgs))
+            let (messages, more) = crate::file_message::history_page(&client, &cid, latest.as_deref(), None, false, 200)?;
+            Ok(Done::OlderMessages(messages, more))
         },
     )
+}
+
+pub fn api_newer(client: Arc<Client>, conv: usize, cid: String, since: i64) -> Job {
+    spawn(JobKind::Newer { conv }, "fetching newer messages".into(), move || {
+        let (messages, more) = crate::file_message::newer(&client, &cid, &id_to_ts(since), 200)?;
+        Ok(Done::NewerMessages(messages, more))
+    })
 }
 
 pub fn api_conversations(client: Arc<Client>) -> Job {
