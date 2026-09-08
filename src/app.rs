@@ -475,6 +475,9 @@ pub struct App {
     emoji_pending: bool,
     /// The last confirmed server snapshot; old local overrides are no longer read.
     pub muted: HashSet<String>,
+    pub starred: HashSet<String>,
+    starred_generation: u64,
+    starred_pending: bool,
     muted_generation: u64,
     /// Slack's muted set still to fetch.
     pub muted_pending: bool,
@@ -594,6 +597,9 @@ impl App {
             emoji_job: None,
             emoji_pending: false,
             muted: HashSet::new(),
+            starred: HashSet::new(),
+            starred_generation: 0,
+            starred_pending: false,
             muted_generation: 0,
             muted_pending: false,
             draft: None,
@@ -747,6 +753,10 @@ impl App {
             Some(Command::Cache(op, name)) => {
                 self.restore_filter(filter_before);
                 self.cache_cmd(&op, &name);
+            }
+            Some(Command::Star(on, name)) => {
+                self.restore_filter(filter_before);
+                self.star_cmd(on, &name);
             }
             Some(Command::Mute(on, name)) => {
                 self.restore_filter(filter_before);
@@ -1261,6 +1271,35 @@ impl App {
         for c in self.corpus.convs.iter_mut() {
             c.muted = self.muted.contains(&c.id);
         }
+    }
+
+    fn star_cmd(&mut self, on: bool, name: &str) {
+        let index = match self.target_conv(name) {
+            Ok(index) => index,
+            Err(error) => { self.status = error; return; }
+        };
+        let Some(client) = self.api.clone().filter(|_| self.live) else {
+            self.status = "Star/unstar needs a Slack sign-in".into();
+            return;
+        };
+        if self.job.is_some() {
+            self.status = "Wait for the current Slack operation".into();
+            return;
+        }
+        self.starred_generation = self.starred_generation.wrapping_add(1);
+        self.job = Some(live::api_set_starred(client, self.conv(index).id.clone(), on));
+    }
+    fn take_starred_snapshot(&mut self, generation: u64, ids: Vec<String>) {
+        if generation == self.starred_generation {
+            self.starred = ids.into_iter().collect();
+            self.apply_filter();
+        }
+    }
+    fn finish_star(&mut self, cid: &str, starred: bool, ids: Vec<String>) {
+        self.starred_generation = self.starred_generation.wrapping_add(1);
+        self.take_starred_snapshot(self.starred_generation, ids);
+        let name = self.corpus.convs.iter().find(|c| c.id == cid).map(|c| c.name.as_str()).unwrap_or(cid);
+        self.status = format!("{} {} in Slack (verified)", name, if starred { "starred" } else { "unstarred" });
     }
 
     /// `/mute` and `/unmute` update Slack; local state changes only after verification.
@@ -1817,6 +1856,8 @@ impl App {
         }
         // Muted conversations keep their unread color but sink to the end.
         idx.sort_by_key(|&i| convs[i].muted);
+        // Stars take precedence over unread, mute, search rank and sort mode.
+        idx.sort_by_key(|&i| !self.starred.contains(&convs[i].id));
         // Keep the highlighted conversation highlighted across a re-sort.
         let current = self.filtered.get(self.conv_cursor).copied();
         self.filtered = idx;
@@ -3211,6 +3252,7 @@ impl App {
                     if let Some(c) = self.api.clone() {
                         self.bg = Some(live::api_counts(c, self.counts_gen));
                         self.muted_pending = true;
+                        self.starred_pending = true;
                     }
                 }
                 Ok(Done::Counts(v)) => {
@@ -3220,7 +3262,12 @@ impl App {
                     }
                     self.last_counts = Instant::now();
                     self.muted_pending = true;
+                    self.starred_pending = true;
                 }
+                Ok(Done::StarredChannels(ids)) => {
+                    if let JobKind::StarredChannels { gen } = job.kind { self.take_starred_snapshot(gen, ids); }
+                }
+                Ok(Done::StarChanged { cid, starred, ids }) => self.finish_star(&cid, starred, ids),
                 Ok(Done::MutedChannels(ids)) => {
                     if let JobKind::MutedChannels { gen } = job.kind {
                         self.take_muted_snapshot(gen, ids);
@@ -3248,6 +3295,11 @@ impl App {
             }
         }
         if let Some(c) = self.api.clone() {
+            if self.starred_pending && self.bg.is_none()
+                && !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::SetStarred)) {
+                self.starred_pending = false;
+                self.bg = Some(live::api_starred_channels(c.clone(), self.starred_generation));
+            }
             if self.muted_pending
                 && self.bg.is_none()
                 && !matches!(self.job.as_ref().map(|j| &j.kind), Some(JobKind::SetMuted))
@@ -3339,6 +3391,10 @@ impl App {
             Ok(d) => d,
             Err(e) => {
                 self.status = format!("Slack: {e}");
+                if matches!(job.kind, JobKind::SetStarred) {
+                    self.starred_generation = self.starred_generation.wrapping_add(1);
+                    self.starred_pending = true;
+                }
                 if matches!(job.kind, JobKind::SetMuted) {
                     self.muted_generation = self.muted_generation.wrapping_add(1);
                     self.muted_pending = true;
@@ -3364,6 +3420,8 @@ impl App {
             }
         };
         match (job.kind, done) {
+            (_, Done::StarChanged { cid, starred, ids }) => self.finish_star(&cid, starred, ids),
+            (JobKind::StarredChannels { gen }, Done::StarredChannels(ids)) => self.take_starred_snapshot(gen, ids),
             (_, Done::MuteChanged { cid, muted, ids }) => self.finish_mute(&cid, muted, ids),
             (JobKind::MutedChannels { gen }, Done::MutedChannels(ids)) => {
                 self.take_muted_snapshot(gen, ids)
@@ -4267,6 +4325,7 @@ enum Command {
     Cache(String, String),
     /// `mute [#name]` (true) and `unmute [#name]` (false).
     Mute(bool, String),
+    Star(bool, String),
     /// `colorpalette [name]`: edit and persist the semantic UI colors,
     /// starting from a named palette when one is given.
     ColorPalette(String),
@@ -4289,6 +4348,8 @@ fn parse_command(line: &str) -> Option<Command> {
     match word.to_lowercase().as_str() {
         "find" | "search" | "f" | "s" => Some(Command::Find(rest.to_string())),
         "leave" => Some(Command::Leave(rest.to_string())),
+        "star" | "pin" => Some(Command::Star(true, rest.to_string())),
+        "unstar" | "unpin" => Some(Command::Star(false, rest.to_string())),
         "mute" => Some(Command::Mute(true, rest.to_string())),
         "unmute" => Some(Command::Mute(false, rest.to_string())),
         "colorpalette" | "palette" | "colors" => Some(Command::ColorPalette(rest.to_string())),
@@ -5204,6 +5265,61 @@ mod tests {
             .iter()
             .all(|fl| !line_text(&fl.line).contains("new")));
     }
+    #[test]
+    fn star_aliases_and_stale_snapshots_preserve_confirmed_changes() {
+        for word in ["star", "pin"] {
+            assert_eq!(parse_command(&format!("/{word} #one")), Some(Command::Star(true, "#one".into())));
+        }
+        for word in ["unstar", "unpin"] {
+            assert_eq!(parse_command(word), Some(Command::Star(false, String::new())));
+        }
+        let mut app = mute_test_app();
+        app.finish_star("C1", true, vec!["C1".into()]);
+        app.take_starred_snapshot(0, vec![]);
+        assert!(app.starred.contains("C1"));
+        app.bg = Some(live::completed_job(JobKind::StarredChannels { gen: app.starred_generation }, Ok(Done::StarredChannels(vec!["D1".into()]))));
+        app.tick();
+        assert!(!app.starred.contains("C1"));
+        assert!(app.starred.contains("D1"));
+        app.job = Some(live::completed_job(JobKind::SetStarred, Ok(Done::StarChanged { cid: "D1".into(), starred: false, ids: vec![] })));
+        app.tick();
+        assert!(app.starred.is_empty());
+        assert!(app.status.contains("unstarred in Slack"));
+        app.starred.insert("C1".into());
+        app.job = Some(live::completed_job(JobKind::SetStarred, Err("denied".into())));
+        app.tick();
+        assert!(app.starred.contains("C1"));
+        assert!(app.starred_pending);
+    }
+
+    #[test]
+    fn starred_conversations_precede_unreads_and_mutes_with_a_nonselectable_divider() {
+        let mut app = mute_test_app();
+        app.starred.insert("D1".into());
+        app.muted.insert("D1".into());
+        app.corpus.convs[0].unread = true;
+        for sort in [Sort::Name, Sort::Mine, Sort::Recent, Sort::Size] {
+            app.sort = sort;
+            app.apply_filter();
+            assert_eq!(app.conv(app.filtered[0]).id, "D1");
+        }
+        app.focus = Focus::Convs;
+        app.conv_cursor = 0;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("────────"));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.conv_cursor, 1);
+        assert_eq!(app.conv(app.filtered[app.conv_cursor]).id, "C1");
+        assert_eq!(app.filtered.len(), 2);
+        app.starred.clear();
+        app.apply_filter();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((2..10).all(|y| buffer[(2,y)].symbol() != "─"));
+    }
+
     fn mute_test_app() -> App {
         let mut app = App::new(
             Corpus::stub(&[]),

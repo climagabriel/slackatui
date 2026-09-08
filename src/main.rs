@@ -127,7 +127,7 @@ environment
 keys (also ? inside)
   j/k move, Ctrl-d/Ctrl-u half page, g/G oldest/newest, h/l or Tab panes,
   Enter thread, Esc back, / a command (Tab completes: upload, keys,
-  colorpalette, version, find, search, leave, mute, unmute, cache),
+  colorpalette, version, find, search, leave, mute, unmute, star, unstar, pin, unpin, cache),
   d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,

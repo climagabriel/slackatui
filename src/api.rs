@@ -376,6 +376,40 @@ impl Client {
             .map(|_| ())
     }
 
+    /// Conversation stars only; saved messages and files do not star their channels.
+    pub fn starred_channels(&self) -> Result<Vec<String>, String> {
+        let mut ids = Vec::new();
+        let mut cursor = String::new();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let response = self.call("stars.list", &[("limit", "100"), ("cursor", &cursor)])?;
+            let items = response.get("items").and_then(Value::as_array).ok_or("stars.list: missing items")?;
+            for item in items {
+                if matches!(item.get("type").and_then(Value::as_str), Some("channel" | "group" | "im" | "mpim")) {
+                    let id = item.get("channel").or_else(|| item.get("group")).and_then(Value::as_str).ok_or("stars.list: missing conversation ID")?;
+                    ids.push(id.to_string());
+                }
+            }
+            cursor = response.pointer("/response_metadata/next_cursor").and_then(Value::as_str).unwrap_or("").to_string();
+            if cursor.is_empty() { break; }
+            if !seen.insert(cursor.clone()) { return Err("stars.list: repeated cursor".into()); }
+        }
+        Ok(ids)
+    }
+
+    pub fn set_starred(&self, cid: &str, starred: bool) -> Result<Vec<String>, String> {
+        let method = if starred { "stars.add" } else { "stars.remove" };
+        if let Err(error) = self.call(method, &[("channel", cid)]) {
+            let harmless = format!("{method}: {}", if starred { "already_starred" } else { "not_starred" });
+            if error != harmless { return Err(error); }
+        }
+        let ids = self.starred_channels()?;
+        if ids.iter().any(|id| id == cid) != starred {
+            return Err("Star change was not confirmed by Slack".into());
+        }
+        Ok(ids)
+    }
+
     /// Server notification preferences; malformed responses must not clear the UI.
     pub fn muted_channels(&self) -> Result<Vec<String>, String> {
         muted_ids(&self.call("users.prefs.get", &[("prefs", "all_notifications_prefs")])?)
@@ -480,6 +514,39 @@ pub fn parse_permalink(link: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::parse_permalink;
+
+    #[test]
+    fn stars_paginate_ignore_messages_and_verify_channel_only_writes() {
+        let client = super::Client::for_test(|method, params| {
+            assert_eq!(method, "stars.list");
+            if params.contains(&("cursor", "")) {
+                Ok(serde_json::json!({"items":[{"type":"channel","channel":"C1"},{"type":"message","channel":"C2"}],"response_metadata":{"next_cursor":"page2"}}))
+            } else {
+                assert!(params.contains(&("cursor", "page2")));
+                Ok(serde_json::json!({"items":[{"type":"im","channel":"D1"},{"type":"group","group":"G1"}],"response_metadata":{"next_cursor":""}}))
+            }
+        });
+        assert_eq!(client.starred_channels().unwrap(), vec!["C1", "D1", "G1"]);
+        for starred in [true, false] {
+            let client = super::Client::for_test(move |method, params| {
+                if method == "stars.list" {
+                    Ok(serde_json::json!({"items":if starred {vec![serde_json::json!({"type":"channel","channel":"C1"})]}else{vec![]}}))
+                } else {
+                    assert_eq!(method, if starred {"stars.add"} else {"stars.remove"});
+                    assert_eq!(params, &[("channel", "C1")]);
+                    Ok(serde_json::json!({"ok":true}))
+                }
+            });
+            assert_eq!(client.set_starred("C1", starred).unwrap().contains(&"C1".into()), starred);
+        }
+        let client = super::Client::for_test(|method, _| {
+            if method == "stars.add" { Ok(serde_json::json!({"ok":true})) }
+            else { Ok(serde_json::json!({"items":[]})) }
+        });
+        assert!(client.set_starred("C1", true).is_err());
+        let client = super::Client::for_test(|_, _| Err("write denied".into()));
+        assert!(client.set_starred("C1", true).is_err());
+    }
 
     #[test]
     fn permalinks_split_into_channel_and_timestamp() {

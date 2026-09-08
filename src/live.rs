@@ -93,6 +93,8 @@ pub enum JobKind {
         gen: u64,
     },
     SetMuted,
+    StarredChannels { gen: u64 },
+    SetStarred,
 }
 
 pub enum Done {
@@ -120,6 +122,8 @@ pub enum Done {
     Left,
     EmojiList(crate::custom_emoji::Catalog),
     MutedChannels(Vec<String>),
+    StarredChannels(Vec<String>),
+    StarChanged { cid: String, starred: bool, ids: Vec<String> },
     MuteChanged {
         cid: String,
         muted: bool,
@@ -748,4 +752,16 @@ pub fn completed_job(kind: JobKind, result: Result<Done, String>) -> Job {
 pub fn pending_job(kind: JobKind) -> (Job, mpsc::Sender<Result<Done, String>>) {
     let (sender, rx) = mpsc::channel();
     (Job { kind, label: String::new(), started: Instant::now(), rx }, sender)
+}
+
+pub fn api_starred_channels(client: Arc<Client>, gen: u64) -> Job {
+    spawn(JobKind::StarredChannels { gen }, String::new(), move || {
+        Ok(Done::StarredChannels(client.starred_channels()?))
+    })
+}
+pub fn api_set_starred(client: Arc<Client>, cid: String, starred: bool) -> Job {
+    spawn(JobKind::SetStarred, "Updating starred conversation".into(), move || {
+        let ids = client.set_starred(&cid, starred)?;
+        Ok(Done::StarChanged { cid, starred, ids })
+    })
 }

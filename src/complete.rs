@@ -32,6 +32,10 @@ pub const COMMANDS: &[Cmd] = &[
         args: "[#name]",
         help: "leave the channel, the open one by default",
     },
+    Cmd { name: "star", args: "[#name]", help: "star a conversation in Slack and keep it on top" },
+    Cmd { name: "pin", args: "[#name]", help: "alias for star" },
+    Cmd { name: "unstar", args: "[#name]", help: "remove a conversation star in Slack" },
+    Cmd { name: "unpin", args: "[#name]", help: "alias for unstar" },
     Cmd {
         name: "mute",
         args: "[#name]",
@@ -144,7 +148,7 @@ pub fn complete(line: &str, convs: &[String]) -> Completion {
                 })
                 .collect()
         }
-        (1, Some(w)) if matches!(w.as_str(), "leave" | "mute" | "unmute") => conv_items(convs),
+        (1, Some(w)) if matches!(w.as_str(), "leave" | "mute" | "unmute" | "star" | "pin" | "unstar" | "unpin") => conv_items(convs),
         (2, Some(w)) if w == "cache" && words.get(1) == Some(&"highlight") => HIGHLIGHT_ARGS
             .iter()
             .map(|(name, help)| Item {

@@ -169,11 +169,19 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         .into_iter()
         .enumerate()
         .map(|(k, line)| {
-            ListItem::new(if k == app.conv_cursor {
+            let line = if k == app.conv_cursor {
                 on_cursor(line, focused, &app.palette)
             } else {
                 line
-            })
+            };
+            let boundary = k > 0
+                && app.starred.contains(&app.conv(app.filtered[k - 1]).id)
+                && !app.starred.contains(&app.conv(app.filtered[k]).id);
+            if boundary {
+                ListItem::new(vec![Line::from(Span::styled("─".repeat(width), dim)), line])
+            } else {
+                ListItem::new(line)
+            }
         })
         .collect();
     let list = List::new(items).block(block);
