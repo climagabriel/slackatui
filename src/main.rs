@@ -186,8 +186,11 @@ vintage palette (terracotta, amber, sand, olive and slate, over whichever
 background the terminal already draws), and
 /colorpalette default over the terminal's own sixteen colors; /keys rebinds
 what the keys do in the two lists, one action per row; /version shows the
-version in the status line's right corner, and hides it again; /mute and /unmute keep a conversation at the end of
-the list, on top of the channels muted in Slack itself.
+version in the status line's right corner, and hides it again.
+/mute and /unmute update your preference in Slack and verify it
+by reading it back. They require sign-in; failures do not create a local mute.
+Old muted.json overrides are ignored. Muted conversations sort last;
+Slack preference refreshes follow unread-count polling.
 /conversations-pane selects visible categories and individual conversations.
 Ctrl-Shift-P opens the same menu and /keys can rebind it. Terminals must report
 the Shift modifier separately; otherwise use the command or rebind the action.
@@ -799,6 +802,7 @@ mod tests {
             "reactions.add",
             "reactions.remove",
             "users.prefs.set",
+            "users.prefs.setNotifications",
         ] {
             assert!(
                 read_only_call_method(method).is_err(),

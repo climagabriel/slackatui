@@ -473,12 +473,9 @@ pub struct App {
     pub custom_emoji: crate::custom_emoji::Catalog,
     emoji_job: Option<live::Job>,
     emoji_pending: bool,
-    /// Muted conversation ids: `<cache>/muted.json` plus the channels muted
-    /// in Slack itself, fetched once per run.
+    /// The last confirmed server snapshot; old local overrides are no longer read.
     pub muted: HashSet<String>,
-    /// Muted in Slack, so `/unmute` says where to undo it.
-    pub muted_in_slack: HashSet<String>,
-    pub muted_loaded: bool,
+    muted_generation: u64,
     /// Slack's muted set still to fetch.
     pub muted_pending: bool,
     /// A message typed and not sent: Esc keeps it for the next `c` on the
@@ -597,8 +594,7 @@ impl App {
             emoji_job: None,
             emoji_pending: false,
             muted: HashSet::new(),
-            muted_in_slack: HashSet::new(),
-            muted_loaded: false,
+            muted_generation: 0,
             muted_pending: false,
             draft: None,
             counts_gen: 0,
@@ -1234,10 +1230,9 @@ impl App {
         }
     }
 
-    /// Slack's own muted channels join the local set for this run.
+    /// Replace the confirmed server snapshot, including conversations unmuted elsewhere.
     fn take_muted(&mut self, ids: Vec<String>) {
-        self.muted_in_slack = ids.iter().cloned().collect();
-        self.muted.extend(ids);
+        self.muted = ids.into_iter().collect();
         self.apply_filter();
         self.mark_all_dirty();
     }
@@ -1262,60 +1257,59 @@ impl App {
         }
     }
 
-    /// The muted set follows `<cache>/muted.json`; the flags on the
-    /// conversations follow the set, so merged-in conversations get theirs.
     fn sync_muted(&mut self) {
-        if !self.muted_loaded {
-            self.muted_loaded = true;
-            if let Some(ids) = std::fs::read_to_string(self.cache_dir.join("muted.json"))
-                .ok()
-                .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
-            {
-                self.muted = ids.into_iter().collect();
-            }
-        }
         for c in self.corpus.convs.iter_mut() {
             c.muted = self.muted.contains(&c.id);
         }
     }
 
-    /// `/mute [#name]` and `/unmute [#name]`: never, or again, shown as unread.
+    /// `/mute` and `/unmute` update Slack; local state changes only after verification.
     fn mute_cmd(&mut self, on: bool, name: &str) {
         let idx = match self.target_conv(name) {
             Ok(i) => i,
-            Err(e) => {
-                self.status = e;
+            Err(error) => {
+                self.status = error;
                 return;
             }
         };
-        let (id, cname) = {
-            let c = &self.corpus.convs[idx];
-            (c.id.clone(), c.name.clone())
-        };
-        let in_slack = self.muted_in_slack.contains(&id);
-        if on {
-            self.muted.insert(id);
-        } else if in_slack {
-            self.status = format!("{cname} is muted in Slack itself; unmute it there");
+        let Some(client) = self.api.clone().filter(|_| self.live) else {
+            self.status = "Mute/unmute needs a Slack sign-in; no local override was changed".into();
             return;
-        } else {
-            self.muted.remove(&id);
-        }
-        let mut ids: Vec<&String> = self.muted.difference(&self.muted_in_slack).collect();
-        ids.sort();
-        let _ = std::fs::create_dir_all(&self.cache_dir);
-        let saved = serde_json::to_string(&ids)
-            .map_err(|e| e.to_string())
-            .and_then(|t| {
-                std::fs::write(self.cache_dir.join("muted.json"), t).map_err(|e| e.to_string())
-            });
-        self.status = match saved {
-            Ok(()) if on => format!("{cname} muted: always at the end of the list"),
-            Ok(()) => format!("{cname} unmuted"),
-            Err(e) => format!("{cname}: {e}"),
         };
-        self.apply_filter();
-        self.mark_all_dirty();
+        if self.job.is_some() {
+            self.status = "Wait for the current Slack operation before changing mute state".into();
+            return;
+        }
+        let c = &self.corpus.convs[idx];
+        self.status = format!(
+            "{} {} in Slack…",
+            if on { "Muting" } else { "Unmuting" },
+            c.name
+        );
+        self.muted_generation = self.muted_generation.wrapping_add(1);
+        self.job = Some(live::api_set_muted(client, c.id.clone(), on));
+    }
+
+    fn finish_mute(&mut self, cid: &str, muted: bool, ids: Vec<String>) {
+        self.muted_generation = self.muted_generation.wrapping_add(1);
+        self.take_muted(ids);
+        let name = self
+            .corpus
+            .convs
+            .iter()
+            .find(|c| c.id == cid)
+            .map(|c| c.name.as_str())
+            .unwrap_or(cid);
+        self.status = format!(
+            "{name} {} in Slack (verified)",
+            if muted { "muted" } else { "unmuted" }
+        );
+    }
+
+    fn take_muted_snapshot(&mut self, gen: u64, ids: Vec<String>) {
+        if gen == self.muted_generation {
+            self.take_muted(ids);
+        }
     }
 
     /// Every message list on screen: the open timeline and the stacked views.
@@ -3218,8 +3212,14 @@ impl App {
                         self.apply_counts(&v);
                     }
                     self.last_counts = Instant::now();
+                    self.muted_pending = true;
                 }
-                Ok(Done::MutedChannels(ids)) => self.take_muted(ids),
+                Ok(Done::MutedChannels(ids)) => {
+                    if let JobKind::MutedChannels { gen } = job.kind {
+                        self.take_muted_snapshot(gen, ids);
+                    }
+                }
+                Ok(Done::MuteChanged { cid, muted, ids }) => self.finish_mute(&cid, muted, ids),
                 Ok(Done::ThreadMsgs(msgs)) => {
                     if let JobKind::Thread { root, .. } = job.kind {
                         self.extend_thread(msgs, root);
@@ -3241,9 +3241,12 @@ impl App {
             }
         }
         if let Some(c) = self.api.clone() {
-            if self.muted_pending && self.bg.is_none() {
+            if self.muted_pending
+                && self.bg.is_none()
+                && !matches!(self.job.as_ref().map(|j| &j.kind), Some(JobKind::SetMuted))
+            {
                 self.muted_pending = false;
-                self.bg = Some(live::api_muted_channels(c.clone()));
+                self.bg = Some(live::api_muted_channels(c.clone(), self.muted_generation));
             }
             if let (Some((conv, thread)), true) = (self.tail_pending, self.bg.is_none()) {
                 let open_here = self.open.as_ref().map(|o| o.conv) == Some(conv);
@@ -3329,6 +3332,10 @@ impl App {
             Ok(d) => d,
             Err(e) => {
                 self.status = format!("Slack: {e}");
+                if matches!(job.kind, JobKind::SetMuted) {
+                    self.muted_generation = self.muted_generation.wrapping_add(1);
+                    self.muted_pending = true;
+                }
                 if let JobKind::Upload { .. } = &job.kind {
                     // The file left the prompt when the send started; say so,
                     // rather than let the next conversation inherit it.
@@ -3350,6 +3357,10 @@ impl App {
             }
         };
         match (job.kind, done) {
+            (_, Done::MuteChanged { cid, muted, ids }) => self.finish_mute(&cid, muted, ids),
+            (JobKind::MutedChannels { gen }, Done::MutedChannels(ids)) => {
+                self.take_muted_snapshot(gen, ids)
+            }
             (JobKind::EmojiList, Done::EmojiList(catalog)) => self.take_emoji_list(catalog),
             (JobKind::Refresh { conv, before }, Done::Refreshed) => {
                 self.refresh_conv_stats(conv);
@@ -5173,4 +5184,123 @@ mod tests {
             .iter()
             .all(|fl| !line_text(&fl.line).contains("new")));
     }
+    fn mute_test_app() -> App {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![
+            json!({"id":"C1","name":"one","is_member":true}),
+            json!({"id":"D1","user":"U1","is_im":true}),
+        ]);
+        app
+    }
+    #[test]
+    fn mute_snapshots_replace_removed_ids_and_ignore_stale_reads() {
+        let mut app = mute_test_app();
+        app.take_muted(vec!["C1".into()]);
+        let generation = app.muted_generation;
+        app.finish_mute("C1", false, vec!["D1".into()]);
+        assert!(!app.muted.contains("C1"));
+        assert!(app.muted.contains("D1"));
+        app.take_muted_snapshot(generation, vec!["C1".into()]);
+        assert!(!app.muted.contains("C1"));
+        app.take_muted_snapshot(app.muted_generation, vec![]);
+        assert!(app.muted.is_empty());
+        assert!(app.corpus.convs.iter().all(|c| !c.muted));
+    }
+    #[test]
+    fn mute_completion_applies_target_not_cursor_and_failures_preserve_state() {
+        let mut app = mute_test_app();
+        app.job = Some(live::completed_job(
+            JobKind::SetMuted,
+            Ok(Done::MuteChanged {
+                cid: "C1".into(),
+                muted: true,
+                ids: vec!["C1".into()],
+            }),
+        ));
+        app.conv_cursor = 1;
+        app.tick();
+        assert!(app.muted.contains("C1"));
+        assert!(app.status.contains("#one muted in Slack (verified)"));
+        let before = app.muted_generation;
+        app.job = Some(live::completed_job(
+            JobKind::SetMuted,
+            Err("verification failed".into()),
+        ));
+        app.tick();
+        assert!(app.muted.contains("C1"));
+        assert!(app.status.contains("verification failed"));
+        assert!(app.muted_generation > before);
+        // Quiet and foreground result handling must agree.
+        app.bg = Some(live::completed_job(
+            JobKind::SetMuted,
+            Ok(Done::MuteChanged {
+                cid: "C1".into(),
+                muted: false,
+                ids: vec![],
+            }),
+        ));
+        app.tick();
+        assert!(app.muted.is_empty());
+    }
+    #[test]
+    fn mute_offline_never_creates_a_local_override() {
+        let mut app = mute_test_app();
+        app.mute_cmd(true, "#one");
+        assert!(app.job.is_none());
+        assert!(app.muted.is_empty());
+        assert!(app.status.contains("sign-in"));
+    }
+    #[test]
+    fn mute_dispatch_invalidates_reads_and_blocks_preference_scheduling() {
+        use std::sync::{mpsc, Mutex};
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let release_receiver = Mutex::new(release_receiver);
+        let client = Client::for_test(move |method, _| {
+            assert_eq!(method, "users.prefs.setNotifications");
+            started_sender.send(()).unwrap();
+            release_receiver.lock().unwrap().recv_timeout(Duration::from_secs(2)).unwrap();
+            Err("write denied".into())
+        });
+        let mut app = mute_test_app();
+        app.api = Some(Arc::new(client));
+        app.live = true;
+        let generation = app.muted_generation;
+        let (snapshot, snapshot_sender) = live::pending_job(JobKind::MutedChannels { gen: generation });
+        app.bg = Some(snapshot);
+        app.mute_cmd(true, "#one");
+        started_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(app.muted_generation > generation);
+        snapshot_sender.send(Ok(Done::MutedChannels(vec!["D1".into()]))).ok().unwrap();
+        app.muted_pending = true;
+        app.tick();
+        assert!(app.muted.is_empty());
+        assert!(app.bg.is_none());
+        assert!(app.muted_pending);
+        assert!(matches!(app.job.as_ref().map(|job| &job.kind), Some(JobKind::SetMuted)));
+        // Release the worker without timing-dependent polling of its result.
+        release_sender.send(()).unwrap();
+        app.api = None;
+        let generation = app.muted_generation;
+        app.job = Some(live::completed_job(JobKind::SetMuted, Err("write denied".into())));
+        app.muted_pending = false;
+        app.tick();
+        assert!(app.muted_pending);
+        assert!(app.muted_generation > generation);
+        app.bg = Some(live::completed_job(JobKind::MutedChannels { gen: generation }, Ok(Done::MutedChannels(vec!["D1".into()]))));
+        app.tick();
+        assert!(app.muted.is_empty());
+    }
+
 }

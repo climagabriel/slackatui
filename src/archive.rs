@@ -70,7 +70,7 @@ pub struct Conv {
     pub live_only: bool,
     /// `/leave` succeeded: no longer a member, the archive stays readable.
     pub left: bool,
-    /// `/mute`: never shown as unread. Local, kept in the cache directory.
+    /// Muted in Slack, from the last confirmed notification-preference snapshot.
     pub muted: bool,
     pub unread: bool,
     pub mentions: i64,

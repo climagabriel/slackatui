@@ -22,11 +22,11 @@ You develop slack-tui, a ratatui terminal client for the owner's Slack: it reads
 - Sign-in imports the Slack desktop app's session: the `d` cookie from the app's Chromium profile (snap or classic location under `$HOME`) and a token minted from the workspace page. The pair is cached owner-only in `~/.config/slack-tui/auth.json`; that file is a secret, never read or print it. `SLACK_TOKEN` and `SLACK_COOKIE` bypass the import. Credentials go only to slack.com hosts.
 - slackdump stays the only archive writer; slack-tui opens the SQLite files read-only and the hourly refresh may write them at the same time. It shares the refresh's lock file (`SLACKDUMP_LOCK`).
 - Threads: a signed-in session always refetches a thread on open; the archived `reply_count` is not a completeness signal (a thread showed 2 replies where Slack had 24). `R` replaces the list; the poll refreshes the open thread and appends.
-- Slack's own muted channels come from `users.prefs.get` (`all_notifications_prefs.channels.<id>.muted`), read-only; local mutes live in `muted.json`. `conversations.create` is `restricted_action` in this workspace.
+- Mute state comes from `users.prefs.get` (`all_notifications_prefs.channels.<id>.muted`); `/mute` and `/unmute` use `users.prefs.setNotifications` and verify by read-back. Legacy `muted.json` overrides are ignored. `conversations.create` is `restricted_action` in this workspace.
 
 ## Web API writes the tool makes
 
-`conversations.mark` (`m`/`M`), `chat.postMessage` (compose, `c`), `chat.delete` (`D` on your own message, and `--delete-message URL`), `reactions.add`/`reactions.remove` (`e`), `files.getUploadURLExternal` plus `files.completeUploadExternal` (`/upload`, `Ctrl-v` image paste), `conversations.leave` (`/leave`), `canvases.edit` (`:w`/`:wq` in the channel canvas section editor). Any new write goes on this list and gets the test discipline below.
+`conversations.mark` (`m`/`M`), `chat.postMessage` (compose, `c`), `chat.delete` (`D` on your own message, and `--delete-message URL`), `reactions.add`/`reactions.remove` (`e`), `files.getUploadURLExternal` plus `files.completeUploadExternal` (`/upload`, `Ctrl-v` image paste), `conversations.leave` (`/leave`), `users.prefs.setNotifications` (`/mute`, `/unmute`), `canvases.edit` (`:w`/`:wq` in the channel canvas section editor). Any new write goes on this list and gets the test discipline below.
 
 ## Test discipline: the tool posts under the owner's name
 

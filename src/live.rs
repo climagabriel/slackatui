@@ -89,7 +89,10 @@ pub enum JobKind {
     /// The workspace's custom emoji names, for the reaction picker.
     EmojiList,
     /// The channels muted in Slack itself.
-    MutedChannels,
+    MutedChannels {
+        gen: u64,
+    },
+    SetMuted,
 }
 
 pub enum Done {
@@ -117,6 +120,11 @@ pub enum Done {
     Left,
     EmojiList(crate::custom_emoji::Catalog),
     MutedChannels(Vec<String>),
+    MuteChanged {
+        cid: String,
+        muted: bool,
+        ids: Vec<String>,
+    },
 }
 
 pub struct Job {
@@ -484,9 +492,21 @@ pub fn api_emoji_list(client: Arc<Client>) -> Job {
     })
 }
 
-pub fn api_muted_channels(client: Arc<Client>) -> Job {
-    spawn(JobKind::MutedChannels, String::new(), move || {
+pub fn api_muted_channels(client: Arc<Client>, gen: u64) -> Job {
+    spawn(JobKind::MutedChannels { gen }, String::new(), move || {
         Ok(Done::MutedChannels(client.muted_channels()?))
+    })
+}
+
+pub fn api_set_muted(client: Arc<Client>, cid: String, muted: bool) -> Job {
+    let label = if muted {
+        "muting in Slack"
+    } else {
+        "unmuting in Slack"
+    };
+    spawn(JobKind::SetMuted, label.into(), move || {
+        let ids = client.set_muted(&cid, muted)?;
+        Ok(Done::MuteChanged { cid, muted, ids })
     })
 }
 
@@ -710,4 +730,22 @@ mod tests {
         assert_eq!(id_to_ts(1782927057158059), "1782927057.158059");
         assert_eq!(id_to_ts(1782927057000009), "1782927057.000009");
     }
+}
+
+#[cfg(test)]
+pub fn completed_job(kind: JobKind, result: Result<Done, String>) -> Job {
+    let (tx, rx) = mpsc::channel();
+    tx.send(result).unwrap();
+    Job {
+        kind,
+        label: String::new(),
+        started: Instant::now(),
+        rx,
+    }
+}
+
+#[cfg(test)]
+pub fn pending_job(kind: JobKind) -> (Job, mpsc::Sender<Result<Done, String>>) {
+    let (sender, rx) = mpsc::channel();
+    (Job { kind, label: String::new(), started: Instant::now(), rx }, sender)
 }

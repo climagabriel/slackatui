@@ -11,6 +11,8 @@ use crate::auth::Auth;
 pub struct Client {
     agent: ureq::Agent,
     auth: Auth,
+    #[cfg(test)]
+    mock: Option<Box<dyn Fn(&str, &[(&str, &str)]) -> Result<Value, String> + Send + Sync>>,
 }
 
 /// What this client will carry in one upload; Slack's own limit is larger,
@@ -30,11 +32,22 @@ impl Client {
         Client {
             agent: agent(),
             auth,
+            #[cfg(test)]
+            mock: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(mock: impl Fn(&str, &[(&str, &str)]) -> Result<Value, String> + Send + Sync + 'static) -> Self {
+        let mut client = Self::new(Auth { token: String::new(), cookie: String::new(), source: "test".into() });
+        client.mock = Some(Box::new(mock));
+        client
     }
 
     /// One Web API call; the JSON on `ok`, the `error` field otherwise.
     pub fn call(&self, method: &str, params: &[(&str, &str)]) -> Result<Value, String> {
+        #[cfg(test)]
+        if let Some(mock) = &self.mock { return mock(method, params); }
         let url = format!("https://slack.com/api/{method}");
         for attempt in 0..2 {
             let mut resp = self
@@ -363,24 +376,13 @@ impl Client {
             .map(|_| ())
     }
 
-    /// Channel ids muted in Slack itself, from the notification preferences.
+    /// Server notification preferences; malformed responses must not clear the UI.
     pub fn muted_channels(&self) -> Result<Vec<String>, String> {
-        let v = self.call("users.prefs.get", &[])?;
-        let raw = v
-            .pointer("/prefs/all_notifications_prefs")
-            .and_then(Value::as_str)
-            .unwrap_or("{}");
-        let prefs: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
-        Ok(prefs
-            .pointer("/channels")
-            .and_then(Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .filter(|(_, v)| v.get("muted").and_then(Value::as_bool).unwrap_or(false))
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            })
-            .unwrap_or_default())
+        muted_ids(&self.call("users.prefs.get", &[("prefs", "all_notifications_prefs")])?)
+    }
+
+    pub fn set_muted(&self, cid: &str, muted: bool) -> Result<Vec<String>, String> {
+        update_mute(cid, muted, |method, params| self.call(method, params))
     }
 
     /// The workspace's custom emoji image URLs and aliases.
@@ -396,6 +398,70 @@ impl Client {
     pub fn counts(&self) -> Result<Value, String> {
         self.call("client.counts", &[("thread_counts_by_channel", "false")])
     }
+}
+
+fn muted_ids(response: &Value) -> Result<Vec<String>, String> {
+    let raw = response
+        .pointer("/prefs/all_notifications_prefs")
+        .ok_or("users.prefs.get: missing notification preferences")?;
+    let parsed;
+    let prefs = if let Some(text) = raw.as_str() {
+        parsed = serde_json::from_str::<Value>(text)
+            .map_err(|_| "users.prefs.get: invalid notification preferences JSON")?;
+        &parsed
+    } else {
+        raw
+    };
+    let channels = prefs
+        .get("channels")
+        .and_then(Value::as_object)
+        .ok_or("users.prefs.get: missing channels in notification preferences")?;
+    let mut ids = Vec::new();
+    for (id, settings) in channels {
+        if !settings.is_object() {
+            return Err("users.prefs.get: invalid conversation preference".into());
+        }
+        match settings.get("muted") {
+            Some(Value::Bool(true)) => ids.push(id.clone()),
+            Some(Value::Bool(false)) | None => {}
+            _ => return Err("users.prefs.get: invalid muted flag".into()),
+        }
+    }
+    Ok(ids)
+}
+
+/// Set one override, then independently read it back. Never upload the whole prefs object.
+fn update_mute(
+    cid: &str,
+    muted: bool,
+    mut call: impl FnMut(&str, &[(&str, &str)]) -> Result<Value, String>,
+) -> Result<Vec<String>, String> {
+    if cid.len() < 2
+        || !cid.starts_with(['C', 'D', 'G'])
+        || !cid
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return Err("mute: invalid conversation ID".into());
+    }
+    call(
+        "users.prefs.setNotifications",
+        &[
+            ("channel_id", cid),
+            ("name", "muted"),
+            ("value", if muted { "true" } else { "false" }),
+            ("global", "false"),
+            ("sync", "false"),
+        ],
+    )?;
+    let response = call("users.prefs.get", &[("prefs", "all_notifications_prefs")])
+        .map_err(|error| format!("mute update accepted, but verification failed: {error}"))?;
+    let ids = muted_ids(&response)
+        .map_err(|error| format!("mute update accepted, but verification failed: {error}"))?;
+    if ids.iter().any(|id| id == cid) != muted {
+        return Err("Slack has not confirmed the requested mute state; preferences will be rechecked".into());
+    }
+    Ok(ids)
 }
 
 /// `https://x.slack.com/archives/C123/p1788423554556689` -> (C123, 1788423554.556689).
@@ -430,5 +496,70 @@ mod tests {
             None
         );
         assert_eq!(parse_permalink("https://example.com/x"), None);
+    }
+    #[test]
+    fn mute_writes_one_override_and_checks_the_server() {
+        use super::update_mute;
+        use serde_json::json;
+        for (cid, muted) in [("C123", true), ("D123", false), ("G123", true)] {
+            let mut calls = 0;
+            let ids=update_mute(cid,muted,|method,params|{
+                calls+=1;
+                if calls==1 {
+                    assert_eq!(method,"users.prefs.setNotifications");
+                    assert_eq!(params,&[("channel_id",cid),("name","muted"),("value",if muted{"true"}else{"false"}),("global","false"),("sync","false")]);
+                    Ok(json!({"ok":true}))
+                } else {
+                    assert_eq!(method,"users.prefs.get");
+                    assert_eq!(params,&[("prefs","all_notifications_prefs")]);
+                    Ok(json!({"prefs":{"all_notifications_prefs":json!({"channels":{cid:{"muted":muted},"COTHER":{"muted":true,"desktop":"all"}}}).to_string()}}))
+                }
+            }).unwrap();
+            assert_eq!(calls, 2);
+            assert!(ids.contains(&"COTHER".into()));
+            assert_eq!(ids.iter().any(|id| id == cid), muted);
+        }
+    }
+    #[test]
+    fn mute_rejects_failed_writes_unverified_updates_and_invalid_preferences() {
+        use super::{muted_ids, update_mute};
+        use serde_json::json;
+        assert!(update_mute("bad/id", true, |_, _| panic!(
+            "invalid id must not reach Slack"
+        ))
+        .is_err());
+        let mut calls = 0;
+        let result = update_mute("C1", true, |_, _| {
+            calls += 1;
+            Err("write denied".into())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result.unwrap_err(), "write denied");
+        let result = update_mute("C1", true, |method, _| {
+            if method == "users.prefs.get" {
+                Err("offline".into())
+            } else {
+                Ok(json!({"ok":true}))
+            }
+        });
+        assert!(result.unwrap_err().contains("verification failed"));
+        let result = update_mute("C1", true, |_, _| {
+            Ok(json!({"prefs":{"all_notifications_prefs":{"channels":{}}}}))
+        });
+        assert!(result.unwrap_err().contains("not confirmed"));
+        for bad in [
+            json!({}),
+            json!({"prefs":{"all_notifications_prefs":"not json"}}),
+            json!({"prefs":{"all_notifications_prefs":{"channels":{"C1":{"muted":"true"}}}}}),
+        ] {
+            assert!(muted_ids(&bad).is_err());
+        }
+        assert_eq!(
+            muted_ids(
+                &json!({"prefs":{"all_notifications_prefs":{"channels":{"C1":{"desktop":"all"}}}}})
+            )
+            .unwrap(),
+            Vec::<String>::new()
+        );
     }
 }
