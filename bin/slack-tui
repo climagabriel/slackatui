@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# maturity: low; issues-found: 2
+# maturity: low; issues-found: 3
 # slack-tui - front door for libexec/slack-tui, a Rust crate. Builds it on
 # first use into the user's cache and execs the binary; rebuilds when the
 # source changes (checksum), so a plugin update takes effect on the next run.
@@ -75,8 +75,8 @@ launcher flags
                       no stripping or optimization, and unwind panics;
                       launch with RUST_BACKTRACE=full and imply --verbose
                       Takes precedence over --build/--rebuild when combined.
-  --verbose, -v       synonyms; show the launcher decision and cargo output
-                      when building; do not force a rebuild
+  --verbose, -v       synonyms; also report reuse of a cached binary;
+                      do not force a rebuild
   --help, -h          show combined help without checking cargo or building
 
 argument boundary
@@ -85,10 +85,10 @@ argument boundary
   application argument that matches a launcher flag.
 
 environment
-  SLACK_TUI_REBUILD=1  force the build step without enabling verbose output;
-                       command-line verbosity still applies
+  SLACK_TUI_REBUILD=1  force the build step; builds always show Cargo output
   XDG_CACHE_HOME       build cache: $XDG_CACHE_HOME/slack-tui;
                        default: $HOME/.cache/slack-tui
+  Builds announce their reason and show Cargo progress on stderr.
   Debug binary and checksum are cached separately from release. A plain
   slack-tui invocation still launches release.
 
@@ -134,7 +134,10 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 mkdir --parents "$cache"
 exec {build_lock}>"$cache/build.lock"
-flock --exclusive "$build_lock"
+if ! flock --exclusive --nonblock "$build_lock"; then
+    echo "slack-tui: waiting for another build or cache operation..." >&2
+    flock --exclusive "$build_lock"
+fi
 if ((prune_build_cache)); then
     if [[ -L "$cache/target" || ( -e "$cache/target" && ! -d "$cache/target" ) ]]; then
         echo "slack-tui: refusing to prune non-directory or symlink $cache/target" >&2
@@ -202,12 +205,10 @@ elif [[ "$cached_sum" != "$sum" ]]; then
     build_reason="source changed"
 fi
 
-if ((verbose)); then
-    if ((needs_build)); then
-        echo "slack-tui: building ($build_reason)..." >&2
-    else
-        echo "slack-tui: $build_reason; using $bin" >&2
-    fi
+if ((needs_build)); then
+    echo "slack-tui: building ($build_reason)..." >&2
+elif ((verbose)); then
+    echo "slack-tui: $build_reason; using $bin" >&2
 fi
 
 if ((needs_build)); then
@@ -227,9 +228,6 @@ if ((needs_build)); then
         --manifest-path "$src/Cargo.toml"
         --target-dir "$cache/target"
     )
-    if ((!verbose)); then
-        cargo_arguments+=(--quiet)
-    fi
     cargo "${cargo_arguments[@]}"
     # A running instance keeps the old file busy; a rename replaces the entry
     # under it instead of failing with "Text file busy".

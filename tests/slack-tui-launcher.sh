@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # maturity: low; issues-found: 0
 set -euo pipefail
-unset XDG_CACHE_HOME SLACK_TUI_REBUILD
+unset XDG_CACHE_HOME SLACK_TUI_REBUILD SLACK_TUI_FAKE_BUILD_FAILURE
 
 plugin_root=$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 launcher=$plugin_root/bin/slack-tui
@@ -60,6 +60,10 @@ fi
 if ((!quiet)); then
     echo "fake cargo: verbose $command output" >&2
 fi
+if [[ "$command" == build && "${SLACK_TUI_FAKE_BUILD_FAILURE:-0}" == 1 ]]; then
+    echo 'fake cargo: build failed' >&2
+    exit 42
+fi
 mkdir --parents "$target_dir/$build_directory"
 if [[ "$command" == clean ]]; then
     rm --force "$target_dir/$build_directory/slack-tui"
@@ -84,16 +88,26 @@ test_home=$test_root/home
 stdout=$test_root/stdout
 stderr=$test_root/stderr
 
-# An ordinary first run builds quietly and passes every application argument
+# An ordinary first run announces the build and shows Cargo progress and passes every application argument
 # unchanged, including an argument containing whitespace.
 HOME=$test_home PATH=$test_path "$launcher" \
     --channel '#zero-member-test' 'two words' > "$stdout" 2> "$stderr"
 [[ ! -s "$stdout" ]]
-[[ ! -s "$stderr" ]]
-grep --fixed-strings --quiet '[--quiet]' "$cargo_argument_log"
+grep --fixed-strings --quiet 'slack-tui: building (' "$stderr"
+grep --fixed-strings --quiet 'fake cargo: verbose build output' "$stderr"
+if grep --fixed-strings --quiet '[--quiet]' "$cargo_argument_log"; then
+    echo 'ordinary build unexpectedly made cargo quiet' >&2
+    exit 1
+fi
 printf '%s\n' '[--channel]' '[#zero-member-test]' '[two words]' \
     > "$test_root/expected-application-arguments"
 cmp "$test_root/expected-application-arguments" "$application_argument_log"
+[[ $(head -1 "$stderr") == 'slack-tui: building (first run)...' ]]
+printf 'outdated\n' > "$test_home/.cache/slack-tui/source.sha256"
+: > "$cargo_argument_log"
+HOME=$test_home PATH=$test_path "$launcher" --list > "$stdout" 2> "$stderr"
+[[ $(head -1 "$stderr") == 'slack-tui: building (source changed)...' ]]
+grep --fixed-strings --quiet 'fake cargo: verbose build output' "$stderr"
 
 # A current cached binary is silent and does not call cargo.
 : > "$cargo_argument_log"
@@ -163,14 +177,31 @@ printf '%s\n' '[--build]' '[-v]' '[--list]' \
     > "$test_root/expected-application-arguments"
 cmp "$test_root/expected-application-arguments" "$application_argument_log"
 
-# The legacy environment rebuild stays quiet.
+# The environment rebuild also announces progress.
 : > "$cargo_argument_log"
 : > "$application_argument_log"
 HOME=$test_home PATH=$test_path SLACK_TUI_REBUILD=1 "$launcher" --list \
     > "$stdout" 2> "$stderr"
 [[ ! -s "$stdout" ]]
-[[ ! -s "$stderr" ]]
-grep --fixed-strings --quiet '[--quiet]' "$cargo_argument_log"
+grep --fixed-strings --quiet 'slack-tui: building (' "$stderr"
+grep --fixed-strings --quiet 'fake cargo: verbose build output' "$stderr"
+if grep --fixed-strings --quiet '[--quiet]' "$cargo_argument_log"; then
+    echo 'ordinary build unexpectedly made cargo quiet' >&2
+    exit 1
+fi
+
+# A failing build keeps the cached binary/stamp and never launches it.
+cp "$test_home/.cache/slack-tui/source.sha256" "$test_root/stamp-before-failure"
+cp "$test_home/.cache/slack-tui/bin/slack-tui" "$test_root/binary-before-failure"
+: > "$application_argument_log"
+failure_status=0
+HOME=$test_home PATH=$test_path SLACK_TUI_REBUILD=1 SLACK_TUI_FAKE_BUILD_FAILURE=1 \
+    "$launcher" --list > "$stdout" 2> "$stderr" || failure_status=$?
+[[ "$failure_status" == 42 ]]
+[[ ! -s "$application_argument_log" ]]
+grep --fixed-strings --quiet 'fake cargo: build failed' "$stderr"
+cmp "$test_root/stamp-before-failure" "$test_home/.cache/slack-tui/source.sha256"
+cmp "$test_root/binary-before-failure" "$test_home/.cache/slack-tui/bin/slack-tui"
 
 # Help reads current application help from the source without cargo, a cached
 # binary, or cache mutation.
@@ -268,7 +299,8 @@ flock --exclusive "$held_lock"
 lock_status=0
 HOME=$test_home PATH=$test_path timeout 1 "$launcher" --build-cache-prune > "$stdout" 2> "$stderr" || lock_status=$?
 [[ "$lock_status" == 124 ]]
-[[ ! -s "$stdout" && ! -s "$stderr" ]]
+[[ ! -s "$stdout" ]]
+grep --fixed-strings --quiet 'waiting for another build or cache operation' "$stderr"
 flock --unlock "$held_lock"
 exec {held_lock}>&-
 HOME=$test_home PATH=$test_path "$launcher" --build-cache-prune --help > "$stdout" 2> "$stderr"
