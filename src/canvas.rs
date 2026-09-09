@@ -29,6 +29,7 @@ pub struct Section {
 }
 #[derive(Clone, Debug)]
 pub struct Document {
+    pub html: String,
     pub permalink: String,
     pub id: String,
     pub title: String,
@@ -52,6 +53,26 @@ struct Tab {
 }
 fn string(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").into()
+}
+
+fn escape_markdown(text: &str) -> String {
+    let mut escaped = String::new();
+    for c in text.chars() {
+        if "\\`*_[]<>!#+-.=|~".contains(c) { escaped.push('\\'); }
+        escaped.push(c);
+    }
+    escaped
+}
+
+fn table_cell(text: &str) -> String {
+    let mut escaped = String::new();
+    let mut slashes = 0;
+    for c in text.chars() {
+        if c == '|' && slashes % 2 == 0 { escaped.push('\\'); }
+        escaped.push(c);
+        slashes = if c == '\\' { slashes + 1 } else { 0 };
+    }
+    escaped
 }
 
 // Convert only supported sections for editing. Unknown structures remain readable.
@@ -78,16 +99,20 @@ fn markdown(element: ElementRef<'_>, safe: &mut bool) -> String {
         *safe = false;
         let rows = Selector::parse("tr").unwrap();
         let cells = Selector::parse("th, td").unwrap();
-        return element
-            .select(&rows)
-            .map(|row| {
-                row.select(&cells)
-                    .map(|cell| cell.text().collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rows = element.select(&rows).map(|row| {
+            row.select(&cells).map(|cell| {
+                table_cell(&markdown(cell, safe)).replace('\n', " ")
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut output = String::new();
+        for (index, row) in rows.iter().enumerate() {
+            let mut row = row.clone();
+            row.resize(columns, String::new());
+            output.push_str(&format!("| {} |\n", row.join(" | ")));
+            if index == 0 { output.push_str(&format!("| {} |\n", vec!["---"; columns].join(" | "))); }
+        }
+        return output;
     }
 
     if name == "code" || name == "pre" {
@@ -114,12 +139,7 @@ fn markdown(element: ElementRef<'_>, safe: &mut bool) -> String {
     }
     for child in element.children() {
         if let Some(text) = child.value().as_text() {
-            for c in text.chars() {
-                if "\\`*_[]<>!#+-.=|~".contains(c) {
-                    content.push('\\');
-                }
-                content.push(c);
-            }
+            content.push_str(&escape_markdown(text));
         } else if let Some(child) = ElementRef::wrap(child) {
             content.push_str(&markdown(child, safe));
         }
@@ -132,6 +152,7 @@ fn markdown(element: ElementRef<'_>, safe: &mut bool) -> String {
         "h1" => format!("# {content}"),
         "h2" => format!("## {content}"),
         "h3" => format!("### {content}"),
+        "h4" | "h5" | "h6" => { *safe = false; format!("#### {content}") },
         "lnk" | "a" => {
             if let Some(url) = element.value().attr("href") {
                 format!(
@@ -158,17 +179,16 @@ fn markdown(element: ElementRef<'_>, safe: &mut bool) -> String {
         }
         "p" | "span" | "control" => content,
         "li" => {
-            let prefix = if element
-                .parent()
-                .and_then(ElementRef::wrap)
-                .is_some_and(|e| e.value().name() == "ol")
-            {
-                "1. "
-            } else {
-                "- "
-            };
-            format!("{prefix}{}", content.trim_end().replace('\n', "\n  "))
+            let parent = element.parent().and_then(ElementRef::wrap);
+            let prefix = if let Some(parent) = parent.filter(|e| e.value().name() == "ol") {
+                let start = parent.value().attr("start").and_then(|v| v.parse::<u64>().ok()).unwrap_or(1);
+                let position = parent.children().filter_map(ElementRef::wrap).filter(|e| e.value().name() == "li").position(|e| e.id() == element.id()).unwrap_or(0);
+                format!("{}. ", start.saturating_add(position as u64))
+            } else { "- ".into() };
+            format!("{prefix}{}\n", content.trim_end().replace('\n', "\n  "))
         }
+        "ul" | "ol" => { *safe = false; format!("\n{content}") }
+
         "blockquote" => content
             .lines()
             .map(|s| format!("> {s}"))
@@ -231,7 +251,7 @@ fn collect_sections(parent: ElementRef<'_>, inherited_safe: bool, sections: &mut
             if let Some(text) = child.value().as_text().filter(|t| !t.trim().is_empty()) {
                 sections.push(Section {
                     id: String::new(),
-                    markdown: text.to_string(),
+                    markdown: escape_markdown(text),
                     display: text.to_string(),
                     original: text.to_string(),
                     editable: false,
@@ -298,6 +318,7 @@ pub fn parse_document(file: &Value, html: &str) -> Result<Document, String> {
     let mut sections = Vec::new();
     collect_sections(root, true, &mut sections);
     Ok(Document {
+        html: html.into(),
         permalink: string(file, "permalink"),
         id: string(file, "id"),
         title: string(file, "title"),
@@ -692,7 +713,10 @@ pub struct Browser {
     document: Option<Document>,
     history: Option<crate::canvas_history::History>,
     section: usize,
-    document_rows: Vec<(usize, String)>,
+    document_rows: Vec<(usize, Line<'static>)>,
+    raw_scroll: Option<usize>,
+    raw_rows: usize,
+    page_height: usize,
     draft: Option<Draft>,
     job: Option<Job>,
     notice: String,
@@ -703,7 +727,7 @@ impl Browser {
     pub fn log_state(&self) -> Value {
         serde_json::json!({"channel":self.channel,"tab_cursor":self.cursor,"entry_cursor":self.entry_cursor,
             "entry_scroll":self.entry_scroll,"entries":self.entries.as_ref().map(Vec::len),"canvas":self.document.as_ref().map(|d|&d.id),
-            "section":self.section,"editing":self.draft.is_some(),"insert":self.draft.as_ref().is_some_and(|d|d.insert),
+            "section":self.section,"raw_html":self.raw_scroll.is_some(),"editing":self.draft.is_some(),"insert":self.draft.as_ref().is_some_and(|d|d.insert),
             "command":self.draft.as_ref().is_some_and(|d|d.command.is_some()),"history":self.history.is_some(),
             "picture":self.picture.as_ref().map(|p|&p.file.id),"loading":self.job.is_some()})
     }
@@ -751,6 +775,9 @@ impl Browser {
             history: None,
             section: 0,
             document_rows: vec![],
+            raw_scroll: None,
+            raw_rows: 0,
+            page_height: 1,
             draft: None,
             job: Some(spawn(move || load_tabs(&api, &cid).map(Loaded::Tabs))),
             notice: "Loading channel tabs…".into(),
@@ -781,6 +808,8 @@ impl Browser {
                 }
                 Ok(Loaded::Canvas(doc)) => {
                     self.document = Some(doc);
+                    self.document_rows.clear();
+                    self.raw_scroll = None;
                     self.section = 0;
                 }
                 Ok(Loaded::Saved(doc, close)) => {
@@ -907,6 +936,20 @@ impl Browser {
             }
             return;
         }
+        if let Some(scroll) = &mut self.raw_scroll {
+            let step = (self.page_height / 2).max(1);
+            match key.code {
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.raw_scroll = None,
+                KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1).min(self.raw_rows.saturating_sub(1)),
+                KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                KeyCode::Char('f') | KeyCode::PageDown => *scroll = scroll.saturating_add(step).min(self.raw_rows.saturating_sub(1)),
+                KeyCode::Char('b') | KeyCode::PageUp => *scroll = scroll.saturating_sub(step),
+                KeyCode::Char('g') | KeyCode::Home => *scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => *scroll = self.raw_rows.saturating_sub(1),
+                _ => {}
+            }
+            return;
+        }
         if key.code == KeyCode::Char('H') && self.document.is_some() {
             self.history = Some(crate::canvas_history::History::default());
             self.load_history(None);
@@ -965,11 +1008,17 @@ impl Browser {
                 *cursor = (*cursor + 1).min(count.saturating_sub(1))
             }
             KeyCode::Char('k') | KeyCode::Up => *cursor = cursor.saturating_sub(1),
+            KeyCode::Char('f') | KeyCode::PageDown => *cursor = cursor.saturating_add((self.page_height / 2).max(1)).min(count.saturating_sub(1)),
+            KeyCode::Char('b') | KeyCode::PageUp => *cursor = cursor.saturating_sub((self.page_height / 2).max(1)),
             KeyCode::Char('g') | KeyCode::Home => *cursor = 0,
             KeyCode::Char('G') | KeyCode::End => *cursor = count.saturating_sub(1),
             _ => {}
         }
         if let Some(doc) = &self.document {
+            if matches!(key.code, KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter) {
+                self.raw_scroll = Some(0);
+                return;
+            }
             if key.code == KeyCode::Char('i') {
                 if !doc.writable {
                     self.notice = "Canvas is read-only".into();
@@ -1058,6 +1107,7 @@ impl Browser {
         if let Some(history) = &self.history {
             title.push_str(if history.details { " · edit history · revision details" } else { " · edit history" });
         }
+        if self.raw_scroll.is_some() { title.push_str(" · raw HTML"); }
         title
     }
 
@@ -1075,6 +1125,7 @@ impl Browser {
             height: inner.height - 2,
             ..inner
         };
+        self.page_height = usize::from(body.height);
         let footer = Rect {
             y: inner.y + inner.height - 2,
             height: 2,
@@ -1090,8 +1141,10 @@ impl Browser {
             "+/- zoom · 0 fit · m message · h back · Esc home · T hide".into()
         } else if let Some(history) = &self.history {
             if history.details { "j/k scroll · h back · Esc home · T hide".into() } else { "j/k select · l/Enter details/load older · r reload · h back · Esc home · T hide".into() }
+        } else if self.raw_scroll.is_some() {
+            "j/k lines · f/b half page · h formatted canvas · Esc home · T hide".into()
         } else if self.document.is_some() {
-            "j/k lines · i edit section · H edit history · h back · Esc home · T hide".into()
+            "j/k lines · f/b half page · l raw HTML · i edit section · H edit history · h back · Esc home · T hide".into()
         } else {
             "j/k select · l/Enter open · m message · h back · Esc home · T hide".into()
         };
@@ -1101,6 +1154,14 @@ impl Browser {
         frame.render_widget(Paragraph::new(format!("{hint}\n{status}")), footer);
         if let Some(history) = &mut self.history {
             history.draw(frame, body, palette, self.document.as_ref().map(|doc| doc.permalink.as_str()).unwrap_or(""));
+            return;
+        }
+        if let Some(scroll) = &mut self.raw_scroll {
+            let source = self.document.as_ref().map(|doc| doc.html.as_str()).unwrap_or("");
+            let rows = wrap_lines(source, usize::from(body.width));
+            self.raw_rows = rows.len();
+            *scroll = (*scroll).min(rows.len().saturating_sub(usize::from(body.height)));
+            frame.render_widget(Paragraph::new(rows.into_iter().skip(*scroll).take(usize::from(body.height)).map(Line::from).collect::<Vec<_>>()), body);
             return;
         }
         if self.picture.is_some() { return; }
@@ -1153,7 +1214,7 @@ impl Browser {
         let (rows, cursor) = if let Some(doc) = &self.document {
             self.document_rows.clear();
             for (index, section) in doc.sections.iter().enumerate() {
-                for row in wrap_lines(&section.display, body.width as usize) {
+                for row in crate::canvas_markdown::lines(&section.markdown, body.width as usize, palette) {
                     self.document_rows.push((index, row));
                 }
             }
@@ -1167,7 +1228,7 @@ impl Browser {
             )
         } else {
             (
-                self.tabs.iter().map(|t| t.label.clone()).collect(),
+                self.tabs.iter().map(|t| Line::from(t.label.clone())).collect(),
                 self.cursor,
             )
         };
@@ -1506,6 +1567,9 @@ mod tests {
             history: None,
             section: 0,
             document_rows: vec![],
+            raw_scroll: None,
+            raw_rows: 0,
+            page_height: 1,
             draft: None,
             job: None,
             notice: String::new(),
@@ -1540,9 +1604,54 @@ mod tests {
         assert!(!b.visible);
     }
     #[test]
+    fn formatted_tables_and_loose_text_preserve_literals() {
+        let doc = parse_document(&json!({"id":"F1"}), r#"<div class="quip-canvas-content"><table><tr><th>Heading</th></tr><tr><td><code>a|b</code> c|d</td><td>extra</td></tr></table><div>[reference]: /path</div><div>*literal*</div></div>"#).unwrap();
+        let text = doc.sections.iter().flat_map(|section| crate::canvas_markdown::lines(&section.markdown, 100, &Palette::default())).map(|line| crate::render::line_text(&line)).collect::<String>();
+        for literal in ["a|b", "c|d", "extra", "[reference]: /path", "*literal*"] { assert!(text.contains(literal), "{literal}: {text}"); }
+        assert!(doc.sections.iter().all(|section| !section.editable));
+    }
+
+    #[test]
+    fn formatted_canvas_raw_navigation_and_edit_target() {
+        let html = format!(r#"<div class="quip-canvas-content"><h1 id="title">Heading</h1><p id="body"><strong>Bold</strong> and <em>italic</em> text</p><pre id="code">{}</pre></div>"#, "abcdefghij\n".repeat(20));
+        let mut browser = browser();
+        browser.document = Some(parse_document(&json!({"id":"F1","editable":true}), &html).unwrap());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80,12)).unwrap();
+        let palette = Palette::default();
+        terminal.draw(|f| browser.draw(f, f.area(), &palette)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(buffer.content.iter().any(|c| c.symbol() == "H" && c.modifier.contains(Modifier::BOLD)));
+        browser.key(key('j'));
+        let selected = browser.section;
+        browser.key(key('l'));
+        terminal.draw(|f| browser.draw(f, f.area(), &palette)).unwrap();
+        assert_eq!(browser.document.as_ref().unwrap().html, html);
+        assert!(browser.title().ends_with("raw HTML"));
+        let text: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("<h1 id="));
+        browser.key(key('f'));
+        assert!(browser.raw_scroll.unwrap() > 1);
+        browser.key(key('b'));
+        assert_eq!(browser.raw_scroll, Some(0));
+        browser.key(key('G'));
+        terminal.draw(|f| browser.draw(f, f.area(), &palette)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("</pre></div>"));
+        browser.key(key('i'));
+        assert!(browser.draft.is_none());
+        browser.key(key('h'));
+        assert!(browser.raw_scroll.is_none());
+        assert_eq!(browser.section, selected);
+        terminal.draw(|f| browser.draw(f, f.area(), &palette)).unwrap();
+        browser.key(key('i'));
+        assert_eq!(browser.draft.as_ref().unwrap().section.id, "body");
+        assert!(browser.draft.as_ref().unwrap().editor.text.contains("**Bold**"));
+    }
+
+    #[test]
     fn narrow_render_keeps_all_canvas_lines_reachable() {
         let mut b = browser();
-        b.document.as_mut().unwrap().sections[0].display = "世界".repeat(60);
+        b.document.as_mut().unwrap().sections[0].markdown = "世界".repeat(60);
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -1553,7 +1662,7 @@ mod tests {
             .document_rows
             .iter()
             .filter(|r| r.0 == 0)
-            .map(|r| r.1.as_str())
+            .map(|r| crate::render::line_text(&r.1))
             .collect::<String>();
         assert_eq!(reconstructed, "世界".repeat(60));
         b.key(key('G'));
