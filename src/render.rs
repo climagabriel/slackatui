@@ -1250,6 +1250,27 @@ fn human_bytes(n: i64) -> String {
     }
 }
 
+/// The `[kind] name (filetype, size)` line a file gets in a message, directly
+/// above the rows reserved for its image. Shared with the collapsed preview in
+/// `app.rs`, which shows it in place of a reserved row it kept but whose image
+/// it dropped, so both paths name a file identically.
+pub fn file_label(f: &FileInfo) -> Line<'static> {
+    let kind = match f.mode.as_str() {
+        "snippet" => "snippet",
+        "quip" => "canvas",
+        _ => "file",
+    };
+    let mut s = format!("  [{kind}] {}", f.name);
+    if !f.filetype.is_empty() {
+        s.push_str(&format!(" ({}", f.filetype));
+        if let Some(n) = f.size {
+            s.push_str(&format!(", {}", human_bytes(n)));
+        }
+        s.push(')');
+    }
+    Line::from(Span::styled(s, Style::new().add_modifier(Modifier::DIM)))
+}
+
 /// One message as lines: header, wrapped body, files, reactions, thread
 /// footer. `in_thread` drops the footer (the replies are on screen).
 pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i64) -> Rendered {
@@ -1337,20 +1358,7 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i
     lines.extend(wrap(&body(m, ctx), width, "  ", ctx.palette));
     let body_end = lines.len();
     for f in m.files() {
-        let kind = match f.mode.as_str() {
-            "snippet" => "snippet",
-            "quip" => "canvas",
-            _ => "file",
-        };
-        let mut s = format!("  [{kind}] {}", f.name);
-        if !f.filetype.is_empty() {
-            s.push_str(&format!(" ({}", f.filetype));
-            if let Some(n) = f.size {
-                s.push_str(&format!(", {}", human_bytes(n)));
-            }
-            s.push(')');
-        }
-        lines.push(Line::from(Span::styled(s, dim)));
+        lines.push(file_label(&f));
         if let Some(font) = ctx.image_font {
             if let Some((cols, rows)) = image_cells(&f, font, width) {
                 images.push(ImageSlot {

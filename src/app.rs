@@ -213,7 +213,19 @@ impl MsgList {
                 // how it starts. Everything between them is the count.
                 let last_row = rendered.lines.len() - 1;
                 let hidden = last_row - 1;
-                let tail = rendered.lines.pop().expect("a collapsed message has lines");
+                let mut tail = rendered.lines.pop().expect("a collapsed message has lines");
+                // A message ending inside a taller-than-one-row image keeps one
+                // of that image's blank reserved rows as the preview's last
+                // line, and the retain below drops the image itself: the
+                // preview would end on nothing. Name the file there instead,
+                // with the label an uncollapsed render puts above those rows.
+                if let Some(slot) = rendered.images.iter().find(|slot| {
+                    slot.rows > 1
+                        && (slot.line..slot.line + usize::from(slot.rows)).contains(&last_row)
+                }) {
+                    let render::ImageSource::File(f) = &slot.source;
+                    tail = render::file_label(f);
+                }
                 rendered.lines.truncate(1);
                 rendered.lines.push(Line::from(format!("  ... ({hidden} more lines)")));
                 rendered.lines.push(tail);
@@ -6283,12 +6295,33 @@ pub(crate) mod tests {
         assert_eq!(list.collapsed, vec![false]);
         assert_eq!(list.flat[list.first[0] + 1 + 22].image.as_ref().unwrap().line, 22);
         // 800x800 is 14 rows tall, so it starts on a row the preview hides and
-        // would paint over the elision and the message below it.
-        let mut list = MsgList::new(vec![with_image(800, 800)], false);
+        // would paint over the elision and the message below it. The last row
+        // is one of its reserved blanks, so the preview names the file there
+        // with the label an uncollapsed render puts above those rows.
+        let tall = with_image(800, 800);
+        let mut list = MsgList::new(vec![tall.clone()], false);
         list.rebuild_for_pane(&context, 120, 24);
         assert_eq!(list.collapsed, vec![true]);
         assert!(list.flat.iter().all(|line| line.image.is_none()));
         assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  ... (34 more lines)");
+        let label = render::file_label(&tall.files()[0]).to_string();
+        assert_eq!(label, "  [file] wide.png (png)");
+        assert_eq!(list.flat[list.first[0] + 3].line.to_string(), label);
+        // The same label is what the uncollapsed render shows above the image.
+        list.rebuild_for_pane(&context, 120, 100);
+        assert_eq!(list.collapsed, vec![false]);
+        assert_eq!(list.flat[list.first[0] + 1 + 21].line.to_string(), label);
+        // A plain attachment reserves no rows, so no slot exists to drop and
+        // the message's own last row is already the file line.
+        let mut list = MsgList::new(vec![Msg::from_api("C1".into(), json!({
+            "ts": "1.000000", "user": "U1",
+            "text": (0..20).map(|n| format!("body {n}")).collect::<Vec<_>>().join("\n"),
+            "files": [{"id": "F2", "name": "notes.txt", "filetype": "text", "size": 12}],
+        })).unwrap()], false);
+        list.rebuild_for_pane(&context, 120, 24);
+        assert_eq!(list.collapsed, vec![true]);
+        assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  ... (20 more lines)");
+        assert_eq!(list.flat[list.first[0] + 3].line.to_string(), "  [file] notes.txt (text, 12B)");
         // The smallest message that collapses: four rows, two of them hidden,
         // with the first and the last shown once each.
         let mut list = MsgList::new(vec![msg(1, "one\ntwo\nthree")], false);
