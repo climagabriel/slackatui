@@ -830,7 +830,10 @@ impl App {
         }
         if let Some(Command::Find(text)) = parse_command(line) {
             // A search half-typed is not a name filter: neither `from:@` nor
-            // `message:` says anything about the conversation names.
+            // `message:` says anything about the conversation names. Either
+            // prefix counts only once it is complete, so the letters of
+            // `message` filter the list until the `:` lands and restores it,
+            // exactly as `from:` does until its `@` arrives.
             if crate::author_search::has_author(&text) || crate::author_search::message_needle(&text).is_some() {
                 if let Mode::Prompt { previous, .. } = &self.mode { self.filter = previous.clone(); }
                 self.apply_filter(); return;
@@ -871,7 +874,9 @@ impl App {
                     self.run_archive_search(&text);
                 } else if across {
                     self.restore_filter(filter_before);
-                    if text.is_empty() {
+                    // A needle of blanks would scan every archive for nothing
+                    // and ask Slack for nothing; it is an empty needle.
+                    if text.trim().is_empty() {
                         self.status = "search what?".to_string();
                     } else {
                         self.run_archive_search(&text);
@@ -5968,7 +5973,8 @@ pub(crate) mod tests {
         app.corpus.me = Some("U1".into());
         app.corpus.merge_profiles(vec![json!({"id":"U1","name":"gabriel.clima"})]);
         app.merge_conversations(vec![json!({"id":"COTHER","name":"other-channel","is_member":true})]);
-        attach_archive(&mut app, "C1", &[(1, None, "nginx in one"), (3, Some(1), "nginx reply in one")]);
+        attach_archive(&mut app, "C1", &[(1, None, "nginx in one"), (3, Some(1), "nginx reply in one"),
+            (5, None, "a quoted foo bar phrase")]);
         attach_archive(&mut app, "COTHER", &[(2, None, "nginx over there"), (4, None, "nothing to see")]);
         let hits = |app: &App| -> Vec<String> {
             let Some(View::Search { list, .. }) = app.stack.last() else { panic!("no search view") };
@@ -6003,12 +6009,16 @@ pub(crate) mod tests {
         app.on_msg_key(Some(Action::Back));
         assert!(matches!(app.stack.last(), Some(View::Search { .. })));
 
-        // An empty needle asks rather than searching.
-        app.go_home();
-        app.run_command("/find message:", "");
-        assert_eq!(app.status, "search what?");
-        assert!(app.stack.is_empty());
-        assert_eq!(app.focus, Focus::Convs);
+        // An empty needle asks rather than searching, and a needle of blanks
+        // is an empty needle: quoted, it must not become a scan of everything.
+        for line in ["/find message:", "/find message:   ", "/find message: \"\"", "/find message: \"   \""] {
+            app.go_home();
+            app.run_command(line, "");
+            assert_eq!(app.status, "search what?", "{line}");
+            assert!(app.stack.is_empty(), "{line}");
+            assert!(app.job.is_none(), "{line}");
+            assert_eq!(app.focus, Focus::Convs, "{line}");
+        }
 
         // Typed live, the prefix never becomes a name filter.
         app.open_command();
@@ -6051,6 +6061,20 @@ pub(crate) mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1 nginx");
         assert!(app.status.contains("cached author matches"), "{}", app.status);
         assert_eq!(hits(&app).len(), 3);
+
+        // A quoted phrase keeps its quotes out of the needle and out of the
+        // Slack query when an author sits beside them.
+        for line in ["/find message: \"foo bar\" from:@me", "/find message: from:@me \"foo bar\""] {
+            app.go_home();
+            app.run_command(line, "");
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1 foo bar", "{line}");
+            assert_eq!(hits(&app), ["a quoted foo bar phrase"], "{line}");
+        }
+        // Blanks stay empty even with an author: that is an author search.
+        app.go_home();
+        app.run_command("/find message: \"  \" from:@me", "");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1");
+        assert_eq!(hits(&app).len(), 5);
     }
 
     #[test]

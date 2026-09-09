@@ -13,15 +13,30 @@ pub fn has_author(query: &str) -> bool {
 
 /// `message:` asks for a text search rather than a name filter. The needle is
 /// the rest of the line, with one pair of wrapping double quotes stripped, so
-/// `message: foo bar` and `message: "foo bar"` mean the same. A `from:@name`
-/// left in the remainder still parses: the two filters combine.
+/// `message: foo bar` and `message: "foo bar"` mean the same. The quotes wrap
+/// the phrase, not the line: a `from:@name` beside them is lifted out first,
+/// so `message: "foo bar" from:@me` searches `foo bar` for that author. The
+/// caller still gets that author back, at the end, for `parse` to resolve.
 pub fn message_needle(query: &str) -> Option<String> {
     let query = query.trim();
     let rest = query.get(..MESSAGE.len()).filter(|head| head.eq_ignore_ascii_case(MESSAGE)).map(|_| query[MESSAGE.len()..].trim())?;
-    Some(match rest.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).filter(|inner| !inner.contains('"')) {
-        Some(unquoted) => unquoted.to_string(),
-        None => rest.to_string(),
-    })
+    if !has_author(rest) { return Some(unquote(rest)); }
+    // Word order inside each group survives; `parse` joins the text the same
+    // way, so nothing is lost that the author path would have kept.
+    let (author, phrase): (Vec<&str>, Vec<&str>) =
+        rest.split_whitespace().partition(|word| word.to_lowercase().starts_with("from:@"));
+    let phrase = unquote(&phrase.join(" "));
+    Some(if phrase.is_empty() { author.join(" ") } else { format!("{phrase} {}", author.join(" ")) })
+}
+
+/// One pair of wrapping double quotes off, and the surrounding blanks with
+/// them: a needle of blanks is an empty needle, not a match-everything scan.
+fn unquote(text: &str) -> String {
+    let text = text.trim();
+    match text.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).filter(|inner| !inner.contains('"')) {
+        Some(unquoted) => unquoted.trim().to_string(),
+        None => text.to_string(),
+    }
 }
 
 pub const MESSAGE: &str = "message:";
@@ -81,8 +96,11 @@ mod tests {
         for query in ["message: foo bar", "message:foo bar", "  MESSAGE: \"foo bar\" ", "Message:\"foo bar\""] {
             assert_eq!(message_needle(query).as_deref(), Some("foo bar"), "{query}");
         }
-        assert_eq!(message_needle("message:").as_deref(), Some(""));
-        assert_eq!(message_needle("message: \"\"").as_deref(), Some(""));
+        // Blanks, quoted or not, are an empty needle rather than a scan of
+        // everything.
+        for query in ["message:", "message:   ", "message: \"\"", "message: \"   \"", "message:\" \""] {
+            assert_eq!(message_needle(query).as_deref(), Some(""), "{query}");
+        }
         assert_eq!(message_needle("message: \"foo\" \"bar\"").as_deref(), Some("\"foo\" \"bar\""));
         assert_eq!(message_needle("message: \"").as_deref(), Some("\""));
         assert_eq!(message_needle("message: foo from:@me").as_deref(), Some("foo from:@me"));
@@ -92,6 +110,20 @@ mod tests {
         let parsed = parse(&message_needle("message: foo from:@me").unwrap(), &[], Some("U1")).unwrap();
         assert_eq!(parsed.text, "foo");
         assert_eq!(parsed.slack, "from:U1 foo");
+        // The quotes wrap the phrase, so an author beside them, on either
+        // side, does not leave them in the needle.
+        for query in ["message: \"foo bar\" from:@me", "message: from:@me \"foo bar\"", "message:\"foo bar\" FROM:@me"] {
+            // The author token keeps the case it was typed in; `parse` folds it.
+            assert!(message_needle(query).unwrap().eq_ignore_ascii_case("foo bar from:@me"), "{query}");
+            let parsed = parse(&message_needle(query).unwrap(), &[], Some("U1")).unwrap();
+            assert_eq!(parsed.text, "foo bar", "{query}");
+            assert_eq!(parsed.user_id.as_deref(), Some("U1"), "{query}");
+            assert_eq!(parsed.slack, "from:U1 foo bar", "{query}");
+        }
+        // An author with no phrase of its own stays an author search.
+        assert_eq!(message_needle("message: from:@me").as_deref(), Some("from:@me"));
+        assert_eq!(message_needle("message: \"  \" from:@me").as_deref(), Some("from:@me"));
+        assert!(parse(&message_needle("message: \"a\" from:@me from:@U1").unwrap(), &[], Some("U1")).is_err());
         let text = text_query(" nginx ");
         assert!(text.user_id.is_none());
         assert_eq!((text.text.as_str(), text.slack.as_str()), ("nginx", "nginx"));
