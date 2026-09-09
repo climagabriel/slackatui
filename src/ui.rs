@@ -1122,7 +1122,9 @@ mod message_focus_tests {
         terminal.draw(|frame| draw_msgs(frame, &mut app, frame.area())).unwrap();
         let list = app.active_list().unwrap();
         let visible = list.first.iter().filter(|&&first| first >= list.scroll && first < list.scroll + 38).count();
-        assert_eq!(visible, 6);
+        // A collapsed message is five rows, so one more of them fits than when
+        // the preview carried two body rows and a separate count line.
+        assert_eq!(visible, 7);
         assert!(list.flat.len() - list.scroll >= 34);
         assert_eq!(list.cursor, 19);
         let selected_last = list.last[19] - list.scroll + 1;
@@ -1197,10 +1199,12 @@ mod message_focus_tests {
                 }
                 let preview: Vec<_> = list.flat[list.first[1]..=list.last[1]].iter().map(|line| line.line.to_string()).collect();
                 if height < 50 {
-                    assert_eq!(preview.len(), 6);
-                    assert!(preview[2].contains("body 0"));
-                    assert!(preview[3].contains("body 1"));
-                    assert!(preview[4].contains("(18 more lines)"));
+                    // Blank, the message's first row, the elision, its last
+                    // row, blank. 21 rendered rows, 19 of them hidden.
+                    assert_eq!(preview.len(), 5);
+                    assert!(preview[1].contains("UTC") && !preview[1].contains("body"));
+                    assert!(preview[2].contains("... (19 more lines)"));
+                    assert!(preview[3].contains("body 19"));
                 } else { assert!(preview.len() > 6); }
                 for (row, line) in list.flat.iter().enumerate().skip(list.scroll).take(height as usize - 2) {
                     if line.msg.is_none() && line.line.to_string().contains("new") {

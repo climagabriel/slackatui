@@ -208,11 +208,27 @@ impl MsgList {
                 && rendered.lines.len() > 3;
             self.collapsed.push(collapsed);
             if collapsed {
-                let remaining = rendered.lines.len() - 3;
-                rendered.lines.truncate(3);
-                rendered.lines.push(Line::from(format!("  ({remaining} more lines)")));
-                // Never paint a partial image over the preview or its count.
-                rendered.images.retain(|slot| slot.line + slot.rows as usize <= 3);
+                // Keep the message's own first and last rows around the
+                // elision, so a preview shows how the message ends as well as
+                // how it starts. Everything between them is the count.
+                let last_row = rendered.lines.len() - 1;
+                let hidden = last_row - 1;
+                let tail = rendered.lines.pop().expect("a collapsed message has lines");
+                rendered.lines.truncate(1);
+                rendered.lines.push(Line::from(format!("  ... ({hidden} more lines)")));
+                rendered.lines.push(tail);
+                // Slot lines index the truncated vec, so the surviving last row
+                // has to be readdressed to index 2. Only a one-row image on
+                // that row survives: anything taller reaches rows the preview
+                // dropped, and would paint over the elision or the next
+                // message.
+                rendered.images.retain_mut(|slot| {
+                    let keep = slot.line == last_row && slot.rows == 1;
+                    if keep {
+                        slot.line = 2;
+                    }
+                    keep
+                });
             }
             self.first.push(self.flat.len());
             self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
@@ -6205,8 +6221,13 @@ pub(crate) mod tests {
                     terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
                     let collapsed = height == 24;
                     assert_eq!(app.active_list().unwrap().collapsed, vec![collapsed]);
-                    assert_eq!(app.active_list().unwrap().flat.iter().any(|line|
-                        line.line.to_string().contains("more lines)")), collapsed);
+                    // 13 rendered rows: the header and 12 body rows. Collapsed,
+                    // the last one stays and the 11 between it and the header go.
+                    let list = app.active_list().unwrap();
+                    assert_eq!(list.flat.iter().filter(|line|
+                        line.line.to_string() == "  ... (11 more lines)").count(),
+                        usize::from(collapsed));
+                    assert_eq!(list.last[0] - list.first[0], if collapsed { 4 } else { 14 });
                     app.on_key(key(forward));
                     if collapsed {
                         assert!(app.active_list().unwrap().line_scroll);
@@ -6224,6 +6245,61 @@ pub(crate) mod tests {
                 assert!(app.job.is_none());
             }
         }
+    }
+
+    /// A collapsed message shows its own first and last rows around the
+    /// elision. The last row carries an image only when the whole image fits
+    /// on it, and the slot has to be readdressed to its new index.
+    #[test]
+    fn collapsed_preview_keeps_the_last_row_and_only_an_image_that_fits_it() {
+        let corpus = Corpus::stub(&[]);
+        let palette = Palette::default();
+        let context = Ctx { archive: None, corpus: &corpus, tz: Tz::Utc,
+            image_font: Some((8, 16)), last_read: None, palette: &palette };
+        let with_image = |width: u32, height: u32| {
+            Msg::from_api("C1".into(), json!({
+                "ts": "1.000000", "user": "U1",
+                "text": (0..20).map(|n| format!("body {n}")).collect::<Vec<_>>().join("\n"),
+                "files": [{"id": "F1", "name": "wide.png", "mimetype": "image/png",
+                    "filetype": "png", "original_w": width, "original_h": height}],
+            })).unwrap()
+        };
+        // 800x10 at an 8x16 font is one row tall, so it lands on the message's
+        // last row: header, 20 body rows, the file line, the image row.
+        let mut list = MsgList::new(vec![with_image(800, 10)], false);
+        list.rebuild_for_pane(&context, 120, 24);
+        assert_eq!(list.collapsed, vec![true]);
+        let rows: Vec<_> = list.flat[list.first[0]..=list.last[0]]
+            .iter().map(|line| line.line.to_string()).collect();
+        assert_eq!(rows.len(), 5); // blank, first, elision, last, blank.
+        assert!(rows[1].contains("UTC") && !rows[1].contains("body"));
+        assert_eq!(rows[2], "  ... (21 more lines)");
+        assert_eq!(rows[3], ""); // The image's reserved row.
+        let slot = list.flat[list.first[0] + 3].image.as_ref().expect("image kept");
+        assert_eq!((slot.line, slot.rows), (2, 1)); // Readdressed to the truncated vec.
+        assert!(list.flat.iter().filter(|line| line.image.is_some()).count() == 1);
+        // Uncollapsed, the same slot keeps its original index.
+        list.rebuild_for_pane(&context, 120, 100);
+        assert_eq!(list.collapsed, vec![false]);
+        assert_eq!(list.flat[list.first[0] + 1 + 22].image.as_ref().unwrap().line, 22);
+        // 800x800 is 14 rows tall, so it starts on a row the preview hides and
+        // would paint over the elision and the message below it.
+        let mut list = MsgList::new(vec![with_image(800, 800)], false);
+        list.rebuild_for_pane(&context, 120, 24);
+        assert_eq!(list.collapsed, vec![true]);
+        assert!(list.flat.iter().all(|line| line.image.is_none()));
+        assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  ... (34 more lines)");
+        // The smallest message that collapses: four rows, two of them hidden,
+        // with the first and the last shown once each.
+        let mut list = MsgList::new(vec![msg(1, "one\ntwo\nthree")], false);
+        list.rebuild_for_pane(&context, 120, 8);
+        assert_eq!(list.collapsed, vec![true]);
+        let rows: Vec<_> = list.flat[list.first[0]..=list.last[0]]
+            .iter().map(|line| line.line.to_string()).collect();
+        assert_eq!(rows.len(), 5);
+        assert!(rows[1].contains("UTC") && !rows[1].contains("one"));
+        assert_eq!(rows[2], "  ... (2 more lines)");
+        assert_eq!(rows[3], "  three");
     }
 
     #[test]
