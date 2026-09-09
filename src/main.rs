@@ -63,7 +63,7 @@ the conversations on the left, the messages of the selected one on the
 right. Enter on a message opens its thread; Esc returns home.
 l or Right opens the selected message's thread from the conversation.
 On a message without a thread, or inside a thread, it opens raw JSON unless
-the message is collapsed to two lines and a remaining-line count. Collapsed
+the message is collapsed to its first line, a hidden-line count and its last line. Collapsed
 messages open for line-by-line reading: j/k or Up/Down scroll one line, PageUp/PageDown scroll a page,
 Home/End reach its start/end. l or Right again for raw JSON.
 h/Left returns one level along the path you entered, ending at
