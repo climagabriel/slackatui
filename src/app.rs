@@ -2480,7 +2480,7 @@ impl App {
     /// Open a message's thread wherever it lives: this conversation, another
     /// archived one (switched to underneath the search view), or Slack.
     fn open_hit(&mut self, cid: String, root: i64, focus: i64) {
-        if matches!(self.stack.last(), Some(View::Saved { .. } | View::Feed { .. } | View::Search { .. })) {
+        if matches!(self.stack.last(), Some(View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. })) {
             self.open_thread_in(cid, root, focus);
             return;
         }
@@ -3068,7 +3068,7 @@ impl App {
         }
     }
 
-    /// Every thread the owner replied to or was mentioned in, newest reply
+    /// Every thread the owner took part in or was mentioned in, newest reply
     /// first, from the cache. Archive-wide: it opens no conversation, and the
     /// conversation cursor stays where it was.
     fn open_my_threads(&mut self) {
@@ -3101,7 +3101,7 @@ impl App {
             list: MsgList::new(roots, false),
         });
         self.focus = Focus::Msgs;
-        self.status = format!("{n} threads you replied to or were mentioned in, newest reply first");
+        self.status = format!("{n} threads you took part in or were mentioned in, newest reply first");
     }
 
     pub fn image_font(&self) -> Option<(u16, u16)> {
@@ -4050,7 +4050,7 @@ impl App {
                 )
             }
             Some(View::Threads { list }) => format!(
-                "threads you replied to or were mentioned in · {} · newest reply first",
+                "threads you took part in or were mentioned in · {} · newest reply first",
                 list.len()
             ),
             Some(View::Thread {
@@ -6228,7 +6228,7 @@ pub(crate) mod tests {
     }
 
     /// THREADS is the fourth top row and opens what Ctrl-T opens: the roots of
-    /// every cached thread the owner replied to or was mentioned in, newest
+    /// every cached thread the owner took part in or was mentioned in, newest
     /// reply first. Neither path opens a conversation or moves the sidebar
     /// cursor; selecting a row still opens that thread.
     #[test]
@@ -6251,11 +6251,28 @@ pub(crate) mod tests {
         assert_eq!(app.conv_cursor,cursor);
         assert_eq!(app.active_list().unwrap().msgs.iter().map(|m|m.id).collect::<Vec<_>>(),
             [5_000_000,3_000_000,1_000_000]);
-        assert!(app.status.contains("3 threads you replied to or were mentioned in"));
-        // Selecting a row opens that thread, as it did before the row existed.
+        assert!(app.status.contains("3 threads you took part in or were mentioned in"));
+        // The list is drawn with no conversation open: the messages pane must
+        // show the roots, not its "select a conversation" hint. State alone
+        // cannot tell the two apart.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        let screen = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, app: &mut App| {
+            terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height).map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(!drawn.contains("select a conversation"), "THREADS list not drawn:\n{drawn}");
+        assert!(drawn.contains("quiet root"));
+        // Selecting a row opens that thread over the list, as SAVED and
+        // MENTIONS do, still with no conversation open, and it draws too.
         app.on_msg_key(Some(Action::Open));
         assert!(matches!(app.stack.last(),Some(View::Thread {root:5_000_000,..})));
+        assert!(app.open.is_none());
         assert_eq!(app.selected().unwrap().text,"quiet root");
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(!drawn.contains("select a conversation"), "thread over THREADS not drawn:\n{drawn}");
+        assert!(drawn.contains("quiet root"));
         // Ctrl-T from the sidebar reaches the same list and leaves the
         // conversation under the cursor closed.
         app.escape_home();

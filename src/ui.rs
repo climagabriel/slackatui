@@ -323,7 +323,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         palette,
         ..
     } = app;
-    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Feed { .. } | View::Search { .. })) {
+    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. })) {
         let hint = Line::from(Span::styled(
             "  select a conversation and press Enter",
             Style::new().add_modifier(Modifier::DIM),
@@ -920,7 +920,7 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(Action::GoToDate, "go to a date (YYYY-MM-DD)"),
     HelpRow::Bound(Action::ChannelTabs, "channel tabs: canvases, files and bookmarks"),
-    HelpRow::Bound(Action::MyThreads, "threads you replied to or were mentioned in, newest reply first"),
+    HelpRow::Bound(Action::MyThreads, "threads you took part in or were mentioned in, newest reply first"),
     HelpRow::Bound(
         Action::Images,
         "the selected message's images, full pane; j/k between them",
