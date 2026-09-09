@@ -69,7 +69,7 @@ impl Action {
             Action::Keys => "this key editor",
             Action::ConversationsPane => "choose visible conversations",
             Action::GoToDate => "go to a date",
-            Action::MyThreads => "threads I took part in",
+            Action::MyThreads => "threads I replied to or was mentioned in",
             Action::ChannelTabs => "channel tabs and canvases",
             Action::UnreadsFirst => "unread conversations on top",
             Action::Compose => "write a message",

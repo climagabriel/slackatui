@@ -408,12 +408,12 @@ pub struct Open {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TopSection { Saved, Sent, Mentions }
+pub enum TopSection { Saved, Sent, Mentions, Threads }
 
 impl TopSection {
-    pub const ALL: [Self; 3] = [Self::Saved, Self::Sent, Self::Mentions];
-    pub fn label(self) -> &'static str { match self { Self::Saved => "SAVED", Self::Sent => "SENT", Self::Mentions => "MENTIONS" } }
-    pub fn row(self) -> usize { match self { Self::Saved => 0, Self::Sent => 1, Self::Mentions => 2 } }
+    pub const ALL: [Self; 4] = [Self::Saved, Self::Sent, Self::Mentions, Self::Threads];
+    pub fn label(self) -> &'static str { match self { Self::Saved => "SAVED", Self::Sent => "SENT", Self::Mentions => "MENTIONS", Self::Threads => "THREADS" } }
+    pub fn row(self) -> usize { match self { Self::Saved => 0, Self::Sent => 1, Self::Mentions => 2, Self::Threads => 3 } }
 }
 
 pub enum View {
@@ -437,7 +437,8 @@ pub enum View {
     },
     Raw { title: String, browser: crate::raw::Browser },
     Reactions { title: String, lines: Vec<String>, scroll: usize },
-    /// Roots of the threads the owner wrote in, across every archive.
+    /// Roots of the threads the owner wrote in or was mentioned in, across
+    /// every archive.
     Threads { list: MsgList },
     /// `/colorpalette`: edit semantic UI colors with a live preview.
     ColorPalette {
@@ -3067,20 +3068,14 @@ impl App {
         }
     }
 
-    /// Every thread the owner wrote in, newest reply first, from the cache.
+    /// Every thread the owner replied to or was mentioned in, newest reply
+    /// first, from the cache. Archive-wide: it opens no conversation, and the
+    /// conversation cursor stays where it was.
     fn open_my_threads(&mut self) {
         let Some(me) = self.corpus.me.clone() else {
             self.status = "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
             return;
         };
-        if self.open.is_none() {
-            let Some(&idx) = self.filtered.get(self.conv_cursor) else {
-                return;
-            };
-            if !self.open_conv(idx) {
-                return;
-            }
-        }
         let mut roots: Vec<Msg> = Vec::new();
         let mut seen: HashSet<(String, i64)> = HashSet::new();
         for (ai, a) in self.corpus.archives.iter().enumerate() {
@@ -3106,7 +3101,7 @@ impl App {
             list: MsgList::new(roots, false),
         });
         self.focus = Focus::Msgs;
-        self.status = format!("{n} threads you took part in, newest reply first");
+        self.status = format!("{n} threads you replied to or were mentioned in, newest reply first");
     }
 
     pub fn image_font(&self) -> Option<(u16, u16)> {
@@ -4055,7 +4050,7 @@ impl App {
                 )
             }
             Some(View::Threads { list }) => format!(
-                "threads you took part in · {} · newest reply first",
+                "threads you replied to or were mentioned in · {} · newest reply first",
                 list.len()
             ),
             Some(View::Thread {
@@ -4589,6 +4584,7 @@ impl App {
                 Some(TopSection::Saved) => { self.open_saved(); return; }
                 Some(TopSection::Sent) => { self.open_sent(); return; }
                 Some(TopSection::Mentions) => { self.open_feed(TopSection::Mentions); return; }
+                Some(TopSection::Threads) => { self.open_my_threads(); return; }
                 None => {}
             }
         }
@@ -5426,9 +5422,11 @@ pub(crate) mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        // Row 0 is the border, 1..=4 the top sections, 5 their divider; the
+        // first conversation lands on 6.
         let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
             (1..29)
-                .map(|x| terminal.backend().buffer()[(x, 5)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 6)].symbol())
                 .collect::<String>()
         };
         assert!(row(&terminal).ends_with("123"));
@@ -5863,10 +5861,11 @@ pub(crate) mod tests {
         let mut app=mute_test_app();app.msgs_height=10;
         app.merge_conversations((0..30).map(|i|json!({"id":format!("CEXTRA{i}"),"name":format!("extra{i}"),"is_member":true})).collect());
         app.top_section=Some(TopSection::Saved);
-        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,2);
+        // A half page from the top row lands past the four top sections.
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,1);
         app.on_key(KeyEvent::new(KeyCode::Char('b'),KeyModifiers::NONE));assert_eq!(app.top_section,Some(TopSection::Saved));
         app.msgs_height=20;
-        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,7);
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,6);
         app.msgs_height=10;
         app.stack.push(View::Reactions {title:"reactions".into(),lines:vec!["reaction".into();100],scroll:0});
         for (key,expected) in [('f',5),('j',6),('k',5),('b',0)] {
@@ -6198,7 +6197,7 @@ pub(crate) mod tests {
         let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();
         terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
         let buffer=terminal.backend().buffer();
-        for (y,name) in [(1,"SAVED"),(2,"SENT"),(3,"MENTIONS")] {let row:String=(1..20).map(|x|buffer[(x,y)].symbol()).collect();assert!(row.starts_with(name));}
+        for (y,name) in [(1,"SAVED"),(2,"SENT"),(3,"MENTIONS"),(4,"THREADS")] {let row:String=(1..20).map(|x|buffer[(x,y)].symbol()).collect();assert!(row.starts_with(name));}
         let text:String=buffer.content.iter().map(|cell|cell.symbol()).collect();assert!(text.contains("sent reply"));
         app.apply_sent(generation,true,crate::sent::Page {messages:vec![reply.clone(),older.clone()],next_cursor:None});
         assert_eq!(app.active_list().unwrap().len(),2);assert_eq!(app.selected().unwrap().id,reply.id);
@@ -6220,11 +6219,56 @@ pub(crate) mod tests {
         app.on_msg_key(Some(Action::Down));assert!(matches!(app.job.as_ref().map(|j|&j.kind),Some(JobKind::Sent {append:true,..})));
         app.on_msg_key(Some(Action::Back));assert!(app.job.is_none());
         app.on_conv_key(Some(Action::Down));assert_eq!(app.top_section,Some(TopSection::Mentions));
+        app.on_conv_key(Some(Action::Down));assert_eq!(app.top_section,Some(TopSection::Threads));
         app.on_conv_key(Some(Action::Down));assert!(app.top_section.is_none());assert_eq!(app.conv_cursor,0);
         app.api=None;app.corpus.convs.clear();app.filtered.clear();
-        app.on_conv_key(Some(Action::Last));assert_eq!(app.top_section,Some(TopSection::Mentions));app.on_conv_key(Some(Action::Open));
+        app.on_conv_key(Some(Action::Last));assert_eq!(app.top_section,Some(TopSection::Threads));app.on_conv_key(Some(Action::Open));
         terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
         app.escape_home();app.escape_home();assert_eq!(app.top_section,Some(TopSection::Saved));
+    }
+
+    /// THREADS is the fourth top row and opens what Ctrl-T opens: the roots of
+    /// every cached thread the owner replied to or was mentioned in, newest
+    /// reply first. Neither path opens a conversation or moves the sidebar
+    /// cursor; selecting a row still opens that thread.
+    #[test]
+    fn threads_row_and_control_t_open_the_thread_list_without_opening_a_conversation() {
+        let dir = crate::archive::test_dir("threads-row");
+        crate::archive::thread_database(&dir, crate::archive::THREAD_FIXTURE);
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..3 { app.on_conv_key(Some(Action::Down)); }
+        assert_eq!(app.top_section,Some(TopSection::Threads));
+        assert_eq!(TopSection::Threads.label(),"THREADS");
+        let cursor = app.conv_cursor;
+        app.on_conv_key(Some(Action::Open));
+        assert!(matches!(app.stack.last(),Some(View::Threads {..})));
+        assert!(app.open.is_none());
+        assert_eq!(app.conv_cursor,cursor);
+        assert_eq!(app.active_list().unwrap().msgs.iter().map(|m|m.id).collect::<Vec<_>>(),
+            [5_000_000,3_000_000,1_000_000]);
+        assert!(app.status.contains("3 threads you replied to or were mentioned in"));
+        // Selecting a row opens that thread, as it did before the row existed.
+        app.on_msg_key(Some(Action::Open));
+        assert!(matches!(app.stack.last(),Some(View::Thread {root:5_000_000,..})));
+        assert_eq!(app.selected().unwrap().text,"quiet root");
+        // Ctrl-T from the sidebar reaches the same list and leaves the
+        // conversation under the cursor closed.
+        app.escape_home();
+        app.top_section = None;
+        app.conv_cursor = 1;
+        app.on_key(KeyEvent::new(KeyCode::Char('t'),KeyModifiers::CONTROL));
+        assert!(matches!(app.stack.last(),Some(View::Threads {..})));
+        assert!(app.open.is_none());
+        assert_eq!(app.conv_cursor,1);
+        assert_eq!(app.active_list().unwrap().msgs.iter().map(|m|m.id).collect::<Vec<_>>(),
+            [5_000_000,3_000_000,1_000_000]);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -6240,10 +6284,10 @@ pub(crate) mod tests {
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(app.top_section,Some(TopSection::Mentions));
         app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.top_section,Some(TopSection::Threads));
+        app.on_key(key(KeyCode::Char('j')));
         assert!(app.top_section.is_none()); assert_eq!(app.conv_cursor,0);
-        app.on_key(key(KeyCode::Char('k')));
-        app.on_key(key(KeyCode::Char('k')));
-        app.on_key(key(KeyCode::Char('k')));
+        for _ in 0..4 { app.on_key(key(KeyCode::Char('k'))); }
         assert_eq!(app.top_section,Some(TopSection::Saved));
         app.on_key(key(KeyCode::Enter));
         assert!(app.open.is_none()); assert!(matches!(app.stack.last(),Some(View::Saved {..})));

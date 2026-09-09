@@ -93,6 +93,9 @@ returns; without one the cached archives answer alone.
 
 SENT below SAVED shows sent messages newest first, using Slack search.
 Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.
+THREADS below MENTIONS opens what Ctrl-T opens: every cached thread you
+replied to or were mentioned in, newest reply first, headed by its root
+message. It opens no conversation and leaves the sidebar cursor alone.
 
 Conversations default to recent order: newest message first. Starred, muted,
 unread and search-match grouping take precedence. Press s to cycle recent,
@@ -170,14 +173,15 @@ keys (also ? inside)
   R refresh from Slack, a archive a conversation not cached yet,
   i view a message's images, I inline thumbnails on/off,
   m mark read, M mark unread from the cursor, D delete your own message,
-  T channel tabs and canvases; Ctrl-T threads you participated in,
+  T channel tabs and canvases; Ctrl-T threads you replied to or were mentioned in,
   Ctrl-B cycles the conversations pane: always shown, always hidden,
   auto-hide inside a conversation (shown again on leaving it),
   H the key guide,
   Esc in the list closes the conversation
 
 Channel tabs: T toggles the menu in browsing and normal mode;
-j/k select, l/Enter opens, h/Esc returns. Ctrl-T opens participated threads.
+j/k select, l/Enter opens, h/Esc returns. Ctrl-T opens the threads you
+replied to or were mentioned in.
 Canvases: j/k moves by line; i edits that section as Markdown. Esc leaves
 insert mode; hjkl moves the cursor. In normal mode, :w saves,
 :wq saves and closes, :q closes a clean draft, :q! discards it.

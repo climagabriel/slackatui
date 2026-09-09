@@ -1169,16 +1169,26 @@ impl Archive {
         Ok(msgs)
     }
 
-    /// Roots of every thread the owner wrote in.
+    /// Roots of every thread the owner wrote a message in, or was mentioned in
+    /// directly. Root and replies count alike for both. A direct mention is the
+    /// literal `<@ME>`, so `<!here>`, `<!channel>` and `<!subteam^…>` do not
+    /// bring a thread in.
     pub fn my_threads(&self, me: &str) -> rusqlite::Result<Vec<Msg>> {
         self.ensure_combined_fresh()?;
-        let like = format!("%\"user\":\"{}\"%", me.replace(['%', '_'], ""));
+        // `%` and `_` are LIKE wildcards; a user id carries neither, so
+        // dropping them keeps a crafted id from widening the prefilter.
+        let safe = me.replace(['%', '_'], "");
+        let author_like = format!("%\"user\":\"{safe}\"%");
+        let mention_like = format!("%<@{safe}>%");
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT CHANNEL_ID, THREAD_TS FROM MESSAGE \
-             WHERE THREAD_TS IS NOT NULL AND DATA LIKE ?1 AND json_extract(DATA, '$.user') = ?2",
+               WHERE THREAD_TS IS NOT NULL AND DATA LIKE ?1 AND json_extract(DATA, '$.user') = ?2 \
+             UNION \
+             SELECT DISTINCT CHANNEL_ID, THREAD_TS FROM MESSAGE \
+               WHERE THREAD_TS IS NOT NULL AND DATA LIKE ?3",
         )?;
         let roots: Vec<(String, String)> = stmt
-            .query_map(params![like, me], |r| {
+            .query_map(params![author_like, me, mention_like], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
             .flatten()
@@ -1486,6 +1496,77 @@ impl Msg {
     }
 }
 
+/// One channel's worth of threads for the THREADS tests, as
+/// `(id, root, user, text)`. `root == id` marks a thread root, `root == 0` a
+/// message outside any thread. The owner is `U1`.
+#[cfg(test)]
+pub(crate) const THREAD_FIXTURE: &[(i64, i64, &str, &str)] = &[
+    // Started by the owner; only somebody else replied.
+    (1, 1, "U1", "root I started"),
+    (2, 1, "U2", "someone else replies"),
+    // Somebody else's thread the owner replied in.
+    (3, 3, "U2", "their root"),
+    (4, 3, "U1", "my reply"),
+    // The owner wrote nothing here; a reply mentions them directly.
+    (5, 5, "U2", "quiet root"),
+    (6, 5, "U2", "hey <@U1> take a look"),
+    // Broadcasts, a longer user id and another user: none of these count.
+    (7, 7, "U2", "<!here> and <!channel>, plus <@U12>"),
+    (8, 7, "U2", "<!subteam^S1> with <@U2>"),
+    // Outside any thread, so out of the list however it reads.
+    (9, 0, "U1", "not in a thread"),
+    (10, 0, "U2", "<@U1> outside a thread"),
+];
+
+/// A single-channel archive on disk holding `messages`, for tests.
+#[cfg(test)]
+pub(crate) fn thread_database(dir: &Path, messages: &[(i64, i64, &str, &str)]) {
+    std::fs::create_dir_all(dir).unwrap();
+    let conn = Connection::open(dir.join("slackdump.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE CHUNK(ID INTEGER, UNIX_TS INTEGER);
+         CREATE TABLE CHANNEL(ID TEXT, NAME TEXT, DATA BLOB, CHUNK_ID INTEGER);
+         CREATE TABLE CHANNEL_USER(CHANNEL_ID TEXT, USER_ID TEXT);
+         CREATE TABLE MESSAGE(ID INTEGER, CHUNK_ID INTEGER, CHANNEL_ID TEXT, TS TEXT,
+             PARENT_ID INTEGER, THREAD_TS TEXT, IS_PARENT INTEGER, LATEST_REPLY TEXT, TXT TEXT, DATA BLOB);
+         INSERT INTO CHUNK VALUES(1,100);
+         INSERT INTO CHANNEL VALUES ('C1','one',CAST('{}' AS BLOB),1);",
+    )
+    .unwrap();
+    for &(id, root, user, text) in messages {
+        let ts = format!("{id}.000000");
+        let data = serde_json::json!({"text":text,"ts":ts,"user":user})
+            .to_string()
+            .into_bytes();
+        conn.execute(
+            "INSERT INTO MESSAGE VALUES(?1,1,'C1',?2,?3,?4,?5,NULL,?6,?7)",
+            params![
+                id * 1_000_000,
+                ts,
+                (root != 0).then_some(root * 1_000_000),
+                (root != 0).then(|| format!("{root}.000000")),
+                i64::from(root == id),
+                text,
+                data
+            ],
+        )
+        .unwrap();
+    }
+}
+
+/// A scratch directory this test alone owns.
+#[cfg(test)]
+pub(crate) fn test_dir(slug: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "slack-{slug}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
 #[cfg(test)]
 mod union_tests {
     use super::*;
@@ -1546,6 +1627,42 @@ mod union_tests {
         assert_eq!(archive.search_filtered(None,"nginx",None,2).unwrap().len(),2);
         assert!(archive.search_filtered(Some("C1"),"absent",None,10).unwrap().is_empty());
         drop(archive);std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Membership of the THREADS list: a thread counts when the owner wrote
+    /// any message in it, or when any message in it mentions them as `<@ME>`.
+    /// Broadcasts, subteams and another user's mention do not bring one in,
+    /// and neither does a message outside a thread.
+    #[test]
+    fn my_threads_takes_authored_and_directly_mentioned_threads_only() {
+        let root = test_dir("my-threads");
+        thread_database(&root, THREAD_FIXTURE);
+        let archive = Archive::open("test".into(), &root).unwrap();
+        let mut mine = archive.my_threads("U1").unwrap();
+        mine.sort_by_key(|message| message.id);
+        assert_eq!(
+            mine.iter().map(|message| message.id).collect::<Vec<_>>(),
+            [1_000_000, 3_000_000, 5_000_000]
+        );
+        // Each root's newest reply, which is what the caller sorts on.
+        assert_eq!(
+            mine.iter().map(|message| message.latest_reply_id).collect::<Vec<_>>(),
+            [Some(2_000_000), Some(4_000_000), Some(6_000_000)]
+        );
+        // The third is the mention-only thread: the owner wrote nothing in it.
+        assert_eq!(mine[2].text, "quiet root");
+        assert!(archive
+            .thread("C1", 5_000_000)
+            .unwrap()
+            .iter()
+            .all(|message| message.user.as_deref() != Some("U1")));
+        // `<@U1>` is not a prefix of `<@U12>`, in either direction.
+        assert_eq!(
+            archive.my_threads("U12").unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [7_000_000]
+        );
+        drop(archive);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
