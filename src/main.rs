@@ -102,11 +102,16 @@ the hits are already on screen, and Esc only closes the box while Slack's
 answer folds in as usual. The box's background is the color palette's
 \"search progress box\" role.
 
-The Slack half pages to the same 500 the archives are capped at, so the two
-hit lists are comparable. The result title counts both sides: N more from
-Slack, and N only in cache for archived hits Slack did not return. When Slack
-still had more to give at 500, its answer is not all it holds, and the title
-says N not in Slack's first 500 instead.
+The Slack half follows its pagination cursor to the same 500 the archives are
+capped at, so the two hit lists are comparable. The result title counts both
+sides: N more from Slack, and N not returned by Slack for archived hits its
+answer did not carry. That is a fact about the two searches, not a claim that
+Slack has lost the messages: Slack search collapses near-duplicates and
+applies its own matching, while this side is a substring scan. When the
+answer is short of everything Slack has -- the cap reached with more on
+offer, a page failing after the first, a repeated cursor, or the request
+budget of seven calls spent -- the title says N not in Slack's first 500
+instead, and the pages that did arrive are still folded in.
 
 SENT below SAVED shows sent messages newest first, using Slack search.
 Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.

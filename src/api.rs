@@ -150,14 +150,25 @@ impl Client {
     }
 
     /// Every match Slack will give for `query`, up to `cap`, following the
-    /// pagination cursor. The flag says whether Slack ran out first: only
-    /// then is the answer the whole of what Slack holds, which is what lets
-    /// a caller call the difference against it "only in cache".
+    /// pagination cursor. The flag is true only when Slack ran out of results
+    /// on its own within the cap: that is the one case where what came back
+    /// is the whole of what Slack answers for the query. Anything else — the
+    /// cap reached, a cursor seen twice, the request budget spent, a call
+    /// failing after the first — returns what was collected and false.
     pub fn search_all(&self, query: &str, cap: usize) -> Result<(Vec<Value>, bool), String> {
+        // Short pages make the call count exceed cap/100; a couple spare, and
+        // then it stops rather than paging indefinitely.
+        let budget = cap / 100 + 2;
         let mut out: Vec<Value> = Vec::new();
         let mut cursor = "*".to_string();
-        loop {
-            let response = self.call(
+        let mut visited: std::collections::HashSet<String> =
+            std::iter::once(cursor.clone()).collect();
+        let partial = |mut out: Vec<Value>| {
+            out.truncate(cap);
+            Ok((out, false))
+        };
+        for request in 0..budget {
+            let response = match self.call(
                 "search.messages",
                 &[
                     ("query", query),
@@ -167,7 +178,13 @@ impl Client {
                     ("cursor", cursor.as_str()),
                     ("highlight", "false"),
                 ],
-            )?;
+            ) {
+                Ok(response) => response,
+                // Nothing collected yet: the search failed. Otherwise keep
+                // the pages that did arrive; they are still hits.
+                Err(error) if request == 0 => return Err(error),
+                Err(_) => return partial(out),
+            };
             if let Some(matches) = response.pointer("/messages/matches").and_then(Value::as_array) {
                 out.extend(matches.iter().cloned());
             }
@@ -178,20 +195,21 @@ impl Client {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let Some(next) = next else {
+                // Slack stopped. It is the whole answer only if the cap did
+                // not have to cut anything off.
+                let complete = out.len() <= cap;
                 out.truncate(cap);
-                return Ok((out, true));
+                return Ok((out, complete));
             };
-            // A cursor Slack hands back unchanged would page for ever.
-            if next == cursor {
-                out.truncate(cap);
-                return Ok((out, true));
-            }
-            if out.len() >= cap {
-                out.truncate(cap);
-                return Ok((out, false));
+            // At the cap with more on offer, or a cursor already followed —
+            // Slack repeating one, or alternating between two, would page for
+            // ever. Neither is exhaustion.
+            if out.len() >= cap || !visited.insert(next.clone()) {
+                return partial(out);
             }
             cursor = next;
         }
+        partial(out)
     }
 
     /// Every conversation the user is a member of.
@@ -749,6 +767,109 @@ mod tests {
             )
             .unwrap(),
             Vec::<String>::new()
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_paging_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A page of `count` matches, and the cursor Slack offers after it.
+    fn page(count: usize, first: usize, next: &str) -> Value {
+        let matches: Vec<Value> = (0..count)
+            .map(|index| json!({"channel": {"id": "C1"}, "ts": format!("{}.000000", first + index)}))
+            .collect();
+        json!({"messages": {"matches": matches, "pagination": {"next_cursor": next}}})
+    }
+
+    /// A client answering with `pages` in order, counting the calls it took.
+    fn paged(pages: Vec<Result<Value, String>>) -> (Client, std::sync::Arc<AtomicUsize>) {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let client = Client::for_test(move |method, _| {
+            assert_eq!(method, "search.messages");
+            let at = seen.fetch_add(1, Ordering::SeqCst);
+            pages.get(at).cloned().unwrap_or_else(|| Ok(page(0, 0, "")))
+        });
+        (client, calls)
+    }
+
+    /// The only way to a complete answer: Slack stops on its own, inside the
+    /// cap. Everything else says so.
+    #[test]
+    fn slack_running_out_within_the_cap_is_the_only_complete_answer() {
+        let (client, calls) = paged(vec![Ok(page(100, 0, "p2")), Ok(page(40, 100, ""))]);
+        let (hits, complete) = client.search_all("nginx", 500).unwrap();
+        assert_eq!((hits.len(), complete), (140, true));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Exactly the cap, and Slack has no more: still the whole answer.
+        let (client, _) = paged(vec![Ok(page(100, 0, "p2")), Ok(page(100, 100, ""))]);
+        let (hits, complete) = client.search_all("nginx", 200).unwrap();
+        assert_eq!((hits.len(), complete), (200, true));
+    }
+
+    /// More hits than the cap, whether the overshoot arrives on the last page
+    /// or the cursor simply outlives the cap.
+    #[test]
+    fn passing_the_cap_is_never_complete() {
+        // The final page pushes the total past the cap: there were more.
+        let (client, _) = paged(vec![Ok(page(100, 0, "p2")), Ok(page(100, 100, ""))]);
+        let (hits, complete) = client.search_all("nginx", 150).unwrap();
+        assert_eq!((hits.len(), complete), (150, false));
+
+        // The cap is reached and Slack still offers a cursor.
+        let (client, calls) = paged(vec![Ok(page(100, 0, "p2")), Ok(page(100, 100, "p3"))]);
+        let (hits, complete) = client.search_all("nginx", 200).unwrap();
+        assert_eq!((hits.len(), complete), (200, false));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "it kept paging past the cap");
+    }
+
+    /// A cursor Slack has already handed out is an anomaly, not exhaustion:
+    /// following it would page for ever, and stopping there is not a whole
+    /// answer either.
+    #[test]
+    fn a_cursor_seen_before_stops_the_paging_and_is_not_complete() {
+        for repeat in ["*", "p2"] {
+            let (client, calls) = paged(vec![Ok(page(10, 0, "p2")), Ok(page(10, 10, repeat))]);
+            let (hits, complete) = client.search_all("nginx", 500).unwrap();
+            assert_eq!((hits.len(), complete), (20, false), "cursor {repeat}");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "cursor {repeat}");
+        }
+    }
+
+    /// Short pages could otherwise page far past cap/100; the budget stops it.
+    #[test]
+    fn the_request_budget_bounds_short_pages() {
+        let pages: Vec<Result<Value, String>> = (0..20)
+            .map(|index| Ok(page(1, index, &format!("p{}", index + 1))))
+            .collect();
+        let (client, calls) = paged(pages);
+        let (hits, complete) = client.search_all("nginx", 500).unwrap();
+        // cap / 100 + 2 calls, one hit each.
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        assert_eq!((hits.len(), complete), (7, false));
+    }
+
+    /// A rate limit on page three must not throw away pages one and two; only
+    /// a first call that fails is a failed search.
+    #[test]
+    fn a_failure_after_the_first_page_keeps_what_arrived() {
+        let (client, _) = paged(vec![
+            Ok(page(100, 0, "p2")),
+            Ok(page(100, 100, "p3")),
+            Err("search.messages: ratelimited".to_string()),
+        ]);
+        let (hits, complete) = client.search_all("nginx", 500).unwrap();
+        assert_eq!((hits.len(), complete), (200, false));
+
+        let (client, _) = paged(vec![Err("search.messages: ratelimited".to_string())]);
+        assert_eq!(
+            client.search_all("nginx", 500).unwrap_err(),
+            "search.messages: ratelimited"
         );
     }
 }
