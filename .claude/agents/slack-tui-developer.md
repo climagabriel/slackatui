@@ -26,7 +26,7 @@ You develop slack-tui, a ratatui terminal client for the owner's Slack: it reads
 - Threads: a signed-in session always refetches a thread on open; the archived `reply_count` is not a completeness signal (a thread showed 2 replies where Slack had 24). `R` replaces the list; the poll refreshes the open thread and appends.
 - Mute state comes from `users.prefs.get` (`all_notifications_prefs.channels.<id>.muted`); `/mute` and `/unmute` use `users.prefs.setNotifications` and verify by read-back. Legacy `muted.json` overrides are ignored. `conversations.create` is `restricted_action` in this workspace.
 
-`e` shows read-only reaction details as `:name:` and user handles. Messages keep reaction names and counts. File image previews remain available.
+`e` shows read-only reaction details as `:name:` and user handles. Messages keep reaction names and counts. A reaction's count can exceed the number of users `reactions.get` returns, which Slack documents. Show the count, the handles the call returned, and how many it did not; never invent a handle. File image previews remain available.
 
 ## Web API writes the tool makes
 
@@ -48,10 +48,16 @@ A scripted tmux test once posted a test message to a team channel: the build had
 - Under tmux or screen the terminal image-protocol query's responses ate the first keypress; the query runs there only when asked for (`--image-protocol query`).
 - Rarely `q` shortly after start leaves the process alive on a blank screen (main thread in the crossterm poll); not reproduced on a debug build.
 - `d` date jump does not move the cursor on a 200-loaded `--no-live` timeline; a stale "no image on this message" status survives a later `i`.
+- `canvases.edit` has no atomic revision check, so a save overwrites whatever landed between load and save. The client's own version of this, a refresh pairing stale editor text with a newer baseline, was fixed; the API gap cannot be. Draft export is the recovery path and `--help` states the limitation. A new canvas write inherits the gap and documents it the same way.
+- A chord can be consumed by the terminal on the owner's workstation before slack-tui sees it. `ctrl-shift-s` is bound to `Action::Unsave` and does not arrive; kitty was suspected and never confirmed. This VM cannot reproduce it: the owner reaches the client over ssh from a terminal this side never runs, so a chord that works under a local tmux proves nothing. `/save` and `/unsave` are the reachable path. Treat host-side chord delivery as unverified until the owner tests it.
 
 ## Deferred on purpose
 
 Worker-thread image decode, thumbnail cache bound, mid-slot inline scroll, Sixel and iTerm2 clipping, draining the terminal after the protocol query.
+
+`D` deletes the Slack copy only. When Slack answers `message_not_found` it stops, and the archived copy stays on screen, since the archive deliberately preserves messages that vanish from Slack. Removing both copies was asked for and not built: no gesture evicts a single message from the local archive.
+
+Opening a web link in a browser on the owner's workstation, over a channel back to the host, was designed and rejected as not worth the complexity: the terminal already makes links clickable over ssh. `Enter` in raw view opens links VM-side. Do not propose the host channel again unprompted; the owner can reopen it.
 
 ## Refresh pipeline it reads
 
