@@ -30,41 +30,12 @@ pub enum Focus {
     Msgs,
 }
 
-/// When the conversations pane appears. `Ctrl-B` advances one step and wraps;
-/// the third state is not a flag the key sets but a question asked at every
-/// draw, so entering and leaving a conversation moves the pane by itself.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum ConversationsPaneVisibility {
-    #[default]
-    AlwaysShown,
-    AlwaysHidden,
-    /// Shown while the conversation list has the focus, hidden while a
-    /// conversation is being read.
-    AutoHideInsideConversation,
-}
+/// The `Ctrl-B` state lives with the file it is saved in, beside the picker's
+/// own preferences.
+pub use crate::conversations_pane::ConversationsPaneVisibility;
 
 /// Said when the focus would be on a pane the hidden state does not draw.
 pub const PANE_HIDDEN_HINT: &str = "conversations pane hidden; Ctrl-B cycles it back";
-
-impl ConversationsPaneVisibility {
-    pub fn next(self) -> Self {
-        match self {
-            Self::AlwaysShown => Self::AlwaysHidden,
-            Self::AlwaysHidden => Self::AutoHideInsideConversation,
-            Self::AutoHideInsideConversation => Self::AlwaysShown,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::AlwaysShown => "conversations pane: always shown",
-            Self::AlwaysHidden => "conversations pane: always hidden",
-            Self::AutoHideInsideConversation => {
-                "conversations pane: auto-hide inside a conversation"
-            }
-        }
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sort {
@@ -644,6 +615,8 @@ impl App {
                 format!("conversations-pane: {e}; showing everything"),
             ),
         };
+        let conversations_pane =
+            crate::conversations_pane::load_visibility(pane_path.as_deref(), &pane_workspace);
         let mut app = App {
             last_key: None,
             channel_browser: None,
@@ -654,7 +627,7 @@ impl App {
             corpus,
             tz,
             focus: Focus::Convs,
-            conversations_pane: ConversationsPaneVisibility::default(),
+            conversations_pane,
             sort: Sort::Recent,
             filter: String::new(),
             filtered: Vec::new(),
@@ -4227,6 +4200,14 @@ impl App {
             && !matches!(self.stack.last(), Some(View::Keys { capture: Some(_), .. })) {
             self.conversations_pane = self.conversations_pane.next();
             self.status = self.conversations_pane.label().to_string();
+            // Saved on every press: the client is killed, not exited.
+            if let Err(e) = crate::conversations_pane::save_visibility(
+                self.pane_path.as_deref(),
+                &self.pane_workspace,
+                self.conversations_pane,
+            ) {
+                self.status = format!("{}; not saved: {e}", self.conversations_pane.label());
+            }
             self.pending_delete = None;
             return;
         }
@@ -6555,6 +6536,60 @@ pub(crate) mod tests {
     }
     fn control_b() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+    }
+
+    /// The cycle survives a restart, and a settings file it cannot write
+    /// costs the state nothing but a note in the status line.
+    #[test]
+    fn the_pane_state_survives_a_restart() {
+        use ConversationsPaneVisibility::*;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("slack-tui-pane-restart-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let keys = dir.join("keys.json");
+        let settings = dir.join("conversations-pane.json");
+        let start = || {
+            App::new(
+                Corpus::stub(&[]),
+                Tz::Utc,
+                30.0,
+                false,
+                false,
+                PathBuf::new(),
+                PathBuf::new(),
+                0,
+                None,
+                Some(keys.clone()),
+            )
+        };
+
+        let mut app = start();
+        assert_eq!(app.conversations_pane, AlwaysShown);
+        app.on_key(control_b());
+        assert_eq!(start().conversations_pane, AlwaysHidden);
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AutoHideInsideConversation);
+        assert_eq!(app.status, AutoHideInsideConversation.label());
+        assert_eq!(start().conversations_pane, AutoHideInsideConversation);
+        // Round the cycle: the default is saved as explicitly as the rest.
+        app.on_key(control_b());
+        assert_eq!(start().conversations_pane, AlwaysShown);
+
+        // An unwritable file keeps the state for this session and says so.
+        std::fs::write(&settings, "broken").unwrap();
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AlwaysHidden);
+        assert!(app.status.starts_with(AlwaysHidden.label()), "{}", app.status);
+        assert!(app.status.contains("not saved"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "broken");
+        // The next start reads the corrupt file as the default, not a crash.
+        assert_eq!(start().conversations_pane, AlwaysShown);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The cycle order and its wrap, and the auto-hide state moving the pane
