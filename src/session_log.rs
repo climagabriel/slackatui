@@ -268,7 +268,7 @@ pub fn state(app: &App) -> Value {
             View::Thread { root, .. } => json!({"view":"thread","root":root}),
             View::Search { .. } => json!({"view":"search"}),
             View::Threads { .. } => json!({"view":"threads"}),
-            View::Sent { .. } => json!({"view":"sent"}),
+            View::Feed { section, .. } => json!({"view":"feed","section":section.label()}),
             View::Saved { .. } => json!({"view":"saved"}),
             View::Raw { browser, .. } => json!({"view":"raw","scroll":browser.scroll,"cursor":browser.cursor}),
             View::Reactions { scroll, .. } => json!({"view":"reactions","scroll":scroll}),
