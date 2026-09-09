@@ -8,6 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::archive::{Archive, Corpus, FileInfo, Msg};
 use crate::palette::{Palette, Role};
@@ -267,7 +268,7 @@ pub struct Sty {
     pub italic: bool,
     pub strike: bool,
     pub code: bool,
-    /// Preformatted: kept verbatim, one line per source line, never wrapped.
+    /// Preformatted: preserve whitespace and source line breaks; wrap to fit.
     pub pre: bool,
     pub link: bool,
     pub mention: bool,
@@ -988,8 +989,8 @@ fn is_blank(line: &Line) -> bool {
         .all(|s| s.content.trim().is_empty() || s.content.as_ref() == "│ ")
 }
 
-/// Greedy word-wrap. A word wider than the line stays whole on its own line
-/// (a long URL is clipped, never split, so it stays clickable).
+/// Greedy word-wrap, splitting oversized words and preformatted lines at
+/// grapheme boundaries so message text remains visible.
 pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<Line<'static>> {
     // Match source text before word wrapping, retaining each segment's semantics.
     let highlighted = palette.highlight_line(Line::from(segs.iter().map(|seg| Span::raw(seg.text.clone())).collect::<Vec<_>>()));
@@ -1014,10 +1015,11 @@ pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<
         if consumed == seg.text.len() { current = source.next(); consumed = 0; }
     }
     let segs = painted.as_slice();
-    let avail = width.saturating_sub(indent.width()).max(8);
+    let avail = width.saturating_sub(indent.width()).max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
+    let mut preserved_rows = std::collections::HashSet::new();
     let mut quote: Option<bool> = None;
     for item in items(segs) {
         match item {
@@ -1029,7 +1031,7 @@ pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<
             Item::Word(parts) => {
                 let w: usize = parts.iter().map(|(t, _)| t.width()).sum();
                 let q = parts.first().map(|p| p.1.quote).unwrap_or(false);
-                let room = avail.saturating_sub(if q { 2 } else { 0 });
+                let room = avail.saturating_sub(if q { 2 } else { 0 }).max(1);
                 if cur_w > 0 && cur_w + 1 + w > room {
                     lines.push(finish(
                         std::mem::take(&mut cur),
@@ -1049,8 +1051,36 @@ pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<
                 let preformatted = parts.first().is_some_and(|(_, style)| style.pre);
                 let word = Line::from(parts.into_iter().map(|(text, style)| Span::styled(text, style_of(style, palette))).collect::<Vec<_>>());
                 let word = if preformatted { palette.highlight_line(word) } else { word };
-                cur.extend(word.spans);
-                cur_w += w;
+                // Segment before applying span boundaries: highlights may split a
+                // combining sequence, which must still occupy one display cell unit.
+                let text = word.to_string();
+                let mut spans = word.spans.iter();
+                let mut span = spans.next();
+                let mut offset = 0;
+                for grapheme in text.graphemes(true) {
+                    let cells = grapheme.width();
+                    if cur_w > 0 && cur_w + cells > room {
+                        if preformatted { preserved_rows.insert(lines.len()); }
+                        lines.push(finish(std::mem::take(&mut cur), indent, q));
+                        cur_w = 0;
+                    }
+                    let mut remaining = grapheme.len();
+                    while remaining > 0 {
+                        let current = span.expect("word spans cover its text");
+                        let count = remaining.min(current.content.len() - offset);
+                        let piece = &current.content[offset..offset + count];
+                        if let Some(last) = cur.last_mut().filter(|last| last.style == current.style) {
+                            last.content.to_mut().push_str(piece);
+                        } else {
+                            cur.push(Span::styled(piece.to_string(), current.style));
+                        }
+                        remaining -= count;
+                        offset += count;
+                        if offset == current.content.len() { span = spans.next(); offset = 0; }
+                    }
+                    cur_w += cells;
+                }
+                if preformatted { preserved_rows.insert(lines.len()); }
             }
         }
     }
@@ -1059,18 +1089,15 @@ pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<
     }
     // Trim blank edges, collapse blank runs: fences and block joins leave
     // doubled breaks behind.
-    while lines.first().is_some_and(is_blank) {
-        lines.remove(0);
-    }
-    while lines.last().is_some_and(is_blank) {
-        lines.pop();
-    }
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
-    for l in lines {
-        if is_blank(&l) && out.last().is_some_and(is_blank) {
-            continue;
-        }
-        out.push(l);
+    let blank = |index: usize| !preserved_rows.contains(&index) && is_blank(&lines[index]);
+    let first = (0..lines.len()).find(|&index| !blank(index)).unwrap_or(lines.len());
+    let last = (first..lines.len()).rfind(|&index| !blank(index)).map_or(first, |index| index + 1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut previous_blank = false;
+    for (index, line) in lines.into_iter().enumerate().take(last).skip(first) {
+        let blank = !preserved_rows.contains(&index) && is_blank(&line);
+        if !blank || !previous_blank { out.push(line); }
+        previous_blank = blank;
     }
     out
 }
@@ -1314,7 +1341,32 @@ mod tests {
         }
         let segments = vec![Seg::new("  nginx   -t\nNGINX", Sty { pre: true, ..Sty::default() })];
         let lines = wrap(&segments, 8, "", &palette);
-        assert_eq!(lines.iter().map(Line::to_string).collect::<Vec<_>>(), vec!["  nginx   -t", "NGINX"]);
+        assert_eq!(lines.iter().map(Line::to_string).collect::<Vec<_>>(), vec!["  nginx ", "  -t", "NGINX"]);
+    }
+
+    #[test]
+    fn oversized_words_and_code_wrap_without_losing_text() {
+        let palette = Palette::default();
+        for pre in [false, true] {
+            for value in ["https://example.org/averylongpath", "界e\u{301}界e\u{301}界e\u{301}"] {
+                for width in [4, 8, 20] {
+                    let lines = wrap(&[Seg::new(value, Sty { pre, ..Sty::default() })], width, "", &palette);
+                    assert!(lines.iter().all(|line| line.width() <= width));
+                    assert_eq!(lines.iter().map(Line::to_string).collect::<String>(), value);
+                }
+            }
+        }
+        let indented = "                        x";
+        let lines = wrap(&[Seg::new(indented, Sty { pre: true, ..Sty::default() })], 8, "", &palette);
+        assert_eq!(lines.iter().map(Line::to_string).collect::<String>(), indented);
+        let mut highlighted = palette.clone();
+        highlighted.highlights.push(crate::palette::Highlight { word: "e".into(), color: ratatui::style::Color::Red });
+        let lines = wrap(&[Seg::new("123e\u{301}x", Sty::default())], 4, "", &highlighted);
+        assert_eq!(lines.iter().map(Line::to_string).collect::<Vec<_>>(), vec!["123e\u{301}", "x"]);
+        let value = "    upstream timed out   while reading response";
+        let lines = wrap(&[Seg::new(value, Sty { pre: true, quote: true, ..Sty::default() })], 16, "  ", &palette);
+        assert!(lines.iter().all(|line| line.width() <= 16));
+        assert_eq!(lines.iter().map(|line| line.to_string().strip_prefix("  │ ").unwrap().to_string()).collect::<String>(), value);
     }
 
     #[test]
@@ -1652,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_breaks_between_words_and_keeps_long_words_whole() {
+    fn wrap_breaks_between_words_and_splits_long_words() {
         let segs = vec![Seg::new("one two three four five", Sty::default())];
         let texts: Vec<String> = wrap(&segs, 11, "", &TEST_PALETTE)
             .iter()
@@ -1669,7 +1721,7 @@ mod tests {
             .collect();
         assert_eq!(
             texts,
-            vec!["x", "https://very.long.example/path/that/does/not/fit", "y"]
+            vec!["x", "https://very", ".long.exampl", "e/path/that/", "does/not/fit", "y"]
         );
     }
 
