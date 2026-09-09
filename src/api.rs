@@ -149,22 +149,49 @@ impl Client {
         Ok(out)
     }
 
-    /// Search matches across the workspace, newest first, at most `count`.
-    pub fn search(&self, query: &str, count: usize) -> Result<Vec<Value>, String> {
-        let count = count.min(100).to_string();
-        let v = self.call(
-            "search.messages",
-            &[
-                ("query", query),
-                ("count", count.as_str()),
-                ("sort", "timestamp"),
-                ("sort_dir", "desc"),
-            ],
-        )?;
-        Ok(v.pointer("/messages/matches")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+    /// Every match Slack will give for `query`, up to `cap`, following the
+    /// pagination cursor. The flag says whether Slack ran out first: only
+    /// then is the answer the whole of what Slack holds, which is what lets
+    /// a caller call the difference against it "only in cache".
+    pub fn search_all(&self, query: &str, cap: usize) -> Result<(Vec<Value>, bool), String> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut cursor = "*".to_string();
+        loop {
+            let response = self.call(
+                "search.messages",
+                &[
+                    ("query", query),
+                    ("count", "100"),
+                    ("sort", "timestamp"),
+                    ("sort_dir", "desc"),
+                    ("cursor", cursor.as_str()),
+                    ("highlight", "false"),
+                ],
+            )?;
+            if let Some(matches) = response.pointer("/messages/matches").and_then(Value::as_array) {
+                out.extend(matches.iter().cloned());
+            }
+            let next = response
+                .pointer("/messages/pagination/next_cursor")
+                .or_else(|| response.pointer("/messages/paging/next_cursor"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let Some(next) = next else {
+                out.truncate(cap);
+                return Ok((out, true));
+            };
+            // A cursor Slack hands back unchanged would page for ever.
+            if next == cursor {
+                out.truncate(cap);
+                return Ok((out, true));
+            }
+            if out.len() >= cap {
+                out.truncate(cap);
+                return Ok((out, false));
+            }
+            cursor = next;
+        }
     }
 
     /// Every conversation the user is a member of.

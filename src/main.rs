@@ -94,13 +94,19 @@ returns; without one the cached archives answer alone.
 A search across conversations runs in the background, behind a progress box
 over the middle four fifths of the screen: the SQLite filter it runs, then
 each conversation with its hit count, then the total, then the Slack query
-and what Slack answered. The box closes itself when the last of the two
+and what Slack answered. A search of one conversation is too fast to be worth
+a box and does not draw one. The box closes itself when the last of the two
 searches lands, and swallows every key but Esc while it is up. Esc during the
 archive scan abandons the search and shows nothing; once Slack has been asked
 the hits are already on screen, and Esc only closes the box while Slack's
 answer folds in as usual. The box's background is the color palette's
-\"search progress box\" role. The result title counts both sides: N more from
-Slack, and N only in cache for hits Slack did not return.
+\"search progress box\" role.
+
+The Slack half pages to the same 500 the archives are capped at, so the two
+hit lists are comparable. The result title counts both sides: N more from
+Slack, and N only in cache for archived hits Slack did not return. When Slack
+still had more to give at 500, its answer is not all it holds, and the title
+says N not in Slack's first 500 instead.
 
 SENT below SAVED shows sent messages newest first, using Slack search.
 Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.

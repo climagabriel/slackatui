@@ -114,34 +114,25 @@ fn draw_scan_overlay(frame: &mut Frame, app: &App, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    // Newest at the bottom: take from the end until the box is full, counting
-    // the rows each line takes once wrapped.
+    // Wrap first, then keep the last rows that fit. Estimating a wrapped
+    // line's height instead loses rows: it under-counts, so older lines push
+    // the newest one off the bottom, and a single line longer than the box
+    // could leave nothing on screen at all.
     let width = inner.width as usize;
-    let mut budget = inner.height as usize;
-    let mut first = scan.lines.len();
-    while first > 0 {
-        let rows = scan.lines[first - 1].text.width().div_ceil(width).max(1);
-        if rows > budget {
-            break;
+    let mut rows: Vec<Line> = Vec::new();
+    for line in &scan.lines {
+        let style = if line.dim {
+            Style::new().bg(background).add_modifier(Modifier::DIM)
+        } else {
+            Style::new().bg(background)
+        };
+        for row in crate::canvas::wrap_lines(&line.text, width) {
+            rows.push(Line::from(Span::styled(row, style)));
         }
-        budget -= rows;
-        first -= 1;
     }
-    let lines: Vec<Line> = scan.lines[first..]
-        .iter()
-        .map(|line| {
-            let style = if line.dim {
-                Style::new().bg(background).add_modifier(Modifier::DIM)
-            } else {
-                Style::new().bg(background)
-            };
-            Line::from(Span::styled(line.text.clone(), style))
-        })
-        .collect();
+    let first = rows.len().saturating_sub(inner.height as usize);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .style(Style::new().bg(background)),
+        Paragraph::new(Text::from(rows.split_off(first))).style(Style::new().bg(background)),
         inner,
     );
 }

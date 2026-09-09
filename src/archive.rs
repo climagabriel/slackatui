@@ -320,9 +320,11 @@ fn search_patterns(needle: &str) -> (String, String) {
 
 /// The filter `search_filtered` runs, with its parameters resolved, for
 /// showing a reader what the scan is asking of SQLite. Display only: the
-/// query itself still binds its parameters. The identical entity form of a
-/// needle without `& < >` is folded into one pair of terms.
+/// query itself still binds its parameters, so the doubling of `'` here is
+/// about rendering valid SQL on screen, not about what runs. The identical
+/// entity form of a needle without `& < >` is folded into one pair of terms.
 pub fn search_filter_sql(needle: &str, author: Option<&str>, limit: usize) -> String {
+    let quoted = |text: &str| format!("'{}'", text.replace('\'', "''"));
     let (like, like_stored) = search_patterns(needle);
     let mut terms = vec![like.clone()];
     if like_stored != like {
@@ -332,12 +334,12 @@ pub fn search_filter_sql(needle: &str, author: Option<&str>, limit: usize) -> St
         .iter()
         .flat_map(|pattern| {
             [
-                format!("TXT LIKE '{pattern}' ESCAPE '\\'"),
-                format!("CAST(DATA AS TEXT) LIKE '{pattern}' ESCAPE '\\'"),
+                format!("TXT LIKE {} ESCAPE '\\'", quoted(pattern)),
+                format!("CAST(DATA AS TEXT) LIKE {} ESCAPE '\\'", quoted(pattern)),
             ]
         })
         .collect();
-    let who = author.map_or_else(|| "NULL".to_string(), |id| format!("'{id}'"));
+    let who = author.map_or_else(|| "NULL".to_string(), quoted);
     format!(
         "… WHERE ({}) AND ({who} IS NULL OR json_extract(DATA,'$.user') = {who}) LIMIT {limit}",
         matches.join(" OR ")

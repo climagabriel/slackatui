@@ -422,8 +422,25 @@ impl TopSection {
 pub struct LiveHits {
     /// Hits Slack returned that the archive scan had not found.
     pub added: usize,
-    /// Archive hits Slack did not return: messages only the cache holds.
+    /// Archive hits Slack did not return.
     pub cache_only: usize,
+    /// Slack ran out of results before the cap, so what it returned is
+    /// everything it holds for the query. Only then does `cache_only` mean
+    /// "the cache has these and Slack does not"; short of it, it means "not
+    /// among the first `SEARCH_CAP` Slack gave".
+    pub complete: bool,
+}
+
+impl LiveHits {
+    /// The clause a title or a progress line adds for the cache-only count,
+    /// empty when there is none to report.
+    pub fn cache_only_label(self) -> String {
+        match (self.cache_only, self.complete) {
+            (0, _) => String::new(),
+            (n, true) => format!("{n} only in cache"),
+            (n, false) => format!("{n} not in Slack's first {SEARCH_CAP}"),
+        }
+    }
 }
 
 /// What the archive scan needs its result handled with: the decisions
@@ -440,6 +457,12 @@ pub struct ArchiveSearch {
     author_unresolved: bool,
     /// Started from the conversation list, which replaces what is on screen.
     from_list: bool,
+    /// The progress end of a scan that draws no box. The worker treats a
+    /// dropped receiver as cancellation, so a scan nobody is narrating still
+    /// needs one held for as long as it runs. Held, never read: dropping it
+    /// with this struct is exactly what cancels such a scan.
+    #[allow(dead_code)]
+    unwatched: Option<std::sync::mpsc::Receiver<crate::live::ScanLine>>,
 }
 
 /// The `/find` progress box: what the archive scan has said so far, and
@@ -581,6 +604,10 @@ pub struct App {
     pub half_life_days: f64,
     /// The one slackdump run in flight, if any.
     pub job: Option<Job>,
+    /// The cross-conversation archive scan, in a slot of its own: it never
+    /// competed for the fetch slot when it ran inline, so a busy client must
+    /// not be able to refuse a search.
+    pub scan: Option<Job>,
     /// The progress box a running `/find` draws over everything else.
     pub scan_overlay: Option<ScanOverlay>,
     /// The archive scan in flight and what to do with what it finds.
@@ -733,6 +760,7 @@ impl App {
             msgs_height: 0,
             half_life_days,
             job: None,
+            scan: None,
             scan_overlay: None,
             pending_search: None,
             spinner: 0,
@@ -2333,7 +2361,7 @@ impl App {
         for view in &mut self.stack {
             if let View::Search {live_pending,..}=view { *live_pending=false; }
         }
-        for slot in [&mut self.job, &mut self.bg] {
+        for slot in [&mut self.job, &mut self.bg, &mut self.scan] {
             if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. } | JobKind::Sent { .. } | JobKind::SentContext { .. } | JobKind::Search { .. } | JobKind::ArchiveScan { .. })) { *slot = None; }
         }
         // The box narrates exactly the jobs just dropped.
@@ -2634,17 +2662,17 @@ impl App {
             slack: parsed.slack.clone(),
             author_unresolved: wants_author && parsed.user_id.is_none(),
             from_list: self.focus == Focus::Convs,
+            unwatched: None,
         };
         let (sender, progress) = std::sync::mpsc::channel();
-        let job = live::archive_scan(query.to_string(), request, sender);
-        // The scan never competed for the fetch slot when it ran inline, so a
-        // busy slot must not refuse it now: the quiet slot takes it instead.
-        if self.job.is_none() {
-            self.job = Some(job);
-        } else if self.bg.is_none() {
-            self.bg = Some(job);
-        } else {
-            self.status = "a fetch is already running; try again in a moment".to_string();
+        let single = pending.cid.is_some();
+        self.scan = Some(live::archive_scan(query.to_string(), request, sender));
+        // One conversation is tens of milliseconds; a box that appears and
+        // goes within a frame is worse than none. The worker still does the
+        // work, it just says nothing about it, and its progress end is parked
+        // so it does not read the silence as a cancellation.
+        if single {
+            self.pending_search = Some(ArchiveSearch { unwatched: Some(progress), ..pending });
             return;
         }
         self.pending_search = Some(pending);
@@ -2751,7 +2779,7 @@ impl App {
         self.scan_overlay = None;
         if live_phase { return; }
         self.pending_search = None;
-        for slot in [&mut self.job, &mut self.bg] {
+        for slot in [&mut self.job, &mut self.bg, &mut self.scan] {
             if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::ArchiveScan { .. })) { *slot = None; }
         }
         self.status = "search cancelled".to_string();
@@ -2848,13 +2876,14 @@ impl App {
         let hits = Archive::open("live/search".to_string(), dir).and_then(|a| a.search_hits());
         let _ = std::fs::remove_dir_all(dir);
         match hits {
-            Ok(h) => self.merge_hits(query, h),
+            // A slackdump search directory is everything that run collected.
+            Ok(h) => self.merge_hits(query, h, true),
             Err(e) => self.status = format!("live search: {e}"),
         }
     }
 
     /// Fold what Slack found into the search view still showing that query.
-    fn merge_hits(&mut self, query: &str, hits: Vec<Msg>) {
+    fn merge_hits(&mut self, query: &str, hits: Vec<Msg>, complete: bool) {
         let total = hits.len();
         let mut counts = None;
         match self
@@ -2898,10 +2927,11 @@ impl App {
                 if let Some(id) = cursor_id {
                     list.cursor = list.msgs.iter().position(|m| (m.channel_id.clone(),m.id) == id).unwrap_or(0);
                 }
-                *live_hits = Some(LiveHits { added, cache_only });
+                let seen_all = LiveHits { added, cache_only, complete };
+                *live_hits = Some(seen_all);
                 *live_pending = false;
                 list.mark_dirty();
-                counts = Some((added, cache_only));
+                counts = Some(seen_all);
                 self.status = format!(
                     "Slack: {total} hit{}, {added} not in the cache",
                     if total == 1 { "" } else { "s" }
@@ -2909,9 +2939,13 @@ impl App {
             }
             _ => self.status = format!("live search finished after its view closed: {total} hits"),
         }
-        if let Some((added, cache_only)) = counts {
+        if let Some(counts) = counts {
+            let cache_only = counts.cache_only_label();
             self.say_in_scan(live::ScanLine::plain(format!(
-                "Slack: {total} hits · +{added} new · {cache_only} only in cache"
+                "Slack: {total} hits{} · +{} new{}",
+                if complete { String::new() } else { format!(" (first {SEARCH_CAP}, more to come)") },
+                counts.added,
+                if cache_only.is_empty() { String::new() } else { format!(" · {cache_only}") },
             )));
         }
         // Slack was the last half of the search; the box has nothing left.
@@ -3805,6 +3839,26 @@ impl App {
                 }
             }
         }
+        // The scan's own slot: the archive search, which must never be
+        // refused because the other two are busy.
+        if let Some(outcome) = self.scan.as_ref().and_then(|job| job.poll()) {
+            let job = self.scan.take().expect("polled");
+            match outcome {
+                Ok(Done::ArchiveHits { hits, capped, users }) => {
+                    if let JobKind::ArchiveScan { query } = job.kind {
+                        self.adopt_scan_users(users);
+                        self.finish_archive_search(&query, hits, capped);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.pending_search = None;
+                    self.say_in_scan(live::ScanLine::plain(error.clone()));
+                    self.close_scan_overlay();
+                    self.status = error;
+                }
+            }
+        }
         // The quiet slot: sign-in, the conversation list, counts, tails.
         if let Some(outcome) = self.bg.as_ref().and_then(|j| j.poll()) {
             let job = self.bg.take().expect("polled");
@@ -4074,7 +4128,7 @@ impl App {
                 self.finish_archive_search(&query, hits, capped);
             }
             (JobKind::Search { query }, Done::Search(dir)) => self.merge_live_search(&query, &dir),
-            (JobKind::Search { query }, Done::SearchHits(hits)) => self.merge_hits(&query, hits),
+            (JobKind::Search { query }, Done::SearchHits { hits, complete }) => self.merge_hits(&query, hits, complete),
             (JobKind::ArchiveNew { spec }, Done::Archived(dir)) => self.finish_archive(&dir, &spec, job.navigate_on_completion),
             (JobKind::Tail { conv }, Done::Messages(msgs)) => self.append_tail(conv, msgs, false),
             (JobKind::Older { conv }, Done::OlderMessages(msgs, more)) => self.prepend_older(conv, msgs, more),
@@ -4332,11 +4386,14 @@ impl App {
                     " · searching Slack".to_string()
                 } else {
                     live_hits
-                        .map(|n| format!(
-                            " · {} more from Slack{}",
-                            n.added,
-                            if n.cache_only > 0 { format!(" · {} only in cache", n.cache_only) } else { String::new() },
-                        ))
+                        .map(|n| {
+                            let cache_only = n.cache_only_label();
+                            format!(
+                                " · {} more from Slack{}",
+                                n.added,
+                                if cache_only.is_empty() { String::new() } else { format!(" · {cache_only}") },
+                            )
+                        })
                         .unwrap_or_else(||" · cached results only".into())
                 };
                 format!(
@@ -6166,7 +6223,7 @@ pub(crate) mod tests {
         app.mode=Mode::Normal;
         app.run_command("/find from:@me","");app.finish_archive_scan_for_test();
         assert!(app.focus==Focus::Msgs);assert!(app.open.is_none());
-        let mut hit=msg(2,"authored message");hit.channel_id="C1".into();app.merge_hits("from:@me",vec![hit]);
+        let mut hit=msg(2,"authored message");hit.channel_id="C1".into();app.merge_hits("from:@me",vec![hit],true);
         let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
         let text:String=terminal.backend().buffer().content.iter().map(|cell|cell.symbol()).collect();assert!(text.contains("authored message"));
         app.open_hit("C1".into(),2_000_000,2_000_000);assert!(app.open.is_none());
@@ -6174,7 +6231,8 @@ pub(crate) mod tests {
         app.on_msg_key(Some(Action::Back));assert!(app.focus==Focus::Convs);
         let (tx,rx)=std::sync::mpsc::channel();
         app.api=Some(Arc::new(Client::for_test(move |method,params| {
-            assert_eq!(method,"search.messages");tx.send(params.iter().find(|(key,_)|*key=="query").unwrap().1.to_string()).unwrap();Ok(json!({"messages":{"matches":[]}}))
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            tx.send(params.iter().find(|(key,_)|*key=="query").unwrap().1.to_string()).unwrap();Ok(json!({"messages":{"matches":[]}}))
         })));
         app.live=true;app.run_command("/find from:@me nginx","");app.finish_archive_scan_for_test();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"from:U1 nginx");
@@ -6194,7 +6252,7 @@ pub(crate) mod tests {
         app.run_command("/find from:@me again","");app.finish_archive_scan_for_test();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"in:<#COTHER> from:U1 again");
         // A request still in flight when the scan lands keeps Slack out of it;
-        // the scan itself takes the quiet slot rather than being refused.
+        // the scan runs regardless, in its own slot.
         app.go_home();
         let (busy,_keep)=live::pending_job(JobKind::Profiles);app.job=Some(busy);
         app.run_command("/find from:@me","");app.finish_archive_scan_for_test();
@@ -6323,8 +6381,10 @@ pub(crate) mod tests {
         // Signed in, Slack is asked the bare needle: no in: filter from the
         // list, and from:@ still combines with it.
         let (tx, rx) = std::sync::mpsc::channel();
+        // Only the search is under test; ordinary background calls (counts,
+        // muted channels) reach the same stub and must not panic its thread.
         app.api = Some(Arc::new(Client::for_test(move |method, params| {
-            assert_eq!(method, "search.messages");
+            if method != "search.messages" { return Ok(quiet_slack()); }
             tx.send(params.iter().find(|(key, _)| *key == "query").unwrap().1.to_string()).unwrap();
             Ok(json!({"messages":{"matches":[]}}))
         })));
@@ -6370,6 +6430,14 @@ pub(crate) mod tests {
             attach_archive(&mut app, "COTHER", &[(2, None, "nginx over there"), (4, None, "nothing to see")]),
         ];
         (app, dirs)
+    }
+
+    /// What a stub answers for the ordinary background calls a signed-in app
+    /// makes: enough shape that none of them writes an error over the status
+    /// the search under test just set.
+    fn quiet_slack() -> serde_json::Value {
+        json!({"ok": true, "prefs": {"all_notifications_prefs": {"channels": {}}},
+               "items": [], "channels": [], "ims": [], "mpims": []})
     }
 
     /// Let the worker narrate without collecting its result, so the box can
@@ -6479,23 +6547,90 @@ pub(crate) mod tests {
         for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
     }
 
-    /// The scan takes the quiet slot when the fetch slot is busy, and its
-    /// result has to be picked up there too.
+    /// The scan has a slot of its own, so a busy client cannot refuse a
+    /// search, and its result is collected from that third slot.
     #[test]
-    fn a_scan_in_the_quiet_slot_still_pushes_its_view() {
+    fn a_scan_runs_and_lands_with_both_other_slots_busy() {
         let (mut app, dirs) = scan_test_app();
-        let (busy, _keep) = live::pending_job(JobKind::Profiles);
-        app.job = Some(busy);
+        let (fetching, _hold_job) = live::pending_job(JobKind::Refresh { conv: 0, before: 0 });
+        let (polling, _hold_bg) = live::pending_job(JobKind::Counts { gen: 0 });
+        app.job = Some(fetching);
+        app.bg = Some(polling);
         app.run_command("/find message: nginx", "");
-        assert!(app.job.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Profiles)));
-        assert!(app.bg.as_ref().is_some_and(|job| matches!(job.kind, JobKind::ArchiveScan { .. })),
-            "the scan did not take the quiet slot");
+        assert_ne!(app.status, "a fetch is already running; try again in a moment");
+        assert!(app.job.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Refresh { .. })), "the fetch slot was taken");
+        assert!(app.bg.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Counts { .. })), "the quiet slot was taken");
+        assert!(app.scan.as_ref().is_some_and(|job| matches!(job.kind, JobKind::ArchiveScan { .. })), "no scan started");
         app.finish_archive_scan_for_test();
         let Some(View::Search { list, query, .. }) = app.stack.last() else { panic!("no search view") };
         assert_eq!(query, "nginx");
         assert_eq!(list.msgs.len(), 3);
         assert_eq!(app.focus, Focus::Msgs);
+        assert!(app.status.contains("3 cached message matches"), "{}", app.status);
         app.job = None;
+        app.bg = None;
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// One conversation is too fast to be worth a box; the scan still runs.
+    #[test]
+    fn a_single_conversation_scan_runs_without_a_box() {
+        let (mut app, dirs) = scan_test_app();
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.run_command("/find from:@gabriel.clima", "");
+        assert!(app.scan.is_some(), "the scan did not start");
+        assert!(app.scan_overlay.is_none(), "a box flashed for a one-conversation search");
+        // With no box up, ordinary keys still reach the UI.
+        assert!(!app.scan_running());
+        app.finish_archive_scan_for_test();
+        let Some(View::Search { list, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(list.source_channel.as_deref(), Some("C1"));
+        // One conversation only: COTHER's message is not in this search.
+        assert_eq!(list.msgs.len(), 2);
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// A needle carrying an apostrophe still renders as valid SQL.
+    #[test]
+    fn the_narrated_statement_doubles_apostrophes() {
+        let (mut app, dirs) = scan_test_app();
+        app.run_command("/find message: O'Reilly", "");
+        wait_for_scan_lines(&mut app, 1);
+        let first = app.scan_overlay.as_ref().unwrap().lines[0].text.clone();
+        assert!(first.contains("LIKE '%O''Reilly%' ESCAPE"), "{first}");
+        // Doubling is for the display only; the bound query is untouched.
+        assert!(!first.contains("'%O'Reilly%'"), "{first}");
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// The newest line is always visible, however narrow the box and however
+    /// long that line: the body is wrapped before its tail is taken.
+    #[test]
+    fn the_box_keeps_the_newest_line_visible_at_any_width() {
+        let (mut app, dirs) = scan_test_app();
+        app.run_command("/find message: nginx", "");
+        wait_for_scan_lines(&mut app, 1);
+        let overlay = app.scan_overlay.as_mut().unwrap();
+        overlay.lines.clear();
+        for filler in 0..40 {
+            overlay.lines.push(live::ScanLine::plain(format!("earlier line {filler} that is quite long and wraps")));
+        }
+        let tail = "THE-TAIL-OF-THE-NEWEST-LINE";
+        overlay.lines.push(live::ScanLine::plain(format!("{} {tail}", "x".repeat(400))));
+        for (width, height) in [(20, 8), (120, 30), (40, 12)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rect = crate::ui::scan_overlay_rect(ratatui::layout::Rect::new(0, 0, width, height));
+            let inner = ratatui::widgets::Block::bordered().inner(rect);
+            // The interior is not blank, and the tail of the newest line is on it.
+            let body: String = (inner.y..inner.y + inner.height)
+                .flat_map(|row| (inner.x..inner.x + inner.width).map(move |column| (column, row)))
+                .map(|at| buffer[at].symbol().to_string())
+                .collect();
+            assert!(body.trim().len() > 4, "{width}x{height}: the box drew nothing");
+            assert!(body.contains(tail), "{width}x{height}: the newest line's tail is off screen");
+        }
         for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
     }
 
@@ -6506,7 +6641,7 @@ pub(crate) mod tests {
         let (mut app, dirs) = scan_test_app();
         let (tx, rx) = std::sync::mpsc::channel();
         app.api = Some(Arc::new(Client::for_test(move |method, params| {
-            assert_eq!(method, "search.messages");
+            if method != "search.messages" { return Ok(quiet_slack()); }
             tx.send(params.iter().find(|(key, _)| *key == "query").unwrap().1.to_string()).unwrap();
             // One hit the archive already has, one only Slack has; the
             // archive's newest hit is left out, so it is cache-only.
@@ -6532,12 +6667,80 @@ pub(crate) mod tests {
         assert_eq!(overlay.lines.last().unwrap().text, "Slack: 3 hits · +1 new · 1 only in cache");
         assert!(overlay.finished);
         let Some(View::Search { live_hits, live_pending, list, .. }) = app.stack.last() else { panic!("no search view") };
-        assert_eq!(*live_hits, Some(LiveHits { added: 1, cache_only: 1 }));
+        assert_eq!(*live_hits, Some(LiveHits { added: 1, cache_only: 1, complete: true }));
         assert!(!live_pending);
         assert_eq!(list.msgs.len(), 4);
         assert_eq!(app.title(), "search 'nginx' · 4 hits · 1 more from Slack · 1 only in cache");
         app.tick();
         assert!(app.scan_overlay.is_none(), "the box outlived the search");
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// Slack's answer is paged to the archive's own cap, so "only in cache"
+    /// is measured against everything Slack holds, not against one page.
+    #[test]
+    fn the_live_search_pages_to_the_cap_before_counting_cache_only_hits() {
+        let (mut app, dirs) = scan_test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            let cursor = params.iter().find(|(key, _)| *key == "cursor").unwrap().1.to_string();
+            tx.send(cursor.clone()).unwrap();
+            // Page one holds a hit the archive already has and says there is
+            // more; page two holds one the archive does not, and ends.
+            Ok(match cursor.as_str() {
+                "*" => json!({"messages":{"matches":[
+                        {"channel":{"id":"C1","name":"one"},"ts":"1.000000","user":"U1","text":"nginx in one"}],
+                    "pagination":{"next_cursor":"page2"}}}),
+                _ => json!({"messages":{"matches":[
+                        {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}],
+                    "pagination":{"next_cursor":""}}}),
+            })
+        })));
+        app.live = true;
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.job.is_some() && Instant::now() < deadline { app.tick(); std::thread::sleep(Duration::from_millis(1)); }
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "*");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "page2", "the second page was never asked for");
+        // Slack held 2; the archive's other 2 hits are genuinely cache-only.
+        let Some(View::Search { live_hits, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(*live_hits, Some(LiveHits { added: 1, cache_only: 2, complete: true }));
+        assert!(app.title().contains("2 only in cache"), "{}", app.title());
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// When Slack still has more at the cap, its answer is not the whole of
+    /// what Slack holds, so the count must not be called "only in cache".
+    #[test]
+    fn a_truncated_slack_answer_never_claims_a_hit_is_only_in_cache() {
+        let (mut app, dirs) = scan_test_app();
+        let page = std::sync::atomic::AtomicUsize::new(0);
+        app.api = Some(Arc::new(Client::for_test(move |method, _| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            // Every page is full and every page says there is another, so the
+            // cap is reached with a cursor still outstanding.
+            let n = page.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let matches: Vec<_> = (0..100).map(|index| json!({
+                "channel": {"id": "C1", "name": "one"},
+                "ts": format!("{}.000000", 1000 + n * 100 + index), "user": "U1", "text": "nginx"
+            })).collect();
+            Ok(json!({"messages":{"matches":matches,"pagination":{"next_cursor":format!("page{}", n + 1)}}}))
+        })));
+        app.live = true;
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.job.is_some() && Instant::now() < deadline { app.tick(); std::thread::sleep(Duration::from_millis(1)); }
+        let Some(View::Search { live_hits, .. }) = app.stack.last() else { panic!("no search view") };
+        let counts = live_hits.expect("Slack answered");
+        assert_eq!(counts.added, SEARCH_CAP);
+        assert_eq!(counts.cache_only, 3);
+        assert!(!counts.complete, "a page with a cursor left over was called complete");
+        let title = app.title();
+        assert!(!title.contains("only in cache"), "overstated: {title}");
+        assert!(title.contains(&format!("3 not in Slack's first {SEARCH_CAP}")), "{title}");
         for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
     }
 
@@ -6561,9 +6764,12 @@ pub(crate) mod tests {
     #[test]
     fn escape_during_the_slack_phase_keeps_the_list_and_the_job() {
         let (mut app, dirs) = scan_test_app();
-        app.api = Some(Arc::new(Client::for_test(|_, _| Ok(json!({"messages":{"matches":[
-            {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}
-        ]}})))));
+        app.api = Some(Arc::new(Client::for_test(|method, _| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            Ok(json!({"messages":{"matches":[
+                {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}
+            ]}}))
+        })));
         app.live = true;
         app.run_command("/find message: nginx", "");
         app.finish_archive_scan_for_test();

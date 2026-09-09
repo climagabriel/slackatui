@@ -133,7 +133,9 @@ pub enum Done {
     Thread(PathBuf),
     ThreadMsgs(Vec<Msg>),
     Search(PathBuf),
-    SearchHits(Vec<Msg>),
+    /// What Slack returned for a search, and whether that is everything it
+    /// holds for the query or only as far as the cap reached.
+    SearchHits { hits: Vec<Msg>, complete: bool },
     /// What the archive scan found: the hit list the view shows, whether the
     /// cap truncated it, and the user maps the worker read, by archive index,
     /// so the next scan and the UI's own rendering do not read them again.
@@ -338,7 +340,10 @@ pub fn api_search_labeled(client: Arc<Client>, query: String, label: String) -> 
         JobKind::Search { query: label },
         format!("searching Slack for '{q}'"),
         move || {
-            let matches = client.search(&q, 100)?;
+            // Paged to the same cap the archive scan uses, so the two hit
+            // lists are comparable and the difference between them means
+            // something.
+            let (matches, complete) = client.search_all(&q, crate::archive::SEARCH_CAP)?;
             let mut out = Vec::new();
             for m in matches {
                 let cid = m
@@ -355,7 +360,7 @@ pub fn api_search_labeled(client: Arc<Client>, query: String, label: String) -> 
                     out.push(msg);
                 }
             }
-            Ok(Done::SearchHits(out))
+            Ok(Done::SearchHits { hits: out, complete })
         },
     )
 }
