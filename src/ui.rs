@@ -25,11 +25,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let rows = app.prompt_rows();
     let [main, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(rows)]).areas(area);
-    let conv_w = (area.width / 4).clamp(22, 40);
-    let [left, right] =
-        Layout::horizontal([Constraint::Length(conv_w), Constraint::Min(20)]).areas(main);
-    draw_convs(frame, app, left);
-    draw_msgs(frame, app, right);
+    if app.focus == Focus::Convs && !matches!(app.mode, Mode::Prompt { .. }) { app.conversations_visible = true; }
+    if app.conversations_visible {
+        let conv_w = (area.width / 4).clamp(22, 40);
+        let [left, right] = Layout::horizontal([Constraint::Length(conv_w), Constraint::Min(20)]).areas(main);
+        draw_convs(frame, app, left);
+        draw_msgs(frame, app, right);
+    } else {
+        draw_msgs(frame, app, main);
+    }
     draw_status(frame, app, status);
     draw_suggestions(frame, app, main);
     if app.help {
@@ -962,7 +966,7 @@ const HELP: &[HelpRow] = &[
     HelpRow::Bound(Action::Quit, "quit"),
     HelpRow::Fixed(
         "in a prompt",
-        "Ctrl-a/e line start/end, Ctrl-b/f and Alt-b/f by char and word, Ctrl-k/u kill to line end/start, Ctrl-w and Alt-d kill a word, Ctrl-y yank, Ctrl-d delete under the cursor; Ctrl-j or Alt-Enter a newline in a message",
+        "Ctrl-a/e line start/end, Left/Ctrl-f and Alt-b/f by char and word; Ctrl-b toggles conversations, Ctrl-k/u kill to line end/start, Ctrl-w and Alt-d kill a word, Ctrl-y yank, Ctrl-d delete under the cursor; Ctrl-j or Alt-Enter a newline in a message",
     ),
 ];
 
@@ -1206,6 +1210,36 @@ mod message_focus_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn control_b_toggles_sidebar_and_back_reveals_it() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "│");
+        let toggle = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        app.on_key(toggle);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.conversations_visible);
+        assert_ne!(terminal.backend().buffer()[(1, 1)].symbol(), "S");
+        app.on_key(toggle);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.conversations_visible);
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "S");
+        app.on_key(toggle);
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.conversations_visible);
+        assert_eq!(app.focus, Focus::Convs);
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.on_key(toggle);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.conversations_visible);
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(matches!(app.mode, Mode::Prompt { .. }));
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub enum Action {
     Back,
     Close,
     OtherPane,
+    ToggleConversations,
     Command,
     Keys,
     ConversationsPane,
@@ -63,6 +64,7 @@ impl Action {
             Action::Back => "back one view, then the list",
             Action::Close => "home; again: first conversation",
             Action::OtherPane => "the other pane",
+            Action::ToggleConversations => "show/hide conversations pane",
             Action::Command => "a command line",
             Action::Keys => "this key editor",
             Action::ConversationsPane => "choose visible conversations",
@@ -104,6 +106,7 @@ impl Action {
             Action::Back => "back",
             Action::Close => "close",
             Action::OtherPane => "other_pane",
+            Action::ToggleConversations => "toggle_conversations",
             Action::Command => "command",
             Action::Keys => "keys",
             Action::ConversationsPane => "conversations_pane",
@@ -140,13 +143,14 @@ pub const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::HalfPageDown, &["ctrl-d", "f"]),
     (Action::HalfPageUp, &["ctrl-u", "b"]),
     (Action::PageDown, &["ctrl-f", "page-down"]),
-    (Action::PageUp, &["ctrl-b", "page-up"]),
+    (Action::PageUp, &["page-up"]),
     (Action::First, &["g", "home"]),
     (Action::Last, &["G", "end"]),
     (Action::Open, &["enter", "l", "right"]),
     (Action::Back, &["h", "left"]),
     (Action::Close, &["esc"]),
     (Action::OtherPane, &["tab"]),
+    (Action::ToggleConversations, &["ctrl-b"]),
     (Action::Command, &["/"]),
     (Action::Keys, &[]),
     (Action::ConversationsPane, &["ctrl-shift-p"]),
@@ -420,6 +424,10 @@ impl Keymap {
                 && list.len() == 1 && list[0].as_str() == Some("T") {
                 continue;
             }
+            if *action == Action::PageUp && !object.contains_key("toggle_conversations")
+                && value == &serde_json::json!(["ctrl-b", "page-up"]) {
+                continue;
+            }
             keymap.bindings.retain(|(_, a)| a != action);
             for item in list {
                 let text = item.as_str().ok_or_else(|| {
@@ -496,6 +504,16 @@ mod tests {
                 KeyModifiers::NONE
             },
         )
+    }
+
+    #[test]
+    fn old_page_up_default_migrates_to_sidebar_toggle() {
+        let path = std::env::temp_dir().join(format!("slack-tui-sidebar-keys-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"page_up":["ctrl-b","page-up"]}"#).unwrap();
+        let keymap = Keymap::load(Some(&path)).unwrap();
+        assert_eq!(keymap.action(press(KeyCode::Char('b'), true)), Some(Action::ToggleConversations));
+        assert_eq!(keymap.action(press(KeyCode::PageUp, false)), Some(Action::PageUp));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

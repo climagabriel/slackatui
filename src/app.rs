@@ -465,6 +465,7 @@ pub struct App {
     pub corpus: Corpus,
     pub tz: Tz,
     pub focus: Focus,
+    pub conversations_visible: bool,
     pub sort: Sort,
     pub filter: String,
     pub filtered: Vec<usize>,
@@ -617,6 +618,7 @@ impl App {
             corpus,
             tz,
             focus: Focus::Convs,
+            conversations_visible: true,
             sort: Sort::Recent,
             filter: String::new(),
             filtered: Vec::new(),
@@ -4076,6 +4078,13 @@ impl App {
 
     pub fn on_key(&mut self, k: KeyEvent) {
         self.last_key = Some((crate::keys::received_key(k), Instant::now()));
+        if self.keymap.action(k) == Some(Action::ToggleConversations)
+            && !matches!(self.stack.last(), Some(View::Keys { capture: Some(_), .. })) {
+            self.conversations_visible = !self.conversations_visible;
+            if !self.conversations_visible && self.focus == Focus::Convs && !matches!(self.mode, Mode::Prompt { .. }) { self.focus = Focus::Msgs; }
+            self.pending_delete = None;
+            return;
+        }
         if k.code == KeyCode::Esc {
             if let Some(browser) = self.channel_browser.as_mut().filter(|browser| browser.visible && browser.escape_edits()) {
                 browser.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
