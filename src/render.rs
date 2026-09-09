@@ -282,6 +282,13 @@ pub struct Sty {
 pub struct Seg {
     pub text: String,
     pub sty: Sty,
+    table: Option<Table>,
+}
+
+#[derive(Clone, Debug)]
+struct Table {
+    rows: Vec<Vec<Vec<Seg>>>,
+    align: Vec<String>,
 }
 
 impl Seg {
@@ -289,6 +296,7 @@ impl Seg {
         Seg {
             text: text.into(),
             sty,
+            table: None,
         }
     }
     fn br() -> Seg {
@@ -302,6 +310,10 @@ impl Seg {
 
 pub fn plain(segs: &[Seg]) -> String {
     segs.iter().map(|s| s.text.as_str()).collect()
+}
+
+fn has_content(segs: &[Seg]) -> bool {
+    segs.iter().any(|seg| seg.table.as_ref().is_some_and(|table| table.rows.iter().any(|row| !row.is_empty()))) || !plain(segs).trim().is_empty()
 }
 
 pub fn unescape(s: &str) -> String {
@@ -607,6 +619,22 @@ pub fn render_blocks(blocks: &[Value], ctx: &Ctx, base: Sty) -> Vec<Seg> {
     let mut out = Vec::new();
     for b in blocks {
         match b.get("type").and_then(Value::as_str).unwrap_or("") {
+            "table" => {
+                let base = Sty { quote: false, ..base };
+                let rows: Vec<Vec<Vec<Seg>>> = arr(b, "rows").filter_map(Value::as_array).map(|row| {
+                    row.iter().map(|cell| match cell.get("type").and_then(Value::as_str) {
+                        Some("rich_text") => render_blocks(std::slice::from_ref(cell), ctx, base),
+                        Some("raw_number") => vec![Seg::new(cell.get("value").map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())).unwrap_or_default(), base)],
+                        _ => vec![Seg::new(cell.get("text").and_then(Value::as_str).unwrap_or(""), base)],
+                    }).collect()
+                }).collect();
+                let text = rows.iter().map(|row| row.iter().map(|cell| plain(cell)).collect::<Vec<_>>().join("\t")).collect::<Vec<_>>().join("\n");
+                let align = arr(b, "column_settings").map(|column| column.get("align").and_then(Value::as_str).unwrap_or("left").to_string()).collect();
+                let mut segment = Seg::new(text, base);
+                segment.table = Some(Table { rows, align });
+                out.push(segment);
+                out.push(Seg::br());
+            }
             "rich_text" => {
                 for el in arr(b, "elements") {
                     rich_element(el, ctx, base, &mut out);
@@ -836,7 +864,7 @@ fn attachment(att: &Value, ctx: &Ctx, base: Sty) -> Vec<Seg> {
     if let Some(bl) = att.get("blocks").and_then(Value::as_array) {
         block_segs = render_blocks(bl, ctx, q);
     }
-    if !plain(&block_segs).trim().is_empty() {
+    if has_content(&block_segs) {
         out.extend(block_segs);
         any = true;
     } else if !s("text").is_empty() {
@@ -881,12 +909,12 @@ pub fn body(m: &Msg, ctx: &Ctx) -> Vec<Seg> {
     if let Some(bl) = m.data.get("blocks").and_then(Value::as_array) {
         segs = render_blocks(bl, ctx, base);
     }
-    if plain(&segs).trim().is_empty() {
+    if !has_content(&segs) {
         segs = mrkdwn(&m.text, ctx, base);
     }
     if let Some(atts) = m.data.get("attachments").and_then(Value::as_array) {
         for att in atts {
-            if !plain(&segs).trim().is_empty() {
+            if has_content(&segs) {
                 segs.push(Seg::br());
             }
             segs.extend(attachment(att, ctx, base));
@@ -989,9 +1017,85 @@ fn is_blank(line: &Line) -> bool {
         .all(|s| s.content.trim().is_empty() || s.content.as_ref() == "│ ")
 }
 
+/// Render cells only after the reading pane width is known.
+fn table_lines(table: &Table, width: usize, indent: &str, palette: &Palette) -> Vec<Line<'static>> {
+    let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 { return Vec::new(); }
+    let available = width.saturating_sub(indent.width());
+    let minimums: Vec<usize> = (0..columns).map(|column| {
+        if table.rows.iter().filter_map(|row| row.get(column)).flatten().any(|seg| seg.sty.quote) { 4 } else { 2 }
+    }).collect();
+    // A grid needs at least one cell column and its separators. At very
+    // narrow widths retain row/cell identity instead of dropping columns.
+    if available < minimums.iter().sum::<usize>() + 3 * columns + 1 {
+        let mut lines = Vec::new();
+        for (row_index, row) in table.rows.iter().enumerate() {
+            lines.extend(wrap(&[Seg::new(format!("Row {}", row_index + 1), Sty { bold: true, ..Sty::default() })], width, indent, palette));
+            for (column, cell) in row.iter().enumerate() {
+                let mut segments = vec![Seg::new(format!("{}: ", column + 1), Sty::default())];
+                segments.extend(cell.clone());
+                lines.extend(wrap(&segments, width, indent, palette));
+            }
+        }
+        return lines;
+    }
+    let mut widths = minimums.clone();
+    for row in &table.rows {
+        for (column, cell) in row.iter().enumerate() {
+            widths[column] = widths[column].max(plain(cell).lines().map(UnicodeWidthStr::width).max().unwrap_or(1));
+        }
+    }
+    let budget = available - (3 * columns + 1);
+    for width in &mut widths { *width = (*width).min(budget); }
+    while widths.iter().sum::<usize>() > budget {
+        let column = (0..columns).filter(|&column| widths[column] > minimums[column]).max_by_key(|&column| widths[column]).unwrap();
+        widths[column] -= 1;
+    }
+    let border = |left: &str, joint: &str, right: &str| {
+        Line::from(format!("{indent}{left}{}{right}", widths.iter().map(|width| "─".repeat(width + 2)).collect::<Vec<_>>().join(joint)))
+    };
+    let mut lines = vec![border("┌", "┬", "┐")];
+    for (row_index, row) in table.rows.iter().enumerate() {
+        let cells: Vec<Vec<Line<'static>>> = (0..columns).map(|column| row.get(column).map(|cell| wrap(cell, widths[column], "", palette)).unwrap_or_default()).collect();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        for line_index in 0..height {
+            let mut spans = vec![Span::raw(format!("{indent}│"))];
+            for column in 0..columns {
+                let cell = cells[column].get(line_index).cloned().unwrap_or_default();
+                let padding = widths[column].saturating_sub(cell.width());
+                let left = match table.align.get(column).map(String::as_str) {
+                    Some("right") => padding,
+                    Some("center") => padding / 2,
+                    _ => 0,
+                };
+                spans.push(Span::raw(" ".repeat(left + 1)));
+                spans.extend(cell.spans);
+                spans.push(Span::raw(format!("{}│", " ".repeat(padding - left + 1))));
+            }
+            lines.push(Line::from(spans));
+        }
+        if row_index + 1 < table.rows.len() { lines.push(border("├", "┼", "┤")); }
+    }
+    lines.push(border("└", "┴", "┘"));
+    lines
+}
+
 /// Greedy word-wrap, splitting oversized words and preformatted lines at
 /// grapheme boundaries so message text remains visible.
 pub fn wrap(segs: &[Seg], width: usize, indent: &str, palette: &Palette) -> Vec<Line<'static>> {
+    if segs.iter().any(|seg| seg.table.is_some()) {
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for (index, seg) in segs.iter().enumerate() {
+            if let Some(table) = &seg.table {
+                lines.extend(wrap(&segs[start..index], width, indent, palette));
+                lines.extend(table_lines(table, width, indent, palette));
+                start = index + 1;
+            }
+        }
+        lines.extend(wrap(&segs[start..], width, indent, palette));
+        return lines;
+    }
     // Match source text before word wrapping, retaining each segment's semantics.
     let highlighted = palette.highlight_line(Line::from(segs.iter().map(|seg| Span::raw(seg.text.clone())).collect::<Vec<_>>()));
     let mut source = segs.iter().filter(|seg| !seg.text.is_empty());
@@ -1342,6 +1446,75 @@ mod tests {
         let segments = vec![Seg::new("  nginx   -t\nNGINX", Sty { pre: true, ..Sty::default() })];
         let lines = wrap(&segments, 8, "", &palette);
         assert_eq!(lines.iter().map(Line::to_string).collect::<Vec<_>>(), vec!["  nginx ", "  -t", "NGINX"]);
+    }
+
+    #[test]
+    fn table_cells_keep_rows_repeated_values_styles_and_alignment() {
+        let archive = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let context = ctx(&archive, &corpus);
+        let blocks = serde_json::json!([{"type":"table", "column_settings":[{}, {"align":"right"}], "rows":[
+            [{"type":"raw_text","text":"Metric"},{"type":"raw_text","text":"Value"}],
+            [{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"text","text":"TLS","style":{"bold":true}}]}]},{"type":"raw_number","value":199}],
+            [{"type":"raw_text","text":"Same"},{"type":"raw_number","value":199}]
+        ]}]);
+        let segments = render_blocks(blocks.as_array().unwrap(), &context, Sty::default());
+        let lines = wrap(&segments, 80, "", &TEST_PALETTE);
+        assert_eq!(lines.iter().map(Line::to_string).collect::<Vec<_>>(), vec![
+            "┌────────┬───────┐", "│ Metric │ Value │", "├────────┼───────┤",
+            "│ TLS    │   199 │", "├────────┼───────┤", "│ Same   │   199 │", "└────────┴───────┘"
+        ]);
+        assert!(lines[3].spans.iter().any(|span| span.content == "TLS" && span.style.add_modifier.contains(Modifier::BOLD)));
+        for width in [12, 20] {
+            let lines = wrap(&segments, width, "  ", &TEST_PALETTE);
+            assert!(lines.iter().all(|line| line.width() <= width));
+            assert_eq!(lines.iter().map(Line::to_string).collect::<String>().matches("199").count(), 2);
+        }
+    }
+
+    #[test]
+    fn empty_tables_survive_fallback_and_quoted_cells_fit_columns() {
+        let archive = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let context = ctx(&archive, &corpus);
+        let table = serde_json::json!({"type":"table","rows":[[{"type":"raw_text","text":""},{"type":"raw_text","text":""}]]});
+        for attachment in [false, true] {
+            let mut value = serde_json::json!({"ts":"1.0","text":"fallback"});
+            if attachment { value["text"] = serde_json::json!(""); value["attachments"] = serde_json::json!([{"fallback":"fallback","blocks":[table.clone()]}]); }
+            else { value["blocks"] = serde_json::json!([table.clone()]); }
+            let message = Msg::from_api("C1".into(), value).unwrap();
+            let lines = wrap(&body(&message, &context), 40, "", &TEST_PALETTE);
+            assert!(lines[0].to_string().contains('┌'));
+            assert!(!lines.iter().any(|line| line.to_string().contains("fallback")));
+        }
+        let blocks = serde_json::json!([{"type":"table","rows":[[
+            {"type":"rich_text","elements":[{"type":"rich_text_quote","elements":[{"type":"text","text":"界"}]}]},
+            {"type":"raw_text","text":"a long string"}
+        ]]}]);
+        for width in [12, 13, 20] {
+            let lines = wrap(&render_blocks(blocks.as_array().unwrap(), &context, Sty::default()), width, "", &TEST_PALETTE);
+            assert!(lines.iter().all(|line| line.width() <= width));
+        }
+    }
+
+    #[test]
+    fn table_wrapping_keeps_empty_cells_multiline_content_and_surrounding_text() {
+        let archive = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let context = ctx(&archive, &corpus);
+        let blocks = serde_json::json!([
+            {"type":"section","text":{"type":"plain_text","text":"Before"}},
+            {"type":"table","rows":[[{"type":"raw_text","text":"abcdefghijk"},{"type":"raw_text","text":""}],
+                [{"type":"raw_text","text":"界界"},{"type":"raw_text","text":"x\ny"}]]},
+            {"type":"section","text":{"type":"plain_text","text":"After"}}
+        ]);
+        let segments = render_blocks(blocks.as_array().unwrap(), &context, Sty::default());
+        let lines = wrap(&segments, 15, "", &TEST_PALETTE);
+        assert!(lines.iter().all(|line| line.width() <= 15));
+        assert_eq!(lines.first().unwrap().to_string(), "Before");
+        assert_eq!(lines.last().unwrap().to_string(), "After");
+        let text = lines.iter().map(Line::to_string).collect::<String>();
+        for value in ["abcdef", "ghijk", "界界", "x", "y"] { assert!(text.contains(value), "{value}: {text}"); }
     }
 
     #[test]
