@@ -2636,6 +2636,57 @@ impl App {
         }
     }
 
+    fn refresh_conversations(&mut self) {
+        if self.job.is_some() { self.status = "a fetch is already running".into(); return; }
+        let Some(client) = self.api.clone() else {
+            self.status = "Refreshing conversations needs a Slack sign-in".into(); return;
+        };
+        self.counts_gen += 1;
+        self.unread_count_job = None;
+        let gen = self.counts_gen;
+        let mut targets = self.unread_count_targets();
+        self.status = "Refreshing conversations and unread counts from Slack…".into();
+        self.job = Some(live::spawn(JobKind::ConversationRefresh { gen }, "Refreshing conversations".into(), move || {
+            let conversations = client.my_conversations()?;
+            for conversation in &conversations {
+                if let Some(id) = conversation["id"].as_str() {
+                    if !targets.iter().any(|target| target == id) { targets.push(id.to_string()); }
+                }
+            }
+            let mut counts = client.counts()?;
+            for chunk in targets.chunks(10) { counts = client.enrich_unread_counts(counts, chunk)?; }
+            Ok(Done::ConversationSnapshot(conversations, counts))
+        }));
+    }
+
+    fn apply_conversation_snapshot(&mut self, gen: u64, conversations: Vec<Value>, counts: Value) {
+        for entry in &conversations {
+            if let Some(index) = entry["id"].as_str().and_then(|id| self.corpus.conv_by_channel(id)) {
+                self.corpus.convs[index].left = false;
+                if let Some(name) = entry["name"].as_str().filter(|_| matches!(self.corpus.convs[index].kind, Kind::Channel | Kind::Private)) {
+                    self.corpus.convs[index].name = format!("#{name}");
+                }
+            }
+        }
+        self.merge_conversations(conversations);
+        self.apply_filter();
+        if gen == self.counts_gen {
+            self.counts_gen += 1; // Retire quiet snapshots launched during this request.
+            self.apply_counts(&counts);
+            self.apply_unread_counts(&counts);
+            self.last_counts = Instant::now();
+            let missing = ["channels", "ims", "mpims"].iter().flat_map(|kind| counts[*kind].as_array().into_iter().flatten())
+                .filter(|entry| entry["has_unreads"] == true && entry["unread_count"].as_i64().is_none()).count();
+            self.status = if missing == 0 { "Conversations and unread counts refreshed from Slack".into() }
+                else { format!("Conversations refreshed; {missing} unread counts unavailable, Shift+R retries") };
+        } else {
+            self.counts_pending = true;
+            self.status = "Conversations refreshed; requesting newer unread counts".into();
+        }
+        self.muted_pending = true;
+        self.starred_pending = true;
+    }
+
     fn refresh(&mut self) {
         if let Some(View::Thread { root, list, .. }) = self.stack.last() {
             let root = *root;
@@ -2865,6 +2916,7 @@ impl App {
     }
 
     fn pump_requested_counts(&mut self) {
+        if matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::ConversationRefresh { .. })) { return; }
         if self.counts_pending && self.bg.is_none() && self.unread_count_job.is_none() {
             if let Some(client) = self.api.clone() {
                 self.counts_pending = false;
@@ -3476,6 +3528,9 @@ impl App {
         if let Some(outcome) = self.bg.as_ref().and_then(|j| j.poll()) {
             let job = self.bg.take().expect("polled");
             match outcome {
+                Ok(Done::ConversationSnapshot(conversations, counts)) => {
+                    if let JobKind::ConversationRefresh { gen } = job.kind { self.apply_conversation_snapshot(gen, conversations, counts); }
+                }
                 Ok(Done::Auth(client, who)) => {
                     self.api = Some(client.clone());
                     self.profile_job =
@@ -3488,14 +3543,17 @@ impl App {
                 Ok(Done::Conversations(list)) => {
                     self.merge_conversations(list);
                     if let Some(c) = self.api.clone() {
-                        self.bg = Some(live::api_counts(c, self.counts_gen));
+                        if !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::ConversationRefresh { .. })) {
+                            self.bg = Some(live::api_counts(c, self.counts_gen));
+                        }
                         self.muted_pending = true;
                         self.starred_pending = true;
                     }
                 }
                 Ok(Done::Counts(v)) => {
                     // A counts snapshot taken before a mark would undo it.
-                    if matches!(job.kind, JobKind::Counts { gen } if gen == self.counts_gen) {
+                    if matches!(job.kind, JobKind::Counts { gen } if gen == self.counts_gen)
+                        && !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::ConversationRefresh { .. })) {
                         self.apply_counts(&v);
                         let targets = self.unread_count_targets();
                         if self.unread_count_job.is_none() && !targets.is_empty() {
@@ -3584,7 +3642,8 @@ impl App {
                     _ => self.tail_pending = None,
                 }
             }
-            if self.bg.is_none() && self.poll_every.as_secs() > 0 {
+            if self.bg.is_none() && self.poll_every.as_secs() > 0
+                && !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::ConversationRefresh { .. })) {
                 if self.last_poll.elapsed() >= self.poll_every {
                     self.last_poll = Instant::now();
                     // An open thread is what the reader is looking at; the
@@ -3672,6 +3731,7 @@ impl App {
             }
         };
         match (job.kind, done) {
+            (JobKind::ConversationRefresh { gen }, Done::ConversationSnapshot(conversations, counts)) => self.apply_conversation_snapshot(gen, conversations, counts),
             (_, Done::StarChanged { cid, starred, ids }) => self.finish_star(&cid, starred, ids),
             (JobKind::StarredChannels { gen }, Done::StarredChannels(ids)) => self.take_starred_snapshot(gen, ids),
             (_, Done::MuteChanged { cid, muted, ids }) => self.finish_mute(&cid, muted, ids),
@@ -4446,6 +4506,7 @@ impl App {
                         "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
                 }
             }
+            Some(Action::Refresh) => self.refresh_conversations(),
             Some(Action::ConversationsPane) => self.open_conversations_pane(),
             Some(Action::Keys) => self.open_keys(),
             _ => {}
@@ -5156,6 +5217,31 @@ pub(crate) mod tests {
         app.apply_unread_counts(&snapshot);
         assert!(!app.corpus.convs[0].unread);
         assert_eq!(crate::conversations_pane::NumberColumn::Unread.value(&app.corpus.convs[0], false), None);
+    }
+
+    #[test]
+    fn sidebar_refresh_reports_signin_and_applies_counts_without_navigation() {
+        let mut app = mute_test_app();
+        app.focus = Focus::Convs;
+        app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert!(app.status.contains("sign-in"));
+        let cid = app.corpus.convs[0].id.clone();
+        let snapshot = json!({"channels":[{"id":cid,"has_unreads":true,"last_read":"1.000000","latest":"3.000000","unread_count":2}]});
+        app.apply_conversation_snapshot(app.counts_gen, vec![], snapshot.clone());
+        assert!(app.corpus.convs[0].unread);
+        assert_eq!(app.corpus.convs[0].unread_count, Some(2));
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(app.status.contains("refreshed"));
+        app.counts_gen += 1;
+        app.corpus.convs[0].unread = false;
+        app.apply_conversation_snapshot(app.counts_gen - 1, vec![], snapshot);
+        assert!(!app.corpus.convs[0].unread);
+        assert!(app.counts_pending);
+        app.corpus.convs[0].left = true;
+        app.apply_conversation_snapshot(app.counts_gen, vec![json!({"id":cid,"name":"renamed"})],
+            json!({"channels":[{"id":cid,"has_unreads":true,"last_read":"1.000000","latest":"3.000000"}]}));
+        assert!(!app.corpus.convs[0].left);
+        assert!(app.status.contains("1 unread counts unavailable"));
     }
 
     #[test]

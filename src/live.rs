@@ -18,6 +18,7 @@ use crate::auth;
 
 pub enum JobKind {
     OpenBrowser,
+    ConversationRefresh { gen: u64 },
     SentContext { generation: u64, focus: i64, channel: String },
     Sent { generation: u64, append: bool },
     Saved,
@@ -99,6 +100,7 @@ impl JobKind {
     fn log_name(&self) -> &'static str {
         match self {
             Self::OpenBrowser => "open_browser",
+            Self::ConversationRefresh { .. } => "conversation_refresh",
             Self::SentContext {..} => "sent_context",
             Self::MessageLink {..} => "message_link",
             Self::Saved => "saved_messages",
@@ -117,6 +119,7 @@ impl JobKind {
 
 pub enum Done {
     BrowserOpened,
+    ConversationSnapshot(Vec<Value>, Value),
     MessageContext(crate::file_message::Location),
     SentPage(crate::sent::Page),
     Saved(Vec<Msg>),
