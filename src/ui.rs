@@ -22,7 +22,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if background != Color::Reset {
         frame.render_widget(Block::default().style(Style::new().bg(background)), area);
     }
-    let rows = app.prompt_rows();
+    let rows = app.prompt_rows(area.width, area.height);
     let [main, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(rows)]).areas(area);
     if app.conversations_visible() {
@@ -570,6 +570,115 @@ fn editor_lines(ed: &crate::edit::Editor, prefix: Span<'static>) -> Vec<Line<'st
     out
 }
 
+/// Interior rows a compose box shows before it scrolls. The cap the old
+/// one-line prompt kept, now counting wrapped rows rather than typed lines;
+/// the two borders are chrome on top of it.
+pub const COMPOSE_ROWS: usize = 8;
+
+/// What the top border advertises on the right, each an existing binding of
+/// the compose prompt. Dropped from the right end when the border is narrow.
+pub const COMPOSE_HINTS: [&str; 4] = [
+    "Enter send",
+    "Ctrl-j newline",
+    "Esc cancel",
+    "Ctrl-v image",
+];
+
+/// One wrapped layout of a compose draft: the rows drawn, where the cursor
+/// sits among them, and how far the interior has scrolled. The box's height,
+/// its cursor cell and its scrolling all read this one value, so they cannot
+/// disagree about where a character landed.
+pub struct ComposeLayout {
+    /// The draft wrapped to the interior, every byte of it kept.
+    pub rows: Vec<String>,
+    /// The editor cursor as (row of `rows`, column in display cells).
+    pub cursor: (usize, usize),
+    /// First row of `rows` the interior shows.
+    pub scroll: usize,
+    /// Rows the interior shows: `rows.len()`, under the cap.
+    pub visible: usize,
+}
+
+impl ComposeLayout {
+    /// The whole box, both borders included: what `prompt_rows` returns.
+    pub fn height(&self) -> u16 {
+        self.visible as u16 + 2
+    }
+}
+
+/// Wraps a compose draft to the interior of a box `width` cells wide, showing
+/// at most `cap` rows at once and scrolling so the cursor's row is one of them.
+///
+/// The wrapper is `canvas::wrap_lines`, not `render::wrap`. It keeps every byte
+/// of the text it is handed, so a byte offset in the draft maps onto an exact
+/// (row, column) and the cursor cannot drift from what is on screen.
+/// `render::wrap` re-tokenizes on whitespace and applies message styling: it
+/// would both misplace the cursor and show text the send would not carry.
+pub fn compose_layout(ed: &crate::edit::Editor, width: u16, cap: usize) -> ComposeLayout {
+    let width = (width as usize).saturating_sub(2).max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut cursor = (0usize, 0usize);
+    let mut offset = 0usize;
+    for (index, source) in ed.text.split('\n').enumerate() {
+        if index > 0 {
+            // The newline `split` consumed, which no row carries.
+            offset += 1;
+        }
+        let first = rows.len();
+        let wrapped = crate::canvas::wrap_lines(source, width);
+        if ed.cursor >= offset && ed.cursor <= offset + source.len() {
+            let mut left = ed.cursor - offset;
+            cursor = 'place: {
+                for (row, text) in wrapped.iter().enumerate() {
+                    if left < text.len() {
+                        break 'place (first + row, text[..left].width());
+                    }
+                    left -= text.len();
+                }
+                // Past the last byte of the line: after its final row.
+                let last = wrapped.len() - 1;
+                (first + last, wrapped[last].width())
+            };
+        }
+        offset += source.len();
+        rows.extend(wrapped);
+    }
+    // A cursor at the end of a row that fills the interior has no cell of its
+    // own: the next character typed opens a row that does not exist yet. Open
+    // it now, so the terminal cursor stays inside the box.
+    if cursor.1 >= width {
+        rows.insert(cursor.0 + 1, String::new());
+        cursor = (cursor.0 + 1, 0);
+    }
+    let visible = rows.len().min(cap.max(1));
+    let scroll = cursor.0.saturating_sub(visible.saturating_sub(1));
+    ComposeLayout {
+        rows,
+        cursor,
+        scroll,
+        visible,
+    }
+}
+
+/// The compose border's two titles for a box `width` cells wide: the label on
+/// the left, and as many hints as the rest of the border holds on the right.
+/// Hints go first, one at a time from the right end; the label is truncated
+/// only once there is no hint left to drop.
+pub fn compose_titles(label: &str, width: u16) -> (String, String) {
+    let room = width.saturating_sub(2) as usize;
+    let left = format!(" {label} ");
+    for keep in (1..=COMPOSE_HINTS.len()).rev() {
+        let right = format!(" {} ", COMPOSE_HINTS[..keep].join(" · "));
+        if left.width() + right.width() <= room {
+            return (left, right);
+        }
+    }
+    if left.width() <= room {
+        return (left, String::new());
+    }
+    (clip(&left, room), String::new())
+}
+
 /// `/keys`: one action per row with the keys that reach it.
 fn draw_keys(frame: &mut Frame, app: &App, inner: Rect) {
     let Some(View::Keys {
@@ -882,6 +991,40 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             },
             (None, _) => "message".to_string(),
         };
+        if *kind == PromptKind::Compose {
+            // The cap the split already granted: `prompt_rows` asked for
+            // `visible + 2`, so the interior it left is `visible` again, and a
+            // narrower one (a terminal too short for the box) shortens the
+            // layout rather than pushing the cursor outside it.
+            let layout = compose_layout(buf, area.width, area.height.saturating_sub(2) as usize);
+            let (left, right) = compose_titles(&compose_label, area.width);
+            let mut block = Block::bordered()
+                .border_style(border(true, &app.palette))
+                .style(background_style(&app.palette))
+                .title(Span::styled(
+                    left,
+                    Style::new().fg(app.palette.get(Role::Accent)),
+                ));
+            if !right.is_empty() {
+                block = block.title(Line::from(Span::styled(right, dim)).right_aligned());
+            }
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            if inner.width == 0 || inner.height == 0 {
+                return;
+            }
+            let end = (layout.scroll + layout.visible).min(layout.rows.len());
+            let shown: Vec<Line> = layout.rows[layout.scroll..end]
+                .iter()
+                .map(|row| Line::raw(row.clone()))
+                .collect();
+            frame.render_widget(Paragraph::new(Text::from(shown)), inner);
+            frame.set_cursor_position((
+                inner.x + layout.cursor.1 as u16,
+                inner.y + (layout.cursor.0 - layout.scroll) as u16,
+            ));
+            return;
+        }
         let label = match kind {
             PromptKind::Command => "",
             PromptKind::PaletteColor => "color (a name, or #rrggbb)",
@@ -1437,3 +1580,225 @@ mod message_focus_tests {
         assert_eq!(original.to_rgba8().get_pixel(0,0).0, [255,0,0,255]);
     }
 }
+
+#[cfg(test)]
+mod compose_tests {
+    use super::*;
+    use crate::app::tests::mute_test_app;
+    use crate::app::Compose;
+    use crate::edit::Editor;
+
+    /// The whole of one buffer row as text.
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+    }
+
+    fn prompt(kind: PromptKind, text: &str) -> App {
+        let mut app = mute_test_app();
+        app.compose = Some(Compose {
+            conv: 0,
+            cid: "C1".into(),
+            thread: None,
+            label: "message to #one".into(),
+        });
+        app.mode = Mode::Prompt {
+            kind,
+            buf: Editor::with(text.to_string()),
+            previous: String::new(),
+        };
+        app
+    }
+
+    /// The four prompts that are not compose keep the one-row status line.
+    /// The strings are a snapshot taken before the compose box existed.
+    #[test]
+    fn the_other_prompt_kinds_keep_the_single_status_line() {
+        let expected = [
+            (PromptKind::Command, "find nginx", " /find nginx"),
+            (PromptKind::Date, "2026-01-02", " go to date (YYYY-MM-DD): 2026-01-02"),
+            (
+                PromptKind::Archive,
+                "C99",
+                " archive a conversation from Slack, last 90 days (URL or id): C99",
+            ),
+            (PromptKind::PaletteColor, "#ff0000", " color (a name, or #rrggbb): #ff0000"),
+        ];
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        for (kind, typed, line) in expected {
+            let mut app = prompt(kind, typed);
+            assert_eq!(app.prompt_rows(100, 20), 1, "{line}");
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(row_text(buffer, 19).trim_end(), line);
+        }
+    }
+
+    /// The interior of the box: its rows in order, borders stripped.
+    fn interior(buffer: &ratatui::buffer::Buffer, top: u16, rows: u16) -> Vec<String> {
+        (top + 1..top + 1 + rows)
+            .map(|y| {
+                (1..buffer.area.width - 1)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// A long line with no newline in it used to get one row and run off the
+    /// right edge. It now fills as many interior rows as it needs.
+    #[test]
+    fn a_long_line_wraps_across_the_interior_and_keeps_its_last_character() {
+        let draft: String = (0..200)
+            .map(|n| char::from(b'a' + (n % 26) as u8))
+            .collect();
+        let mut app = prompt(PromptKind::Compose, &draft);
+        // 58 interior cells: three full rows and 26 characters on a fourth.
+        assert_eq!(app.prompt_rows(60, 20), 6);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rows = interior(terminal.backend().buffer(), 14, 4);
+        assert_eq!(rows.concat().trim_end(), draft);
+        assert_eq!(rows[3].trim_end().len(), 26);
+        // The last character is on screen, not clipped at the right edge.
+        assert_eq!(terminal.backend().buffer()[(26, 18)].symbol(), "r");
+        // The cursor sits one cell past it, on the same wrapped row.
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(27, 18)
+        );
+    }
+
+    /// The box grows a row per wrapped row, stops at the cap, and from there
+    /// scrolls to keep the cursor's row on screen.
+    #[test]
+    fn height_follows_the_wrapped_rows_to_the_cap_and_then_scrolls() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 24)).unwrap();
+        for lines in 1..=12usize {
+            let draft = (0..lines)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut app = prompt(PromptKind::Compose, &draft);
+            assert_eq!(app.prompt_rows(40, 24), (lines.min(COMPOSE_ROWS) + 2) as u16);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let visible = lines.min(COMPOSE_ROWS);
+            let top = 24 - (visible + 2) as u16;
+            let rows = interior(terminal.backend().buffer(), top, visible as u16);
+            // Bottom-anchored on the cursor: the newest rows, not the oldest.
+            let first = lines - visible;
+            for (offset, row) in rows.iter().enumerate() {
+                assert_eq!(row.trim_end(), format!("line {}", first + offset));
+            }
+            // The cursor ends the last visible row and stays inside the box.
+            assert_eq!(
+                terminal.get_cursor_position().unwrap(),
+                ratatui::layout::Position::new(
+                    "line 0".len() as u16 + if lines > 10 { 2 } else { 1 },
+                    23 - 1
+                )
+            );
+        }
+    }
+
+    /// A cursor at the end of a row that fills the interior gets a row of its
+    /// own, rather than a cell outside the border.
+    #[test]
+    fn a_cursor_past_the_last_interior_column_opens_the_next_row() {
+        let draft = "z".repeat(58);
+        let mut app = prompt(PromptKind::Compose, &draft);
+        assert_eq!(app.prompt_rows(60, 20), 4);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rows = interior(terminal.backend().buffer(), 16, 2);
+        assert_eq!(rows[0], draft);
+        assert_eq!(rows[1].trim_end(), "");
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 18)
+        );
+    }
+
+    /// The top border carries the label and the shortcuts; a narrow border
+    /// drops shortcuts from the right, and only then cuts the label.
+    #[test]
+    fn the_top_border_drops_hints_from_the_right_before_truncating_the_label() {
+        let draft = "hello";
+        for (width, wanted, unwanted) in [
+            (120u16, vec!["message to #one", "Enter send", "Ctrl-j newline", "Esc cancel", "Ctrl-v image"], vec![]),
+            (50, vec!["message to #one", "Enter send", "Ctrl-j newline"], vec!["Esc cancel", "Ctrl-v image"]),
+            (24, vec!["message to #one"], vec!["Enter send", "…"]),
+            (12, vec!["…"], vec!["message to #one", "Enter send"]),
+        ] {
+            let mut app = prompt(PromptKind::Compose, draft);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let rows = app.prompt_rows(width, 20);
+            let border = row_text(terminal.backend().buffer(), 20 - rows);
+            for text in wanted {
+                assert!(border.contains(text), "width {width}: {border:?} lacks {text:?}");
+            }
+            for text in unwanted {
+                assert!(!border.contains(text), "width {width}: {border:?} has {text:?}");
+            }
+            // Whatever it holds, the border never spills past the box.
+            assert_eq!(border.chars().count(), width as usize);
+        }
+    }
+
+    /// A staged attachment, and the note when one could not be staged, reach
+    /// the border the same way the plain label does.
+    #[test]
+    fn the_attachment_and_note_labels_render_on_the_border() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let mut app = prompt(PromptKind::Compose, "hi");
+        app.attachment = Some(std::path::PathBuf::from("/tmp/screenshot.png"));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(row_text(terminal.backend().buffer(), 17)
+            .contains("message to #one with screenshot.png"));
+        app.attachment = None;
+        app.attach_note = Some("no image on the clipboard".into());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(row_text(terminal.backend().buffer(), 17)
+            .contains("message to #one · no image on the clipboard"));
+    }
+
+    /// Ctrl-j adds a row to the box; Esc closes it and gives the status line
+    /// its single row back.
+    #[test]
+    fn control_j_grows_the_box_and_escape_returns_the_status_line() {
+        let mut app = prompt(PromptKind::Compose, "one");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        assert_eq!(app.prompt_rows(60, 20), 3);
+        app.on_key(crate::event::KeyEvent::new(
+            crate::event::KeyCode::Char('j'),
+            crate::event::KeyModifiers::CONTROL,
+        ));
+        app.on_key(crate::event::KeyEvent::new(
+            crate::event::KeyCode::Char('t'),
+            crate::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.prompt_rows(60, 20), 4);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rows = interior(terminal.backend().buffer(), 16, 2);
+        assert_eq!((rows[0].trim_end(), rows[1].trim_end()), ("one", "t"));
+        app.on_key(crate::event::KeyEvent::new(
+            crate::event::KeyCode::Esc,
+            crate::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.prompt_rows(60, 20), 1);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(!row_text(buffer, 19).contains('┌'));
+        assert!(row_text(buffer, 19).starts_with(" UTC"));
+    }
+}
+

@@ -239,8 +239,12 @@ messages, every conversation you are a member of, and unread markers; a
 thread lands in the cache, the open conversation is re-checked every
 --poll seconds. Without a sign-in, slackdump does the same more slowly,
 and `a` still archives a new conversation into the root. Writes to Slack:
-m and M move your own read marker; c composes a message, Ctrl-j and Alt-Enter
-break the line and Enter sends it; D deletes one of your own messages, the
+m and M move your own read marker; c composes a message in a bordered box that
+wraps a long line at its spaces and grows to eight rows before it scrolls to
+follow the cursor. Its top border carries the target on the left and
+Enter send · Ctrl-j newline · Esc cancel · Ctrl-v image on the right, dropping
+hints from the right as the terminal narrows. Alt-Enter breaks the line where
+Ctrl-j does; D deletes one of your own messages, the
 same key again confirming; /upload [path] sends a file
 with the next message, and Ctrl-v in the compose prompt attaches the image on
 the clipboard (through wl-paste or xclip); /leave leaves a channel.

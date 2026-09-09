@@ -4383,9 +4383,21 @@ impl App {
         self.active_list().and_then(|l| l.selected())
     }
 
-    /// Rows the bottom line needs: one, or the lines of an open prompt.
-    pub fn prompt_rows(&self) -> u16 {
+    /// Rows the bottom line needs in a terminal `width` by `height`: one, the
+    /// lines of an open prompt, or a compose box sized to its wrapped draft,
+    /// both of its borders included.
+    pub fn prompt_rows(&self, width: u16, height: u16) -> u16 {
         match &self.mode {
+            Mode::Prompt {
+                kind: PromptKind::Compose,
+                buf,
+                ..
+            } => {
+                // What is left once the messages pane keeps its Min(3) and the
+                // box spends two rows on borders, so the split can honor it.
+                let room = height.saturating_sub(5).max(1) as usize;
+                crate::ui::compose_layout(buf, width, crate::ui::COMPOSE_ROWS.min(room)).height()
+            }
             Mode::Prompt { buf, .. } => (buf.text.matches('\n').count() as u16 + 1).min(8),
             Mode::Normal => 1,
         }

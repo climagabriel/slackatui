@@ -1285,14 +1285,33 @@ pub(crate) fn wrap_lines(text: &str, width: usize) -> Vec<String> {
     for line in text.split('\n') {
         let mut row = String::new();
         let mut used = 0;
+        // Byte offset in `row` just past the space it may be broken at: the
+        // space stays on this row, so the rows still concatenate back into
+        // the source line and a byte offset still maps onto one of them.
+        let mut after_space: Option<usize> = None;
         for c in line.chars() {
             let size = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
             if used + size > width && !row.is_empty() {
-                rows.push(std::mem::take(&mut row));
-                used = 0;
+                match after_space.take() {
+                    // Break at the last space rather than mid-word; a word
+                    // wider than the row still breaks wherever it fills up.
+                    Some(at) if at < row.len() => {
+                        let rest = row.split_off(at);
+                        rows.push(std::mem::take(&mut row));
+                        used = unicode_width::UnicodeWidthStr::width(rest.as_str());
+                        row = rest;
+                    }
+                    _ => {
+                        rows.push(std::mem::take(&mut row));
+                        used = 0;
+                    }
+                }
             }
             row.push(c);
             used += size;
+            if c == ' ' {
+                after_space = Some(row.len());
+            }
         }
         rows.push(row);
     }
@@ -1305,6 +1324,46 @@ mod tests {
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
+    /// The wrapper the compose box, the `/find` overlay and the raw canvas
+    /// view share: it breaks at spaces, and it keeps every byte, so a byte
+    /// offset in the source still names one of the rows it returns.
+    #[test]
+    fn wrapping_breaks_at_spaces_and_keeps_every_byte() {
+        let text = "the hourly refresh writes the archive\nand a supercalifragilistic word";
+        for width in 1..=40usize {
+            let rows = wrap_lines(text, width);
+            let mut index = 0;
+            let rebuilt: Vec<String> = text
+                .split('\n')
+                .map(|line| {
+                    let mut out = String::new();
+                    loop {
+                        out.push_str(&rows[index]);
+                        index += 1;
+                        if out.len() >= line.len() {
+                            break out;
+                        }
+                    }
+                })
+                .collect();
+            assert_eq!(rebuilt.join("\n"), text, "width {width}");
+            assert_eq!(index, rows.len(), "width {width}");
+            for row in &rows {
+                let cells = unicode_width::UnicodeWidthStr::width(row.as_str());
+                assert!(cells <= width, "width {width}: {row:?} is {cells} cells");
+            }
+        }
+        assert_eq!(
+            wrap_lines("the hourly refresh writes", 12),
+            vec!["the hourly ", "refresh ", "writes"]
+        );
+        // A word wider than the row still breaks where it fills up.
+        assert_eq!(
+            wrap_lines("supercalifragilistic", 6),
+            vec!["superc", "alifra", "gilist", "ic"]
+        );
+    }
+
     #[test]
     fn escape_leaves_canvas_insert_mode_then_goes_home_preserving_draft() {
         let mut app = crate::app::tests::mute_test_app();
