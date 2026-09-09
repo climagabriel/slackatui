@@ -25,8 +25,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let rows = app.prompt_rows();
     let [main, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(rows)]).areas(area);
-    if app.focus == Focus::Convs && !matches!(app.mode, Mode::Prompt { .. }) { app.conversations_visible = true; }
-    if app.conversations_visible {
+    if app.conversations_visible() {
         let conv_w = (area.width / 4).clamp(22, 40);
         let [left, right] = Layout::horizontal([Constraint::Length(conv_w), Constraint::Min(20)]).areas(main);
         draw_convs(frame, app, left);
@@ -1213,33 +1212,64 @@ mod message_focus_tests {
     }
 
     #[test]
-    fn control_b_toggles_sidebar_and_back_reveals_it() {
+    fn control_b_cycles_the_pane_and_auto_hide_follows_the_conversation() {
+        use crate::app::ConversationsPaneVisibility as Pane;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = mute_test_app();
         app.open_conv(0);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "│");
         let toggle = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
-        app.on_key(toggle);
+        // Shown: drawn even from inside a conversation.
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(!app.conversations_visible);
-        assert_ne!(terminal.backend().buffer()[(1, 1)].symbol(), "S");
-        app.on_key(toggle);
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(app.conversations_visible);
+        assert_eq!(app.conversations_pane, Pane::AlwaysShown);
+        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "│");
         assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "S");
+        // Hidden, and the status line names the state the key just entered.
         app.on_key(toggle);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.conversations_pane, Pane::AlwaysHidden);
+        assert_eq!(app.status, Pane::AlwaysHidden.label());
+        assert_ne!(terminal.backend().buffer()[(1, 1)].symbol(), "S");
+        // Auto-hide, still inside the conversation: still no pane.
+        app.on_key(toggle);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.conversations_pane, Pane::AutoHideInsideConversation);
+        assert!(!app.conversations_visible());
+        assert_ne!(terminal.backend().buffer()[(1, 1)].symbol(), "S");
+        // Leaving the conversation brings it back with no key pressed for it.
         app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(app.conversations_visible);
         assert_eq!(app.focus, Focus::Convs);
-        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.conversations_visible());
+        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "│");
+        // The wrap: shown again, and it stays drawn inside a conversation.
         app.on_key(toggle);
+        assert_eq!(app.conversations_pane, Pane::AlwaysShown);
+        app.open_conv(0);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(!app.conversations_visible);
-        assert_eq!(app.focus, Focus::Convs);
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "S");
+    }
+
+    /// A hidden pane never keeps the cursor: the focus lands on the messages
+    /// instead, except while a prompt is open, where the focus decides what
+    /// `/` searches.
+    #[test]
+    fn a_hidden_pane_does_not_strand_the_cursor() {
+        use crate::app::ConversationsPaneVisibility as Pane;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        let toggle = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        app.on_key(toggle);
+        assert_eq!(app.conversations_pane, Pane::AlwaysHidden);
+        // Tab asks for the pane the hidden state has no room for.
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Msgs);
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Prompt { .. }));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.conversations_visible());
     }
 
     #[test]

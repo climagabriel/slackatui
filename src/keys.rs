@@ -64,7 +64,7 @@ impl Action {
             Action::Back => "back one view, then the list",
             Action::Close => "home; again: first conversation",
             Action::OtherPane => "the other pane",
-            Action::ToggleConversations => "show/hide conversations pane",
+            Action::ToggleConversations => "conversations pane: shown, hidden, auto-hide",
             Action::Command => "a command line",
             Action::Keys => "this key editor",
             Action::ConversationsPane => "choose visible conversations",

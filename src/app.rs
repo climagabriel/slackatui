@@ -30,6 +30,42 @@ pub enum Focus {
     Msgs,
 }
 
+/// When the conversations pane appears. `Ctrl-B` advances one step and wraps;
+/// the third state is not a flag the key sets but a question asked at every
+/// draw, so entering and leaving a conversation moves the pane by itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ConversationsPaneVisibility {
+    #[default]
+    AlwaysShown,
+    AlwaysHidden,
+    /// Shown while the conversation list has the focus, hidden while a
+    /// conversation is being read.
+    AutoHideInsideConversation,
+}
+
+/// Said when the focus would be on a pane the hidden state does not draw.
+pub const PANE_HIDDEN_HINT: &str = "conversations pane hidden; Ctrl-B cycles it back";
+
+impl ConversationsPaneVisibility {
+    pub fn next(self) -> Self {
+        match self {
+            Self::AlwaysShown => Self::AlwaysHidden,
+            Self::AlwaysHidden => Self::AutoHideInsideConversation,
+            Self::AutoHideInsideConversation => Self::AlwaysShown,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AlwaysShown => "conversations pane: always shown",
+            Self::AlwaysHidden => "conversations pane: always hidden",
+            Self::AutoHideInsideConversation => {
+                "conversations pane: auto-hide inside a conversation"
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sort {
     /// Where the archive's owner wrote the most, first.
@@ -465,7 +501,7 @@ pub struct App {
     pub corpus: Corpus,
     pub tz: Tz,
     pub focus: Focus,
-    pub conversations_visible: bool,
+    pub conversations_pane: ConversationsPaneVisibility,
     pub sort: Sort,
     pub filter: String,
     pub filtered: Vec<usize>,
@@ -618,7 +654,7 @@ impl App {
             corpus,
             tz,
             focus: Focus::Convs,
-            conversations_visible: true,
+            conversations_pane: ConversationsPaneVisibility::default(),
             sort: Sort::Recent,
             filter: String::new(),
             filtered: Vec::new(),
@@ -4136,12 +4172,61 @@ impl App {
 
     // ----------------------------------------------------------------- keys
 
+    /// Whether the right-hand pane holds anything: a conversation, a stacked
+    /// view, or one of the home sections.
+    fn messages_pane_occupied(&self) -> bool {
+        self.open.is_some() || !self.stack.is_empty() || self.top_section.is_some()
+    }
+
+    /// Being inside a conversation rather than browsing the list: the messages
+    /// hold the focus and have something to show.
+    pub fn inside_conversation(&self) -> bool {
+        self.focus == Focus::Msgs && self.messages_pane_occupied()
+    }
+
+    /// Whether the pane is drawn at all. The auto-hide state answers from
+    /// where the owner is rather than from anything a key wrote down, so
+    /// opening a conversation hides the pane and leaving it brings it back.
+    pub fn conversations_visible(&self) -> bool {
+        match self.conversations_pane {
+            ConversationsPaneVisibility::AlwaysShown => true,
+            ConversationsPaneVisibility::AlwaysHidden => false,
+            ConversationsPaneVisibility::AutoHideInsideConversation => !self.inside_conversation(),
+        }
+    }
+
+    /// A cursor in a pane nobody draws is lost, so while the pane is hidden
+    /// outright the focus moves to the messages — but only when the messages
+    /// have something to show. With both panes empty there is nowhere better
+    /// to be, and the status line says what happened instead. An open prompt
+    /// keeps the focus it was opened with: `/` searches the workspace from the
+    /// list and the conversation from the messages.
+    fn settle_conversations_focus(&mut self) {
+        if self.conversations_pane != ConversationsPaneVisibility::AlwaysHidden
+            || self.focus != Focus::Convs
+            || matches!(self.mode, Mode::Prompt { .. })
+        {
+            return;
+        }
+        if self.messages_pane_occupied() {
+            self.focus = Focus::Msgs;
+        }
+        if self.status.is_empty() {
+            self.status = PANE_HIDDEN_HINT.to_string();
+        }
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) {
+        self.dispatch_key(k);
+        self.settle_conversations_focus();
+    }
+
+    fn dispatch_key(&mut self, k: KeyEvent) {
         self.last_key = Some((crate::keys::received_key(k), Instant::now()));
         if self.keymap.action(k) == Some(Action::ToggleConversations)
             && !matches!(self.stack.last(), Some(View::Keys { capture: Some(_), .. })) {
-            self.conversations_visible = !self.conversations_visible;
-            if !self.conversations_visible && self.focus == Focus::Convs && !matches!(self.mode, Mode::Prompt { .. }) { self.focus = Focus::Msgs; }
+            self.conversations_pane = self.conversations_pane.next();
+            self.status = self.conversations_pane.label().to_string();
             self.pending_delete = None;
             return;
         }
@@ -6468,6 +6553,99 @@ pub(crate) mod tests {
         ]);
         app
     }
+    fn control_b() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+    }
+
+    /// The cycle order and its wrap, and the auto-hide state moving the pane
+    /// in both directions with no key pressed for it.
+    #[test]
+    fn conversations_pane_cycles_and_auto_hide_follows_the_conversation() {
+        use ConversationsPaneVisibility::*;
+        let mut app = mute_test_app();
+        assert_eq!(app.conversations_pane, AlwaysShown);
+        assert!(app.conversations_visible());
+
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AlwaysHidden);
+        assert_eq!(app.status, AlwaysHidden.label());
+        assert!(!app.conversations_visible());
+
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AutoHideInsideConversation);
+        // Browsing the list.
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(app.conversations_visible());
+        // Entering a conversation hides it.
+        app.open_conv(0);
+        assert_eq!(app.focus, Focus::Msgs);
+        assert!(app.inside_conversation());
+        assert!(!app.conversations_visible());
+        // Leaving it brings it back.
+        app.on_msg_key(Some(Action::Back));
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(!app.inside_conversation());
+        assert!(app.conversations_visible());
+        // Tabbing into the conversation and back moves it too.
+        app.open_conv(0);
+        assert!(!app.conversations_visible());
+        app.on_msg_key(Some(Action::OtherPane));
+        assert!(app.conversations_visible());
+        app.on_conv_key(Some(Action::OtherPane));
+        assert!(!app.conversations_visible());
+
+        // The wrap: three presses return to where the cycle started.
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AlwaysShown);
+        assert!(app.conversations_visible());
+        for expected in [AlwaysHidden, AutoHideInsideConversation, AlwaysShown] {
+            app.on_key(control_b());
+            assert_eq!(app.conversations_pane, expected);
+        }
+    }
+
+    /// The hidden state never leaves the cursor in a pane nobody draws, and
+    /// never moves it while a prompt is deciding what it searches.
+    #[test]
+    fn a_hidden_conversations_pane_does_not_strand_the_cursor() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        app.on_msg_key(Some(Action::OtherPane));
+        assert_eq!(app.focus, Focus::Convs);
+        app.on_key(control_b());
+        assert_eq!(
+            app.conversations_pane,
+            ConversationsPaneVisibility::AlwaysHidden
+        );
+        assert_eq!(app.focus, Focus::Msgs);
+        // Asking for the pane again does not park the cursor on it.
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Msgs);
+        // `h` from the bare timeline empties the messages pane; with neither
+        // pane holding anything the focus stays put and the status says why
+        // the screen is bare.
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(!app.messages_pane_occupied());
+        assert_eq!(app.focus, Focus::Convs);
+        assert_eq!(app.status, PANE_HIDDEN_HINT);
+
+        // Same at a fresh start: nothing to move to, so nothing moves.
+        let mut home = mute_test_app();
+        home.on_key(control_b());
+        assert_eq!(home.focus, Focus::Convs);
+        assert!(!home.conversations_visible());
+
+        // A prompt keeps the focus it was opened with.
+        let mut prompt = mute_test_app();
+        prompt.open_conv(0);
+        prompt.on_msg_key(Some(Action::OtherPane));
+        prompt.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(matches!(prompt.mode, Mode::Prompt { .. }));
+        prompt.on_key(control_b());
+        assert_eq!(prompt.focus, Focus::Convs);
+        assert!(!prompt.conversations_visible());
+    }
+
     #[test]
     fn mute_snapshots_replace_removed_ids_and_ignore_stale_reads() {
         let mut app = mute_test_app();

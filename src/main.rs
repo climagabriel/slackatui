@@ -160,6 +160,8 @@ keys (also ? inside)
   i view a message's images, I inline thumbnails on/off,
   m mark read, M mark unread from the cursor, D delete your own message,
   T channel tabs and canvases; Ctrl-T threads you participated in,
+  Ctrl-B cycles the conversations pane: always shown, always hidden,
+  auto-hide inside a conversation (shown again on leaving it),
   H the key guide,
   Esc in the list closes the conversation
 
