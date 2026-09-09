@@ -464,6 +464,9 @@ pub struct ArchiveSearch {
     author_unresolved: bool,
     /// Started from the conversation list, which replaces what is on screen.
     from_list: bool,
+    /// Where the reader was when they asked. A different generation at
+    /// landing means they have gone elsewhere since.
+    nav_generation: u64,
     /// The progress end of a scan that draws no box. The worker treats a
     /// dropped receiver as cancellation, so a scan nobody is narrating still
     /// needs one held for as long as it runs. Held, never read: dropping it
@@ -622,6 +625,11 @@ pub struct App {
     /// Holds the next scan's worker until a test lets it run.
     #[cfg(test)]
     pub scan_gate: Option<std::sync::mpsc::Receiver<()>>,
+    /// Bumped by every primitive that takes the reader somewhere else, so a
+    /// background result can tell whether the place it was asked for is still
+    /// the place on screen. Moving the focus between panes is not leaving, so
+    /// Tab does not bump it.
+    nav_generation: u64,
     pub spinner: usize,
     /// Slack may be consulted when the cache cannot answer.
     pub live: bool,
@@ -775,6 +783,7 @@ impl App {
             pending_search: None,
             #[cfg(test)]
             scan_gate: None,
+            nav_generation: 0,
             spinner: 0,
             live,
             cache_dir,
@@ -1035,6 +1044,8 @@ impl App {
     /// `/colorpalette [name]`: the editor, over a named palette when one is
     /// given. Esc puts back the colors it opened with.
     fn open_color_palette(&mut self, preset: &str) {
+        // Leaving for color palette.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         let applied = if preset.trim().is_empty() {
             None
         } else {
@@ -1087,6 +1098,8 @@ impl App {
 
     /// `/keys`: the key editor over the messages pane.
     fn open_keys(&mut self) {
+        // Leaving for keys editor.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         if matches!(self.stack.last(), Some(View::Keys { .. })) {
             return;
         }
@@ -1526,6 +1539,8 @@ impl App {
     fn open_sent(&mut self) { self.open_feed(TopSection::Sent); }
 
     fn open_feed(&mut self, section: TopSection) {
+        // Leaving for SENT / MENTIONS.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         self.sent_return = None;
         self.invalidate_thread_jobs();
         if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
@@ -1577,6 +1592,8 @@ impl App {
     }
 
     fn open_saved(&mut self) {
+        // Leaving for SAVED.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         self.sent_return = None;
         self.invalidate_thread_jobs();
         if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
@@ -1812,6 +1829,8 @@ impl App {
             self.tz.fmt(message.id / 1_000_000, "%Y-%m-%d %H:%M:%S"), self.tz.label(), context.author(message));
         let lines = reaction_details(message, &context);
         self.pending_delete = None;
+        // Leaving for the reactions view.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         self.stack.push(View::Reactions { title, lines, scroll: 0 });
     }
 
@@ -2075,6 +2094,8 @@ impl App {
     }
 
     pub fn open_conv(&mut self, idx: usize) -> bool {
+        // Leaving for a conversation.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         if self.open.as_ref().map(|open| open.conv) != Some(idx) { self.sent_return = None; }
         self.invalidate_thread_jobs();
         self.top_section = None;
@@ -2378,20 +2399,9 @@ impl App {
         }
     }
 
-    /// A key that takes the reader somewhere else abandons a running scan.
-    /// It is only reachable for a search of one conversation, which draws no
-    /// box and so does not swallow keys; its hits belong to where the reader
-    /// was, not to where they went. Called from the key handlers rather than
-    /// from `open_conv`, because a finished refresh navigates through that
-    /// too and must leave the scan alone.
-    fn leave_for(&mut self) {
-        if self.scan.is_some() {
-            self.drop_scan();
-        }
-    }
-
-    /// Abandon a running archive scan and the box narrating it. Only a new
-    /// search, Esc, or navigation by key does this. `invalidate_thread_jobs` deliberately does
+    /// Abandon a running archive scan and the box narrating it at once.
+    /// Only a new search and Esc do this; navigating away is caught at
+    /// landing instead, through the navigation generation. `invalidate_thread_jobs` deliberately does
     /// not: it runs on job-completion paths too — a finished refresh
     /// navigates through `open_conv` — and a fetch landing at the wrong
     /// moment must not take a search the reader asked for with it. The
@@ -2404,6 +2414,8 @@ impl App {
     }
 
     pub fn open_thread_in(&mut self, cid: String, root: i64, focus: i64) {
+        // Leaving for a thread.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         self.invalidate_thread_jobs();
         let here = self
             .open
@@ -2699,6 +2711,7 @@ impl App {
             slack: parsed.slack.clone(),
             author_unresolved: wants_author && parsed.user_id.is_none(),
             from_list: self.focus == Focus::Convs,
+            nav_generation: self.nav_generation,
             unwatched: None,
         };
         let (sender, progress) = std::sync::mpsc::channel();
@@ -2735,6 +2748,15 @@ impl App {
             self.close_scan_overlay();
             return;
         };
+        // The reader navigated while this ran. A search of one conversation
+        // draws no box and so does not swallow keys, and every navigation
+        // primitive bumps the generation, which is what makes this complete
+        // where a list of keys to intercept could not be.
+        if self.nav_generation != pending.nav_generation {
+            self.drop_scan();
+            self.status = "search abandoned: you moved on".to_string();
+            return;
+        }
         let go_live = self.live && self.job.is_none() && self.api.is_some();
         let cached = hits.len();
         if pending.from_list { self.open = None; self.stack.clear(); }
@@ -3358,6 +3380,8 @@ impl App {
     /// first, from the cache. Archive-wide: it opens no conversation, and the
     /// conversation cursor stays where it was.
     fn open_my_threads(&mut self) {
+        // Leaving for THREADS.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         let Some(me) = self.corpus.me.clone() else {
             self.status = "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
             return;
@@ -3604,6 +3628,8 @@ impl App {
 
     /// Esc in the list: the home view, with no filter and nothing open.
     fn escape_home(&mut self) {
+        // Leaving for home.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         let at_home = self.focus == Focus::Convs && self.open.is_none() && self.stack.is_empty()
             && self.pane_menu.is_none() && !self.help && self.filter.is_empty()
             && matches!(self.mode, Mode::Normal)
@@ -3635,6 +3661,9 @@ impl App {
     }
 
     fn go_home(&mut self) {
+        // Leaving for home: h from the bare timeline lands here, not in
+        // escape_home.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         self.invalidate_thread_jobs();
         if !self.filter.is_empty() {
             self.filter.clear();
@@ -3649,6 +3678,8 @@ impl App {
 
     /// `i`: the selected message's images, full pane.
     fn open_images(&mut self) {
+        // Leaving for the image viewer.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         let Some(m) = self.selected() else {
             return;
         };
@@ -4134,7 +4165,15 @@ impl App {
             }
             (JobKind::Refresh { conv, before }, Done::Refreshed) => {
                 self.refresh_conv_stats(conv);
-                if job.navigate_on_completion { self.open_conv(conv); }
+                if job.navigate_on_completion {
+                    // A refresh navigating is the job finishing, not the
+                    // reader going anywhere, so a scan in flight keeps its
+                    // generation. The only site that restores it; every
+                    // other caller of open_conv means what the bump says.
+                    let asked_from = self.nav_generation;
+                    self.open_conv(conv);
+                    self.nav_generation = asked_from;
+                }
                 let conversation = &self.corpus.convs[conv];
                 let new = self.corpus.archives[conversation.archive]
                     .timeline_count(&conversation.id).unwrap_or(before) - before;
@@ -4263,6 +4302,8 @@ impl App {
     }
 
     pub fn open_raw(&mut self) {
+        // Leaving for raw JSON.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         let Some(m) = self.active_list().and_then(|l| l.selected()).cloned() else {
             return;
         };
@@ -4273,6 +4314,8 @@ impl App {
     }
 
     fn goto_date(&mut self, text: &str) {
+        // Leaving for a date.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
         let Ok(date) = chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d") else {
             self.status = format!("not a date: '{}' (want YYYY-MM-DD)", text.trim());
             return;
@@ -4616,7 +4659,7 @@ impl App {
         if k.code == KeyCode::Esc {
             if let Some(browser) = self.channel_browser.as_mut().filter(|browser| browser.visible && browser.escape_edits()) {
                 browser.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-            } else { self.leave_for(); self.escape_home(); }
+            } else { self.escape_home(); }
             return;
         }
         if let Some(browser) = self.channel_browser.as_mut().filter(|b| b.visible) {
@@ -4944,7 +4987,6 @@ impl App {
                     if self.open.as_ref().map(|o| o.conv) == Some(idx) {
                         self.focus = Focus::Msgs;
                     } else {
-                        self.leave_for();
                         self.open_conv(idx);
                     }
                 }
@@ -4955,7 +4997,7 @@ impl App {
                 }
             }
             Some(Action::Command) => self.open_command(),
-            Some(Action::Close) => { self.leave_for(); self.escape_home(); }
+            Some(Action::Close) => self.escape_home(),
             Some(Action::Archive) => self.prompt_archive(),
             Some(Action::MyThreads) => self.open_my_threads(),
             Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
@@ -5099,7 +5141,6 @@ impl App {
                 if let (false, Some((cid, root, name))) = (timeline, sel) {
                     match self.corpus.conv_by_channel(&cid) {
                         Some(idx) => {
-                            self.leave_for();
                             self.stack.clear();
                             if self.open.as_ref().map(|o| o.conv) != Some(idx) {
                                 self.open_conv(idx);
@@ -5145,7 +5186,7 @@ impl App {
                 }
                 .to_string();
             }
-            Some(Action::Close) => { self.leave_for(); self.escape_home(); }
+            Some(Action::Close) => self.escape_home(),
             Some(Action::Back) => {
                 if let Some(list) = self.active_list_mut().filter(|list| list.line_scroll) {
                     list.line_scroll = false;
@@ -6677,19 +6718,24 @@ pub(crate) mod tests {
         assert_eq!(app.open.as_ref().map(|open| open.conv), Some(conv));
 
         // Both ready in one tick: the scan is polled first, so the search is
-        // pushed and the refresh then navigates over it, same as above.
+        // pushed and the refresh then navigates over it, same as above. Both
+        // results are staged as already-delivered, so neither is waited on.
         let (mut app, yet_more_dirs) = scan_test_app();
         let conv = app.corpus.conv_by_channel("C1").unwrap();
-        let (refreshing, finish_refresh) = live::pending_job(JobKind::Refresh { conv, before: 0 });
         let (release_scan, gate) = std::sync::mpsc::channel();
         app.scan_gate = Some(gate);
-        app.job = Some(refreshing);
         app.run_command("/find message: nginx", "");
-        release_scan.send(()).unwrap();
-        // The worker has said its last word, so its result is on the way.
-        wait_for_scan_lines(&mut app, 4);
-        std::thread::sleep(Duration::from_millis(50));
-        finish_refresh.send(Ok(Done::Refreshed)).unwrap();
+        drop(release_scan);
+        let mut hit = msg(2, "nginx in one");
+        hit.channel_id = "C1".into();
+        app.scan = Some(Job::completed_for_test(
+            JobKind::ArchiveScan { query: "nginx".into() },
+            Ok(Done::ArchiveHits { hits: vec![hit], capped: false, users: Vec::new() }),
+        ));
+        app.job = Some(Job::completed_for_test(
+            JobKind::Refresh { conv, before: 0 },
+            Ok(Done::Refreshed),
+        ));
         app.tick();
         assert!(app.scan.is_none() && app.job.is_none(), "both were meant to land in one tick");
         assert!(app.stack.is_empty());
@@ -6701,41 +6747,64 @@ pub(crate) mod tests {
     }
 
     /// A scan with no box does not swallow keys, so the reader can walk away
-    /// from it. Its hits belong where they were asked for, not where the
-    /// reader went.
+    /// from it. Its hits belong where they were asked for: if the reader has
+    /// gone elsewhere by the time they land, they are dropped. Every way of
+    /// going elsewhere bumps the navigation generation, which is why this
+    /// does not depend on a list of keys to intercept.
     #[test]
-    fn opening_a_conversation_abandons_a_box_less_scan() {
-        let (mut app, dirs) = scan_test_app();
-        let (release_scan, gate) = std::sync::mpsc::channel();
-        app.scan_gate = Some(gate);
-        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
-        app.run_command("/find from:@gabriel.clima", "");
-        assert!(app.scan.is_some() && app.scan_overlay.is_none(), "a one-conversation scan draws no box");
-        // The reader goes back to the list and opens the other conversation.
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.scan.is_none(), "Esc left the scan running");
-        release_scan.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        app.tick();
-        assert!(app.stack.is_empty(), "the abandoned search pushed its view anyway");
+    fn a_box_less_scan_is_abandoned_when_the_reader_moves_on() {
+        let cases: [(&str, fn(&mut App)); 5] = [
+            ("h home", |app| app.on_msg_key(Some(Action::Back))),
+            ("THREADS", |app| {
+                app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+                app.on_msg_key(Some(Action::MyThreads));
+            }),
+            ("a thread", |app| {
+                let message = app.active_list().unwrap().selected().unwrap().clone();
+                app.open_thread_in(message.channel_id.clone(), message.id, message.id);
+            }),
+            ("a date", |app| app.goto_date("2026-01-01")),
+            ("/keys", |app| app.run_command("/keys", "")),
+        ];
+        for (what, go) in cases {
+            let (mut app, dirs) = scan_test_app();
+            let (release_scan, gate) = std::sync::mpsc::channel();
+            app.scan_gate = Some(gate);
+            app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+            app.run_command("/find from:@gabriel.clima", "");
+            assert!(app.scan.is_some() && app.scan_overlay.is_none(), "{what}: a one-conversation scan draws no box");
+            assert!(!app.scan_running(), "{what}: a box-less scan must not swallow keys");
+            go(&mut app);
+            let focus = app.focus;
+            let stack = app.stack.len();
+            let open = app.open.as_ref().map(|open| open.conv);
+            release_scan.send(()).unwrap();
+            app.finish_archive_scan_for_test();
+            assert!(!app.stack.iter().any(|view| matches!(view, View::Search { .. })),
+                "{what}: the abandoned search pushed its view");
+            assert_eq!(app.status, "search abandoned: you moved on", "{what}");
+            assert_eq!(app.focus, focus, "{what}: focus moved");
+            assert_eq!(app.stack.len(), stack, "{what}: the stack changed");
+            assert_eq!(app.open.as_ref().map(|open| open.conv), open, "{what}: the conversation changed");
+            assert!(app.scan.is_none() && app.pending_search.is_none(), "{what}");
+            for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+        }
+    }
 
-        // The same through Open on another conversation.
-        let (release_scan, gate) = std::sync::mpsc::channel();
-        app.scan_gate = Some(gate);
+    /// Staying put is not moving on: the same scan, with no navigation, still
+    /// pushes its hits.
+    #[test]
+    fn a_box_less_scan_that_is_left_alone_still_lands() {
+        let (mut app, dirs) = scan_test_app();
         app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
         app.run_command("/find from:@gabriel.clima", "");
-        assert!(app.scan.is_some());
-        app.focus = Focus::Convs;
-        let other = app.corpus.conv_by_channel("COTHER").unwrap();
-        app.conv_cursor = app.filtered.iter().position(|&index| index == other).unwrap();
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(other));
-        assert!(app.scan.is_none(), "opening a conversation left the scan running");
-        release_scan.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        app.tick();
-        assert!(app.stack.is_empty(), "the abandoned search pushed its view anyway");
-        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(other));
+        // Moving the cursor and swapping panes are not leaving.
+        app.on_msg_key(Some(Action::Down));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.finish_archive_scan_for_test();
+        let Some(View::Search { list, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(list.msgs.len(), 2);
         for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
     }
 
