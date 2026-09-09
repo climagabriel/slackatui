@@ -110,8 +110,8 @@ Slack has lost the messages: Slack search collapses near-duplicates and
 applies its own matching, while this side is a substring scan. When the
 answer is short of everything Slack has -- the cap reached with more on
 offer, a page failing after the first, a repeated cursor, or the request
-budget of seven calls spent -- the title says N not in Slack's first 500
-instead, and the pages that did arrive are still folded in.
+budget of seven calls spent -- the count reads N not returned by Slack
+(partial answer), and the pages that did arrive are still folded in.
 
 SENT below SAVED shows sent messages newest first, using Slack search.
 Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.

@@ -438,11 +438,14 @@ impl LiveHits {
     /// while this side is a substring scan, so the two are asking different
     /// questions. That a message came back from one and not the other is the
     /// fact; that Slack no longer holds it would be an inference.
+    /// The caveat is not "not in Slack's first 500": paging also stops short
+    /// on a repeated cursor, a spent budget, or a page that failed, and then
+    /// far fewer than 500 were ever compared against.
     pub fn cache_only_label(self) -> String {
         match (self.cache_only, self.complete) {
             (0, _) => String::new(),
             (n, true) => format!("{n} not returned by Slack"),
-            (n, false) => format!("{n} not in Slack's first {SEARCH_CAP}"),
+            (n, false) => format!("{n} not returned by Slack (partial answer)"),
         }
     }
 }
@@ -6797,7 +6800,7 @@ pub(crate) mod tests {
         let counts = live_hits.expect("Slack's partial answer");
         assert_eq!(counts.added, 1);
         assert!(!counts.complete, "a half-collected answer was called complete");
-        assert!(app.title().contains(&format!("3 not in Slack's first {SEARCH_CAP}")), "{}", app.title());
+        assert!(app.title().contains("3 not returned by Slack (partial answer)"), "{}", app.title());
         for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
     }
 
@@ -6828,9 +6831,9 @@ pub(crate) mod tests {
         assert_eq!(counts.added, SEARCH_CAP);
         assert_eq!(counts.cache_only, 3);
         assert!(!counts.complete, "a page with a cursor left over was called complete");
+        // The fact holds either way; only a complete answer drops the caveat.
         let title = app.title();
-        assert!(!title.contains("not returned by Slack"), "overstated: {title}");
-        assert!(title.contains(&format!("3 not in Slack's first {SEARCH_CAP}")), "{title}");
+        assert!(title.contains("3 not returned by Slack (partial answer)"), "{title}");
         for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
     }
 
