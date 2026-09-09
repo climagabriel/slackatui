@@ -394,6 +394,10 @@ pub struct ScanRequest {
     pub palette: crate::palette::Palette,
     pub tz: crate::render::Tz,
     pub image_font: Option<(u16, u16)>,
+    /// Held closed, the worker waits before touching an archive, so a test
+    /// can decide what lands first.
+    #[cfg(test)]
+    pub gate: Option<mpsc::Receiver<()>>,
 }
 
 /// A line the scan wants shown in the progress box, and whether it is
@@ -426,8 +430,12 @@ pub fn archive_scan(
         use crate::render::{self, Ctx};
         use std::collections::{HashMap, HashSet};
 
+        #[cfg(test)]
+        let gate = request.gate;
+        #[cfg(test)]
+        if let Some(gate) = gate { let _ = gate.recv(); }
         let ScanRequest {
-            targets, archives, needle, author, cap, kind, conv_names, names, palette, tz, image_font,
+            targets, archives, needle, author, cap, kind, conv_names, names, palette, tz, image_font, ..
         } = request;
         let author = author.as_deref();
         let say = |line: ScanLine| progress.send(line).map_err(|_| "search cancelled".to_string());

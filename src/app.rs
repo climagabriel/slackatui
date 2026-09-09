@@ -619,6 +619,9 @@ pub struct App {
     pub scan_overlay: Option<ScanOverlay>,
     /// The archive scan in flight and what to do with what it finds.
     pending_search: Option<ArchiveSearch>,
+    /// Holds the next scan's worker until a test lets it run.
+    #[cfg(test)]
+    pub scan_gate: Option<std::sync::mpsc::Receiver<()>>,
     pub spinner: usize,
     /// Slack may be consulted when the cache cannot answer.
     pub live: bool,
@@ -770,6 +773,8 @@ impl App {
             scan: None,
             scan_overlay: None,
             pending_search: None,
+            #[cfg(test)]
+            scan_gate: None,
             spinner: 0,
             live,
             cache_dir,
@@ -2373,8 +2378,20 @@ impl App {
         }
     }
 
+    /// A key that takes the reader somewhere else abandons a running scan.
+    /// It is only reachable for a search of one conversation, which draws no
+    /// box and so does not swallow keys; its hits belong to where the reader
+    /// was, not to where they went. Called from the key handlers rather than
+    /// from `open_conv`, because a finished refresh navigates through that
+    /// too and must leave the scan alone.
+    fn leave_for(&mut self) {
+        if self.scan.is_some() {
+            self.drop_scan();
+        }
+    }
+
     /// Abandon a running archive scan and the box narrating it. Only a new
-    /// search or Esc does this. `invalidate_thread_jobs` deliberately does
+    /// search, Esc, or navigation by key does this. `invalidate_thread_jobs` deliberately does
     /// not: it runs on job-completion paths too — a finished refresh
     /// navigates through `open_conv` — and a fetch landing at the wrong
     /// moment must not take a search the reader asked for with it. The
@@ -2672,6 +2689,8 @@ impl App {
             palette: self.palette.clone(),
             tz: self.tz,
             image_font: self.image_font(),
+            #[cfg(test)]
+            gate: self.scan_gate.take(),
         };
         let pending = ArchiveSearch {
             query: query.to_string(),
@@ -2955,12 +2974,18 @@ impl App {
             _ => self.status = format!("live search finished after its view closed: {total} hits"),
         }
         if let Some(counts) = counts {
+            // The cache-only clause already carries the caveat when there is
+            // one; say it separately only when there is no such clause.
             let cache_only = counts.cache_only_label();
+            let tail = match (cache_only.is_empty(), complete) {
+                (false, _) => format!(" · {cache_only}"),
+                (true, false) => " (partial answer)".to_string(),
+                (true, true) => String::new(),
+            };
             self.say_in_scan(live::ScanLine::plain(format!(
-                "Slack: {total} hits{} · +{} new{}",
-                if complete { String::new() } else { format!(" (first {SEARCH_CAP}, more to come)") },
+                "Slack: {total} hit{} · +{} new{tail}",
+                if total == 1 { "" } else { "s" },
                 counts.added,
-                if cache_only.is_empty() { String::new() } else { format!(" · {cache_only}") },
             )));
         }
         // Slack was the last half of the search; the box has nothing left.
@@ -4591,7 +4616,7 @@ impl App {
         if k.code == KeyCode::Esc {
             if let Some(browser) = self.channel_browser.as_mut().filter(|browser| browser.visible && browser.escape_edits()) {
                 browser.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-            } else { self.escape_home(); }
+            } else { self.leave_for(); self.escape_home(); }
             return;
         }
         if let Some(browser) = self.channel_browser.as_mut().filter(|b| b.visible) {
@@ -4919,6 +4944,7 @@ impl App {
                     if self.open.as_ref().map(|o| o.conv) == Some(idx) {
                         self.focus = Focus::Msgs;
                     } else {
+                        self.leave_for();
                         self.open_conv(idx);
                     }
                 }
@@ -4929,7 +4955,7 @@ impl App {
                 }
             }
             Some(Action::Command) => self.open_command(),
-            Some(Action::Close) => self.escape_home(),
+            Some(Action::Close) => { self.leave_for(); self.escape_home(); }
             Some(Action::Archive) => self.prompt_archive(),
             Some(Action::MyThreads) => self.open_my_threads(),
             Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
@@ -5073,6 +5099,7 @@ impl App {
                 if let (false, Some((cid, root, name))) = (timeline, sel) {
                     match self.corpus.conv_by_channel(&cid) {
                         Some(idx) => {
+                            self.leave_for();
                             self.stack.clear();
                             if self.open.as_ref().map(|o| o.conv) != Some(idx) {
                                 self.open_conv(idx);
@@ -5118,7 +5145,7 @@ impl App {
                 }
                 .to_string();
             }
-            Some(Action::Close) => self.escape_home(),
+            Some(Action::Close) => { self.leave_for(); self.escape_home(); }
             Some(Action::Back) => {
                 if let Some(list) = self.active_list_mut().filter(|list| list.line_scroll) {
                     list.line_scroll = false;
@@ -6460,15 +6487,17 @@ pub(crate) mod tests {
     /// assertion about the search still being out passes or fails on timing.
     fn gated_slack(
         answer: serde_json::Value,
-    ) -> (std::sync::Arc<Client>, std::sync::mpsc::Sender<()>) {
+    ) -> (std::sync::Arc<Client>, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<String>) {
         let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (asked, queries) = std::sync::mpsc::channel::<String>();
         let gate = std::sync::Mutex::new(gate);
-        let client = Client::for_test(move |method, _| {
+        let client = Client::for_test(move |method, params| {
             if method != "search.messages" { return Ok(quiet_slack()); }
+            asked.send(params.iter().find(|(key, _)| *key == "query").unwrap().1.to_string()).unwrap();
             gate.lock().expect("gate").recv().expect("the test releases the search");
             Ok(answer.clone())
         });
-        (std::sync::Arc::new(client), release)
+        (std::sync::Arc::new(client), release, queries)
     }
 
     /// Let the worker narrate without collecting its result, so the box can
@@ -6605,16 +6634,20 @@ pub(crate) mod tests {
 
     /// A fetch finishing mid-scan navigates, and navigation invalidates
     /// thread jobs. It must not take the search with it: the reader asked
-    /// for the search, nothing asked for it to be abandoned.
+    /// for the search, nothing asked for it to be abandoned. The scan worker
+    /// is held on a gate, so which of the two lands first is decided here
+    /// rather than by the scheduler.
     #[test]
     fn a_refresh_landing_mid_scan_does_not_cancel_the_search() {
+        // The refresh lands first: the search is untouched and arrives after.
         let (mut app, dirs) = scan_test_app();
         let conv = app.corpus.conv_by_channel("C1").unwrap();
         let (refreshing, finish_refresh) = live::pending_job(JobKind::Refresh { conv, before: 0 });
+        let (release_scan, gate) = std::sync::mpsc::channel();
+        app.scan_gate = Some(gate);
         app.job = Some(refreshing);
         app.run_command("/find message: nginx", "");
         assert!(app.scan.is_some() && app.scan_overlay.is_some());
-        // The refresh lands first and navigates through open_conv.
         finish_refresh.send(Ok(Done::Refreshed)).unwrap();
         app.tick();
         assert!(app.job.is_none(), "the refresh was not collected");
@@ -6622,11 +6655,87 @@ pub(crate) mod tests {
         assert!(app.scan.is_some(), "the refresh cancelled the scan");
         assert!(app.pending_search.is_some(), "the refresh dropped the pending search");
         assert!(app.scan_overlay.is_some(), "the box went with the refresh");
-        // Then the scan lands and the search is there after all.
+        release_scan.send(()).unwrap();
         app.finish_archive_scan_for_test();
         let Some(View::Search { list, query, .. }) = app.stack.last() else { panic!("no search view") };
         assert_eq!(query, "nginx");
         assert_eq!(list.msgs.len(), 3);
+
+        // The scan lands first: the search is showing, and the refresh then
+        // navigates over it. A refresh has always done that to whatever was
+        // on screen; it is not something this change introduced.
+        let (mut app, more_dirs) = scan_test_app();
+        let conv = app.corpus.conv_by_channel("C1").unwrap();
+        let (refreshing, finish_refresh) = live::pending_job(JobKind::Refresh { conv, before: 0 });
+        app.job = Some(refreshing);
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        assert!(matches!(app.stack.last(), Some(View::Search { .. })));
+        finish_refresh.send(Ok(Done::Refreshed)).unwrap();
+        app.tick();
+        assert!(app.stack.is_empty(), "open_conv clears the stack, as it does for any view");
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(conv));
+
+        // Both ready in one tick: the scan is polled first, so the search is
+        // pushed and the refresh then navigates over it, same as above.
+        let (mut app, yet_more_dirs) = scan_test_app();
+        let conv = app.corpus.conv_by_channel("C1").unwrap();
+        let (refreshing, finish_refresh) = live::pending_job(JobKind::Refresh { conv, before: 0 });
+        let (release_scan, gate) = std::sync::mpsc::channel();
+        app.scan_gate = Some(gate);
+        app.job = Some(refreshing);
+        app.run_command("/find message: nginx", "");
+        release_scan.send(()).unwrap();
+        // The worker has said its last word, so its result is on the way.
+        wait_for_scan_lines(&mut app, 4);
+        std::thread::sleep(Duration::from_millis(50));
+        finish_refresh.send(Ok(Done::Refreshed)).unwrap();
+        app.tick();
+        assert!(app.scan.is_none() && app.job.is_none(), "both were meant to land in one tick");
+        assert!(app.stack.is_empty());
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(conv));
+
+        for dir in dirs.into_iter().chain(more_dirs).chain(yet_more_dirs) {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// A scan with no box does not swallow keys, so the reader can walk away
+    /// from it. Its hits belong where they were asked for, not where the
+    /// reader went.
+    #[test]
+    fn opening_a_conversation_abandons_a_box_less_scan() {
+        let (mut app, dirs) = scan_test_app();
+        let (release_scan, gate) = std::sync::mpsc::channel();
+        app.scan_gate = Some(gate);
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.run_command("/find from:@gabriel.clima", "");
+        assert!(app.scan.is_some() && app.scan_overlay.is_none(), "a one-conversation scan draws no box");
+        // The reader goes back to the list and opens the other conversation.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.scan.is_none(), "Esc left the scan running");
+        release_scan.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        app.tick();
+        assert!(app.stack.is_empty(), "the abandoned search pushed its view anyway");
+
+        // The same through Open on another conversation.
+        let (release_scan, gate) = std::sync::mpsc::channel();
+        app.scan_gate = Some(gate);
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.run_command("/find from:@gabriel.clima", "");
+        assert!(app.scan.is_some());
+        app.focus = Focus::Convs;
+        let other = app.corpus.conv_by_channel("COTHER").unwrap();
+        app.conv_cursor = app.filtered.iter().position(|&index| index == other).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(other));
+        assert!(app.scan.is_none(), "opening a conversation left the scan running");
+        release_scan.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        app.tick();
+        assert!(app.stack.is_empty(), "the abandoned search pushed its view anyway");
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(other));
         for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
     }
 
@@ -6701,7 +6810,7 @@ pub(crate) mod tests {
         let (mut app, dirs) = scan_test_app();
         // One hit the archive already has, one it does not; the archive's
         // newest hit is left out, so Slack does not return it.
-        let (client, release) = gated_slack(json!({"messages":{"matches":[
+        let (client, release, asked) = gated_slack(json!({"messages":{"matches":[
             {"channel":{"id":"C1","name":"one"},"ts":"1.000000","user":"U1","text":"nginx in one"},
             {"channel":{"id":"COTHER","name":"other-channel"},"ts":"2.000000","user":"U1","text":"nginx over there"},
             {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}
@@ -6710,8 +6819,9 @@ pub(crate) mod tests {
         app.live = true;
         app.run_command("/find message: nginx", "");
         app.finish_archive_scan_for_test();
-        // Slack is asked and has not answered: nothing here can race, the
-        // mock is parked on the gate.
+        // Slack is asked the bare needle, and has not answered: nothing here
+        // can race, the mock is parked on the gate.
+        assert_eq!(asked.recv_timeout(Duration::from_secs(2)).unwrap(), "nginx");
         assert!(app.job.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Search { .. })));
         for _ in 0..5 { app.tick(); }
         // The archive hits are showing already, under a box that stays up.
@@ -6793,6 +6903,11 @@ pub(crate) mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.job.is_some() && Instant::now() < deadline { app.tick(); std::thread::sleep(Duration::from_millis(1)); }
         assert!(!app.status.starts_with("Slack: search.messages"), "the search failed outright: {}", app.status);
+        // The box says the answer was cut short, not that more is coming:
+        // nothing follows a page that failed.
+        let overlay = app.scan_overlay.as_ref().expect("the last line is drawn once");
+        assert_eq!(overlay.lines.last().unwrap().text,
+            "Slack: 1 hit · +1 new · 3 not returned by Slack (partial answer)");
         let Some(View::Search { live_hits, live_pending, list, .. }) = app.stack.last() else { panic!("no search view") };
         // Page one's hit is in the list, and the count is not called exact.
         assert_eq!(list.msgs.len(), 4);
@@ -6857,13 +6972,14 @@ pub(crate) mod tests {
     #[test]
     fn escape_during_the_slack_phase_keeps_the_list_and_the_job() {
         let (mut app, dirs) = scan_test_app();
-        let (client, release) = gated_slack(json!({"messages":{"matches":[
+        let (client, release, asked) = gated_slack(json!({"messages":{"matches":[
             {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}
         ]}}));
         app.api = Some(client);
         app.live = true;
         app.run_command("/find message: nginx", "");
         app.finish_archive_scan_for_test();
+        assert_eq!(asked.recv_timeout(Duration::from_secs(2)).unwrap(), "nginx");
         for _ in 0..5 { app.tick(); }
         assert!(app.scan_overlay.as_ref().is_some_and(|o| o.live_pending));
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
