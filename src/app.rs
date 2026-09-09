@@ -224,7 +224,9 @@ impl MsgList {
                         && (slot.line..slot.line + usize::from(slot.rows)).contains(&last_row)
                 }) {
                     let render::ImageSource::File(f) = &slot.source;
-                    tail = render::file_label(f);
+                    // Through the same highlight pass `message_lines` gives its
+                    // file lines, so a configured word colors the name here too.
+                    tail = ctx.palette.highlight_line(render::file_label(f));
                 }
                 rendered.lines.truncate(1);
                 rendered.lines.push(Line::from(format!("  ... ({hidden} more lines)")));
@@ -6265,7 +6267,13 @@ pub(crate) mod tests {
     #[test]
     fn collapsed_preview_keeps_the_last_row_and_only_an_image_that_fits_it() {
         let corpus = Corpus::stub(&[]);
-        let palette = Palette::default();
+        // A highlight the file name matches, so the test can tell a label that
+        // went through the palette from one that did not.
+        let mut palette = Palette::default();
+        palette.highlights = vec![crate::palette::Highlight {
+            word: "wide".into(),
+            color: ratatui::style::Color::Green,
+        }];
         let context = Ctx { archive: None, corpus: &corpus, tz: Tz::Utc,
             image_font: Some((8, 16)), last_read: None, palette: &palette };
         let with_image = |width: u32, height: u32| {
@@ -6306,11 +6314,16 @@ pub(crate) mod tests {
         assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  ... (34 more lines)");
         let label = render::file_label(&tall.files()[0]).to_string();
         assert_eq!(label, "  [file] wide.png (png)");
-        assert_eq!(list.flat[list.first[0] + 3].line.to_string(), label);
-        // The same label is what the uncollapsed render shows above the image.
+        let collapsed_tail = list.flat[list.first[0] + 3].line.clone();
+        assert_eq!(collapsed_tail.to_string(), label);
+        // The name went through the highlight pass: "wide" is green.
+        assert!(collapsed_tail.spans.iter().any(|span|
+            span.content == "wide" && span.style.fg == Some(ratatui::style::Color::Green)));
+        // The same label, styling included, is what the uncollapsed render
+        // shows above the image.
         list.rebuild_for_pane(&context, 120, 100);
         assert_eq!(list.collapsed, vec![false]);
-        assert_eq!(list.flat[list.first[0] + 1 + 21].line.to_string(), label);
+        assert_eq!(list.flat[list.first[0] + 1 + 21].line, collapsed_tail);
         // A plain attachment reserves no rows, so no slot exists to drop and
         // the message's own last row is already the file line.
         let mut list = MsgList::new(vec![Msg::from_api("C1".into(), json!({
