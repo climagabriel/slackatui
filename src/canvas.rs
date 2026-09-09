@@ -1300,6 +1300,13 @@ pub(crate) fn wrap_lines(text: &str, width: usize) -> Vec<String> {
                         rows.push(std::mem::take(&mut row));
                         used = unicode_width::UnicodeWidthStr::width(rest.as_str());
                         row = rest;
+                        // The word carried over may already fill its new row,
+                        // so the character that forced the break is checked
+                        // against it again rather than appended on trust.
+                        if used + size > width && !row.is_empty() {
+                            rows.push(std::mem::take(&mut row));
+                            used = 0;
+                        }
                     }
                     _ => {
                         rows.push(std::mem::take(&mut row));
@@ -1939,6 +1946,24 @@ mod tests {
         assert_eq!(browser.title(), "#team-cdn-alpha · channel tabs · Files & links");
         app.on_key(key('h'));
         assert_eq!(app.channel_browser.as_ref().unwrap().title(), "#team-cdn-alpha · channel tabs");
+    }
+
+    /// After a break at a space, the carried word plus the character that
+    /// forced the break must still fit; the row it opens is checked again.
+    #[test]
+    fn a_word_carried_past_a_space_break_never_overfills_its_row() {
+        use unicode_width::UnicodeWidthStr;
+        for (text, width) in [(" abc界", 4), ("aa bbb界", 4), ("x yyyy z", 5), ("a b c d e f", 3)] {
+            let rows = wrap_lines(text, width);
+            assert_eq!(rows.concat(), text, "{text:?} at {width}");
+            for row in &rows {
+                assert!(
+                    row.width() <= width || row.chars().count() == 1,
+                    "{text:?} at {width}: row {row:?} is {} cells",
+                    row.width()
+                );
+            }
+        }
     }
 
 }
