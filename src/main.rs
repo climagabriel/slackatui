@@ -76,9 +76,20 @@ selection. PgUp/PgDn scroll long values; g/G select the first/last value or link
 Ctrl-S or /save saves the selected message to Slack Later; Ctrl-Shift-S or /unsave
 removes it from Later. SAVED above starred conversations opens active saved messages;
 r refreshes the list. Terminals that report shortcuts alike can use /unsave.
+/find TEXT from the sidebar filters the conversation list by name.
+/find message: TEXT searches the message text of every cached conversation
+instead, thread replies included, newest first, up to 500 hits. The quotes in
+/find message: \"TEXT\" are optional and one pair around the whole needle is
+stripped; matching is a case-insensitive substring of the message as displayed,
+or of a link it carries. While reading a conversation the message: prefix is
+redundant and searches that conversation, as /find TEXT does there.
 /find from:@me or /find from:@name [TEXT] filters by sender. Suggestions narrow;
-Tab completes them. From the sidebar it searches the workspace; while reading a
-conversation it searches that conversation. Ambiguous names use the suggested user ID.
+Tab completes them, and Tab on an empty /find argument offers both prefixes.
+From the sidebar it searches the workspace; while reading a conversation it
+searches that conversation. Ambiguous names use the suggested user ID.
+message: and from:@ combine: /find message: TEXT from:@name means both.
+A signed-in session also asks Slack the same question and folds in what it
+returns; without one the cached archives answer alone.
 
 SENT below SAVED shows sent messages newest first, using Slack search.
 Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.

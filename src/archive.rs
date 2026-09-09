@@ -1525,6 +1525,29 @@ mod union_tests {
         drop(archive);std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// What `/find message:` asks the archive: text alone, every author, every
+    /// channel, replies included, newest first, cut at the limit.
+    #[test]
+    fn text_search_without_an_author_spans_authors_channels_and_replies() {
+        let root=std::env::temp_dir().join(format!("slack-message-test-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        database(&root,100,&[(1,None,"nginx old"),(2,Some(1),"nginx reply"),(3,None,"nginx by somebody else")]);
+        let connection=Connection::open(root.join("slackdump.sqlite")).unwrap();
+        connection.execute("UPDATE MESSAGE SET DATA=CAST(json_set(CAST(DATA AS TEXT),'$.user','U2') AS BLOB) WHERE ID=3000000",[]).unwrap();
+        connection.execute("INSERT INTO MESSAGE SELECT ID,CHUNK_ID,'D1',TS,PARENT_ID,THREAD_TS,IS_PARENT,LATEST_REPLY,TXT,DATA FROM MESSAGE WHERE ID=2000000",[]).unwrap();
+        drop(connection);
+        let archive=Archive::open("test".into(),&root).unwrap();
+        let channel=archive.search_filtered(Some("C1"),"nginx",None,10).unwrap();
+        assert_eq!(channel.iter().map(|message|message.id).collect::<Vec<_>>(),[3_000_000,2_000_000,1_000_000]);
+        assert_eq!(channel[1].parent_id,Some(1_000_000));
+        assert_eq!(channel.iter().filter(|message|message.user.as_deref()==Some("U2")).count(),1);
+        let everywhere=archive.search_filtered(None,"nginx",None,10).unwrap();
+        assert_eq!(everywhere.len(),4);
+        assert!(everywhere.iter().any(|message|message.channel_id=="D1"));
+        assert_eq!(archive.search_filtered(None,"nginx",None,2).unwrap().len(),2);
+        assert!(archive.search_filtered(Some("C1"),"absent",None,10).unwrap().is_empty());
+        drop(archive);std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn overlapping_archives_preserve_union_pages_threads_and_refreshes() {
         let root = std::env::temp_dir().join(format!("slack-archive-union-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));

@@ -829,7 +829,9 @@ impl App {
             return;
         }
         if let Some(Command::Find(text)) = parse_command(line) {
-            if crate::author_search::has_author(&text) {
+            // A search half-typed is not a name filter: neither `from:@` nor
+            // `message:` says anything about the conversation names.
+            if crate::author_search::has_author(&text) || crate::author_search::message_needle(&text).is_some() {
                 if let Mode::Prompt { previous, .. } = &self.mode { self.filter = previous.clone(); }
                 self.apply_filter(); return;
             }
@@ -858,9 +860,22 @@ impl App {
                 }
             }
             Some(Command::Find(text)) => {
+                // `message: TEXT` from the list searches every archive's text
+                // instead of the conversation names; inside a conversation the
+                // prefix is redundant and drops to the ordinary search.
+                let needle = crate::author_search::message_needle(&text);
+                let across = needle.is_some() && self.focus == Focus::Convs;
+                let text = needle.unwrap_or(text);
                 if crate::author_search::has_author(&text) {
                     self.restore_filter(filter_before);
-                    self.run_author_search(&text);
+                    self.run_archive_search(&text);
+                } else if across {
+                    self.restore_filter(filter_before);
+                    if text.is_empty() {
+                        self.status = "search what?".to_string();
+                    } else {
+                        self.run_archive_search(&text);
+                    }
                 } else if self.focus == Focus::Convs {
                     self.filter = text;
                     self.apply_filter();
@@ -2490,10 +2505,18 @@ impl App {
         self.open_thread_in(cid, root, focus);
     }
 
-    fn run_author_search(&mut self, query: &str) {
-        let parsed = match crate::author_search::parse(query, &self.corpus.author_names(), self.corpus.me.as_deref()) {
-            Ok(parsed) => parsed, Err(error) => { self.status = error; return; }
-        };
+    /// A search over the archives themselves: `from:@name`, or the plain text
+    /// of a `message:` query, or both. Every conversation when the list has
+    /// focus, the one being read otherwise; thread replies are included, and
+    /// Slack is asked the same question when a fetch slot is free.
+    fn run_archive_search(&mut self, query: &str) {
+        let wants_author = crate::author_search::has_author(query);
+        let kind = if wants_author { "author" } else { "message" };
+        let parsed = if wants_author {
+            match crate::author_search::parse(query, &self.corpus.author_names(), self.corpus.me.as_deref()) {
+                Ok(parsed) => parsed, Err(error) => { self.status = error; return; }
+            }
+        } else { crate::author_search::text_query(query) };
         let cid = if self.focus == Focus::Msgs {
             match self.stack.last() {
                 Some(View::Search {list,..}) => list.source_channel.clone(),
@@ -2507,11 +2530,13 @@ impl App {
         let mut seen = HashSet::new();
         let mut capped = false;
         let needle = parsed.text.to_lowercase();
-        if let Some(author) = parsed.user_id.as_deref() {
+        let author = parsed.user_id.as_deref();
+        // No author resolved and one asked for means nothing can match.
+        if author.is_some() || !wants_author {
             for conversation in self.corpus.convs.iter().filter(|c| !c.live_only && cid.as_ref().is_none_or(|cid|cid==&c.id)) {
                 let archive=&self.corpus.archives[conversation.archive];
-                let candidates = match archive.search_filtered(Some(&conversation.id), &parsed.text, Some(author), SEARCH_CAP) {
-                    Ok(messages) => messages, Err(error) => { self.status = format!("Author search: {error}"); return; }
+                let candidates = match archive.search_filtered(Some(&conversation.id), &parsed.text, author, SEARCH_CAP) {
+                    Ok(messages) => messages, Err(error) => { self.status = format!("{kind} search: {error}"); return; }
                 };
                 capped |= candidates.len() >= SEARCH_CAP;
                 let ctx = Ctx { archive:Some(archive),corpus:&self.corpus,tz:self.tz,image_font:self.image_font(),last_read:None,palette:&self.palette };
@@ -2531,15 +2556,15 @@ impl App {
         let mut list=MsgList::new(hits,false);list.source_channel=cid.clone();
         self.stack.push(View::Search { query:query.into(),list,capped,live_hits:None,live_pending:go_live });
         self.focus=Focus::Msgs;
-        self.status=format!("{cached} cached author matches{}",if go_live { "; searching Slack" } else if self.live && self.job.is_some() { "; Slack was not searched: another request is running; retry when it finishes" } else { "" });
+        self.status=format!("{cached} cached {kind} matches{}",if go_live { "; searching Slack" } else if self.live && self.job.is_some() { "; Slack was not searched: another request is running; retry when it finishes" } else { "" });
         if go_live {
             let slack_query = match cid { Some(cid)=>format!("in:<#{cid}> {}",parsed.slack),None=>parsed.slack };
             self.job=Some(live::api_search_labeled(self.api.clone().unwrap(),slack_query,query.into()));
-        } else if parsed.user_id.is_none() { self.status="Own user ID unavailable; sign in to search from:@me".into(); }
+        } else if wants_author && parsed.user_id.is_none() { self.status="Own user ID unavailable; sign in to search from:@me".into(); }
     }
 
     pub fn run_search(&mut self, query: &str) {
-        if crate::author_search::has_author(query) { self.run_author_search(query); return; }
+        if crate::author_search::has_author(query) { self.run_archive_search(query); return; }
         let query = query.trim();
         if query.is_empty() {
             return;
@@ -5913,6 +5938,119 @@ pub(crate) mod tests {
         app.run_command("/find from:@me","");assert!(app.status.contains("Slack was not searched"));assert!(app.title().contains("cached results only"));
         app.job=None;
         app.go_home();app.run_command("/find from:@unknown","");assert!(app.status.contains("Unknown author"));assert!(app.stack.is_empty());
+    }
+
+    /// A stub archive holding these messages, attached to `channel`.
+    fn attach_archive(app: &mut App, channel: &str, rows: &[(i64, Option<i64>, &str)]) {
+        let archive = Archive::stub(&[("U1", "gabriel.clima")], &[]);
+        archive.conn.execute_batch(
+            "CREATE TABLE MESSAGE(ID INTEGER, CHUNK_ID INTEGER, CHANNEL_ID TEXT, TS TEXT, PARENT_ID INTEGER,
+             THREAD_TS TEXT, IS_PARENT INTEGER, LATEST_REPLY TEXT, TXT TEXT, DATA BLOB);").unwrap();
+        for &(seconds, parent, text) in rows {
+            let ts = format!("{seconds}.000000");
+            let data = json!({"text":text,"ts":ts,"user":"U1"}).to_string().into_bytes();
+            archive.conn.execute(
+                "INSERT INTO MESSAGE VALUES(?1,1,?2,?3,?4,?5,0,NULL,?6,?7)",
+                rusqlite::params![seconds*1_000_000, channel, ts, parent.map(|p| p*1_000_000),
+                    parent.map(|p| format!("{p}.000000")), text, data]).unwrap();
+        }
+        let index = app.corpus.conv_by_channel(channel).unwrap();
+        app.corpus.archives.push(archive);
+        app.corpus.convs[index].archive = app.corpus.archives.len() - 1;
+        app.corpus.convs[index].live_only = false;
+    }
+
+    /// `/find message:` from the list searches text everywhere the archives
+    /// reach; inside a conversation it is the ordinary search it always was.
+    #[test]
+    fn message_search_crosses_conversations_and_leaves_the_name_filter_alone() {
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.merge_profiles(vec![json!({"id":"U1","name":"gabriel.clima"})]);
+        app.merge_conversations(vec![json!({"id":"COTHER","name":"other-channel","is_member":true})]);
+        attach_archive(&mut app, "C1", &[(1, None, "nginx in one"), (3, Some(1), "nginx reply in one")]);
+        attach_archive(&mut app, "COTHER", &[(2, None, "nginx over there"), (4, None, "nothing to see")]);
+        let hits = |app: &App| -> Vec<String> {
+            let Some(View::Search { list, .. }) = app.stack.last() else { panic!("no search view") };
+            list.msgs.iter().map(|m| m.text.clone()).collect()
+        };
+
+        for line in ["/find message: nginx", "/find message: \"nginx\"", "/find MESSAGE:nginx"] {
+            app.go_home();
+            app.run_command(line, "");
+            assert_eq!(app.focus, Focus::Msgs, "{line}");
+            assert!(app.open.is_none(), "{line}");
+            let Some(View::Search { list, query, capped, .. }) = app.stack.last() else { panic!("{line}") };
+            assert_eq!(query, "nginx", "{line}");
+            assert!(!capped, "{line}");
+            assert!(list.source_channel.is_none(), "{line}");
+            // Newest first, both conversations, the thread reply included.
+            assert_eq!(hits(&app), ["nginx reply in one", "nginx over there", "nginx in one"], "{line}");
+            assert_eq!(list.msgs.iter().filter(|m| m.channel_id == "COTHER").count(), 1, "{line}");
+            assert_eq!(list.msgs[0].channel_name.as_deref(), Some("#one"), "{line}");
+            assert!(app.status.contains("3 cached message matches"), "{line}: {}", app.status);
+        }
+
+        // l on a hit from another conversation opens its thread there, over
+        // the search view, without switching the list to that conversation.
+        app.on_msg_key(Some(Action::Down));
+        assert_eq!(app.selected().unwrap().channel_id, "COTHER");
+        app.on_msg_key(Some(Action::Open));
+        let Some(View::Thread { list, place, .. }) = app.stack.last() else { panic!("no thread") };
+        assert_eq!(list.source_channel.as_deref(), Some("COTHER"));
+        assert_eq!(place.as_deref(), Some("#other-channel"));
+        assert!(app.open.is_none());
+        app.on_msg_key(Some(Action::Back));
+        assert!(matches!(app.stack.last(), Some(View::Search { .. })));
+
+        // An empty needle asks rather than searching.
+        app.go_home();
+        app.run_command("/find message:", "");
+        assert_eq!(app.status, "search what?");
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Convs);
+
+        // Typed live, the prefix never becomes a name filter.
+        app.open_command();
+        app.filter_live("/find one");
+        assert_eq!(app.filter, "one");
+        let narrowed = app.filtered.len();
+        app.filter_live("/find message: ng");
+        assert!(app.filter.is_empty());
+        assert!(app.filtered.len() > narrowed);
+        app.mode = Mode::Normal;
+
+        // Inside a conversation the prefix means what /find TEXT means there.
+        app.go_home();
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.run_command("/find nginx", "");
+        let plain = hits(&app);
+        assert_eq!(plain, ["nginx reply in one", "nginx in one"]);
+        app.stack.clear();
+        app.run_command("/find message: nginx", "");
+        let Some(View::Search { list, query, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(query, "nginx");
+        assert_eq!(list.source_channel.as_deref(), Some("C1"));
+        assert_eq!(hits(&app), plain);
+
+        // Signed in, Slack is asked the bare needle: no in: filter from the
+        // list, and from:@ still combines with it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            assert_eq!(method, "search.messages");
+            tx.send(params.iter().find(|(key, _)| *key == "query").unwrap().1.to_string()).unwrap();
+            Ok(json!({"messages":{"matches":[]}}))
+        })));
+        app.live = true;
+        app.go_home();
+        app.run_command("/find message: nginx", "");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nginx");
+        assert!(app.status.contains("cached message matches"), "{}", app.status);
+        app.go_home();
+        app.run_command("/find message: nginx from:@me", "");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1 nginx");
+        assert!(app.status.contains("cached author matches"), "{}", app.status);
+        assert_eq!(hits(&app).len(), 3);
     }
 
     #[test]

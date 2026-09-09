@@ -21,8 +21,8 @@ pub const COMMANDS: &[Cmd] = &[
     },
     Cmd {
         name: "find",
-        args: "TEXT",
-        help: "filter the conversation list, or search the open conversation",
+        args: "TEXT | message: TEXT",
+        help: "filter the conversation list by name, or search message text",
     },
     Cmd {
         name: "search",
@@ -151,6 +151,17 @@ pub fn complete(line: &str, convs: &[String]) -> Completion {
                 .collect()
         }
         (1, Some(w)) if matches!(w.as_str(), "leave" | "mute" | "unmute" | "star" | "pin" | "unstar" | "unpin") => conv_items(convs),
+        // The two prefixes a find query accepts; plain text needs neither.
+        (1, Some(w)) if matches!(w.as_str(), "find" | "search" | "f" | "s") => vec![
+            Item {
+                text: "message:".to_string(),
+                help: "search message text across conversations".to_string(),
+            },
+            Item {
+                text: "from:@".to_string(),
+                help: "search one sender's messages".to_string(),
+            },
+        ],
         (2, Some(w)) if w == "cache" && words.get(1) == Some(&"highlight") => HIGHLIGHT_ARGS
             .iter()
             .map(|(name, help)| Item {
@@ -257,7 +268,7 @@ fn takes_argument(head: &str, word: &str) -> bool {
             .iter()
             .any(|c| c.name == word && !c.args.is_empty());
     }
-    CACHE_OPS.iter().any(|(op, _)| *op == word)
+    word == "message:" || CACHE_OPS.iter().any(|(op, _)| *op == word)
 }
 
 fn common_prefix(items: &[Item]) -> String {
@@ -289,6 +300,20 @@ mod tests {
         assert_eq!(with_authors("/find from:@duplicate",&[],&users).items.iter().map(|i|i.text.as_str()).collect::<Vec<_>>(),["from:@U4","from:@U5"]);
         assert!(with_authors("/find from:@zzz",&[],&users).items.is_empty());
         assert!(with_authors("/mute from:@",&[],&users).items.is_empty());
+    }
+
+    #[test]
+    fn find_offers_both_query_prefixes_and_completes_message() {
+        assert_eq!(
+            complete("/find ", &convs()).items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+            ["message:", "from:@"]
+        );
+        assert_eq!(apply("/find m", &convs()).as_deref(), Some("/find message: "));
+        assert_eq!(apply("/search mess", &convs()).as_deref(), Some("/search message: "));
+        assert_eq!(apply("/f ", &convs()).as_deref(), Some("/f message:"));
+        // Past the prefix the needle is the user's own text, not a candidate.
+        assert!(complete("/find message: ng", &convs()).items.is_empty());
+        assert!(complete("/find ngin", &convs()).items.is_empty());
     }
 
     #[test]

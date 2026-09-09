@@ -1,4 +1,6 @@
-//! Author filters shared by archive search and Slack queries.
+//! The query prefixes shared by archive search and Slack queries: the
+//! `from:@name` author filter, and the `message:` text search that reaches
+//! every conversation from the list.
 pub struct Query {
     pub user_id: Option<String>,
     pub text: String,
@@ -7,6 +9,28 @@ pub struct Query {
 
 pub fn has_author(query: &str) -> bool {
     query.split_whitespace().any(|word| word.to_lowercase().starts_with("from:@"))
+}
+
+/// `message:` asks for a text search rather than a name filter. The needle is
+/// the rest of the line, with one pair of wrapping double quotes stripped, so
+/// `message: foo bar` and `message: "foo bar"` mean the same. A `from:@name`
+/// left in the remainder still parses: the two filters combine.
+pub fn message_needle(query: &str) -> Option<String> {
+    let query = query.trim();
+    let rest = query.get(..MESSAGE.len()).filter(|head| head.eq_ignore_ascii_case(MESSAGE)).map(|_| query[MESSAGE.len()..].trim())?;
+    Some(match rest.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).filter(|inner| !inner.contains('"')) {
+        Some(unquoted) => unquoted.to_string(),
+        None => rest.to_string(),
+    })
+}
+
+pub const MESSAGE: &str = "message:";
+
+/// A query with no author filter: the needle goes to the archives and to
+/// Slack as it was typed.
+pub fn text_query(text: &str) -> Query {
+    let text = text.trim().to_string();
+    Query { user_id: None, slack: text.clone(), text }
 }
 
 pub fn parse(query: &str, users: &[(String, String)], me: Option<&str>) -> Result<Query, String> {
@@ -50,5 +74,26 @@ mod tests {
         assert_eq!(parse("from:@U1",&collision,None).unwrap().user_id.as_deref(),Some("U1"));
         let duplicate=vec![("U1".into(),"same".into()),("U2".into(),"Same".into())];
         assert!(parse("from:@same",&duplicate,None).is_err());assert!(parse("from:@U2",&duplicate,None).is_ok());
+    }
+
+    #[test]
+    fn a_message_prefix_takes_the_rest_of_the_line_and_one_pair_of_quotes() {
+        for query in ["message: foo bar", "message:foo bar", "  MESSAGE: \"foo bar\" ", "Message:\"foo bar\""] {
+            assert_eq!(message_needle(query).as_deref(), Some("foo bar"), "{query}");
+        }
+        assert_eq!(message_needle("message:").as_deref(), Some(""));
+        assert_eq!(message_needle("message: \"\"").as_deref(), Some(""));
+        assert_eq!(message_needle("message: \"foo\" \"bar\"").as_deref(), Some("\"foo\" \"bar\""));
+        assert_eq!(message_needle("message: \"").as_deref(), Some("\""));
+        assert_eq!(message_needle("message: foo from:@me").as_deref(), Some("foo from:@me"));
+        assert_eq!(message_needle("me message: foo"), None);
+        assert_eq!(message_needle("messages: foo"), None);
+        assert_eq!(message_needle("ünicode"), None);
+        let parsed = parse(&message_needle("message: foo from:@me").unwrap(), &[], Some("U1")).unwrap();
+        assert_eq!(parsed.text, "foo");
+        assert_eq!(parsed.slack, "from:U1 foo");
+        let text = text_query(" nginx ");
+        assert!(text.user_id.is_none());
+        assert_eq!((text.text.as_str(), text.slack.as_str()), ("nginx", "nginx"));
     }
 }
