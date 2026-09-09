@@ -38,6 +38,11 @@ pub enum JobKind {
     Search {
         query: String,
     },
+    /// The cross-conversation scan of the archives themselves, behind
+    /// `/find message:` and `/find from:@name` from the conversation list.
+    ArchiveScan {
+        query: String,
+    },
     /// Archive a conversation not in the cache yet.
     ArchiveNew {
         spec: String,
@@ -106,6 +111,7 @@ impl JobKind {
             Self::Saved => "saved_messages",
             Self::Sent { .. } => "sent_messages",
             Self::Refresh {..} => "refresh", Self::Thread {..} => "thread", Self::Search {..} => "search",
+            Self::ArchiveScan {..} => "archive_scan",
             Self::ArchiveNew {..} => "archive", Self::Auth => "auth", Self::Tail {..} => "tail",
             Self::Older {..} => "older", Self::Newer {..} => "newer", Self::Conversations => "conversations",
             Self::Profiles => "profiles", Self::Usergroups => "usergroups", Self::Counts {..} => "counts",
@@ -128,6 +134,14 @@ pub enum Done {
     ThreadMsgs(Vec<Msg>),
     Search(PathBuf),
     SearchHits(Vec<Msg>),
+    /// What the archive scan found: the hit list the view shows, whether the
+    /// cap truncated it, and the user maps the worker read, by archive index,
+    /// so the next scan and the UI's own rendering do not read them again.
+    ArchiveHits {
+        hits: Vec<Msg>,
+        capped: bool,
+        users: Vec<(usize, std::sync::Arc<std::collections::HashMap<String, crate::archive::User>>)>,
+    },
     Archived(PathBuf),
     Auth(Arc<Client>, String),
     Messages(Vec<Msg>),
@@ -344,6 +358,142 @@ pub fn api_search_labeled(client: Arc<Client>, query: String, label: String) -> 
             Ok(Done::SearchHits(out))
         },
     )
+}
+
+// ----------------------------------------------------------- archive scan
+
+/// One conversation the archive scan visits.
+pub struct ScanTarget {
+    pub cid: String,
+    /// The conversation as the list names it, for the progress line.
+    pub name: String,
+    /// Index into the request's `archives`.
+    pub archive: usize,
+}
+
+/// Everything the scan worker needs, by value: it opens its own read-only
+/// connections and renders message text against its own name snapshot, so it
+/// never borrows `App` or the live `Corpus`.
+pub struct ScanRequest {
+    pub targets: Vec<ScanTarget>,
+    pub archives: Vec<crate::archive::ArchiveHandle>,
+    /// The needle as typed; empty for an author-only search.
+    pub needle: String,
+    pub author: Option<String>,
+    pub cap: usize,
+    /// "message" or "author": how a failure names the search that failed.
+    pub kind: &'static str,
+    /// Channel id -> the name a hit carries, as the conversation list has it.
+    pub conv_names: std::collections::HashMap<String, String>,
+    pub names: crate::archive::Corpus,
+    pub palette: crate::palette::Palette,
+    pub tz: crate::render::Tz,
+    pub image_font: Option<(u16, u16)>,
+}
+
+/// A line the scan wants shown in the progress box, and whether it is
+/// incidental detail rather than the scan's own narration.
+pub struct ScanLine {
+    pub text: String,
+    pub dim: bool,
+}
+
+impl ScanLine {
+    pub fn plain(text: impl Into<String>) -> ScanLine {
+        ScanLine { text: text.into(), dim: false }
+    }
+    pub fn dim(text: impl Into<String>) -> ScanLine {
+        ScanLine { text: text.into(), dim: true }
+    }
+}
+
+/// Scan every conversation in `request`, narrating into `progress`. Dropping
+/// the progress receiver ends the scan at the next conversation boundary,
+/// which is how Esc cancels it.
+pub fn archive_scan(
+    query: String,
+    request: ScanRequest,
+    progress: mpsc::Sender<ScanLine>,
+) -> Job {
+    let label = format!("searching the archives for '{query}'");
+    spawn(JobKind::ArchiveScan { query }, label, move || {
+        use crate::archive::Archive;
+        use crate::render::{self, Ctx};
+        use std::collections::{HashMap, HashSet};
+
+        let ScanRequest {
+            targets, archives, needle, author, cap, kind, conv_names, names, palette, tz, image_font,
+        } = request;
+        let author = author.as_deref();
+        let say = |line: ScanLine| progress.send(line).map_err(|_| "search cancelled".to_string());
+        say(ScanLine::dim(format!(
+            "sqlite: {}",
+            crate::archive::search_filter_sql(&needle, author, cap)
+        )))?;
+        let mut opened: HashMap<usize, Archive> = HashMap::new();
+        let mut hits: Vec<Msg> = Vec::new();
+        let mut seen: HashSet<(String, i64)> = HashSet::new();
+        let mut capped = false;
+        let lowered = needle.to_lowercase();
+        for target in &targets {
+            let archive = match opened.entry(target.archive) {
+                std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let handle = archives
+                        .get(target.archive)
+                        .ok_or_else(|| format!("{kind} search: {} has no archive", target.name))?;
+                    slot.insert(handle.open().map_err(|error| format!("{kind} search: {error}"))?)
+                }
+            };
+            let candidates = archive
+                .search_filtered(Some(&target.cid), &needle, author, cap)
+                .map_err(|error| format!("{kind} search: {error}"))?;
+            capped |= candidates.len() >= cap;
+            let ctx = Ctx {
+                archive: Some(archive), corpus: &names, tz, image_font,
+                last_read: None, palette: &palette,
+            };
+            let mut found = 0usize;
+            for mut message in candidates {
+                if !lowered.is_empty()
+                    && !render::plain(&render::body(&message, &ctx)).to_lowercase().contains(&lowered)
+                    && !render::message_urls(&message).iter().any(|url| url.to_lowercase().contains(&lowered))
+                {
+                    continue;
+                }
+                message.channel_name = conv_names.get(&message.channel_id).cloned();
+                if seen.insert((message.channel_id.clone(), message.id)) {
+                    hits.push(message);
+                    found += 1;
+                }
+            }
+            say(ScanLine::plain(format!(
+                "searching {} … {}",
+                target.name,
+                match found {
+                    0 => "none".to_string(),
+                    1 => "1 hit".to_string(),
+                    n => format!("{n} hits"),
+                }
+            )))?;
+        }
+        hits.sort_by_key(|message| std::cmp::Reverse(message.id));
+        capped |= hits.len() > cap;
+        hits.truncate(cap);
+        say(ScanLine::plain(format!(
+            "{} conversation{} scanned · {} hit{}{}",
+            targets.len(),
+            if targets.len() == 1 { "" } else { "s" },
+            hits.len(),
+            if hits.len() == 1 { "" } else { "s" },
+            if capped { format!(" (capped at {cap})") } else { String::new() },
+        )))?;
+        let users = opened
+            .iter()
+            .filter_map(|(index, archive)| Some((*index, archive.loaded_users()?)))
+            .collect();
+        Ok(Done::ArchiveHits { hits, capped, users })
+    })
 }
 
 /// Messages after `since` (a message id), ascending.

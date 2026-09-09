@@ -3,9 +3,10 @@
 //! be writing the same database (WAL), so connections open with a busy
 //! timeout and never touch the schema.
 
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
@@ -37,9 +38,40 @@ impl Kind {
     }
 }
 
+#[derive(Clone)]
 pub struct User {
     pub name: String,
     pub is_bot: bool,
+}
+
+/// Everything a second, independent read-only connection to one archive
+/// needs: the directory, the channel names `scan_convs` learned, and the
+/// extra archives folded into its `MESSAGE` view. Owned, so a worker thread
+/// can open its own `Archive` over the same files without borrowing the
+/// `Corpus`.
+#[derive(Clone)]
+pub struct ArchiveHandle {
+    rel: String,
+    dir: PathBuf,
+    channel_names: HashMap<String, String>,
+    combined: Vec<(PathBuf, Vec<String>)>,
+    users: Option<Arc<HashMap<String, User>>>,
+}
+
+impl ArchiveHandle {
+    /// A fresh read-only `Archive` that answers exactly as the one this
+    /// handle came from: same union of sources, same names.
+    pub fn open(&self) -> rusqlite::Result<Archive> {
+        let mut archive = Archive::open(self.rel.clone(), &self.dir)?;
+        archive.channel_names = self.channel_names.clone();
+        if let Some(users) = &self.users {
+            archive.adopt_users(users.clone());
+        }
+        if !self.combined.is_empty() {
+            archive.combine_sources(&self.combined)?;
+        }
+        Ok(archive)
+    }
 }
 
 pub struct Archive {
@@ -50,7 +82,10 @@ pub struct Archive {
     combined_sources: Vec<(PathBuf, Vec<String>)>,
     source_fingerprints: RefCell<Vec<String>>,
     pub conn: Connection,
-    users: RefCell<Option<HashMap<String, User>>>,
+    /// The workspace's users as this archive stores them, loaded once.
+    /// Shared rather than copied: the `/find` scan renders on a worker
+    /// thread with its own connections but the same maps.
+    users: RefCell<Option<Arc<HashMap<String, User>>>>,
     pub channel_names: HashMap<String, String>,
 }
 
@@ -268,6 +303,47 @@ impl Msg {
     }
 }
 
+/// The two LIKE patterns `search_filtered` binds: the needle as typed, and
+/// the same needle with `& < >` in the entity form Slack stores.
+fn search_patterns(needle: &str) -> (String, String) {
+    let esc = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    };
+    let stored = needle
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    (format!("%{}%", esc(needle)), format!("%{}%", esc(&stored)))
+}
+
+/// The filter `search_filtered` runs, with its parameters resolved, for
+/// showing a reader what the scan is asking of SQLite. Display only: the
+/// query itself still binds its parameters. The identical entity form of a
+/// needle without `& < >` is folded into one pair of terms.
+pub fn search_filter_sql(needle: &str, author: Option<&str>, limit: usize) -> String {
+    let (like, like_stored) = search_patterns(needle);
+    let mut terms = vec![like.clone()];
+    if like_stored != like {
+        terms.push(like_stored);
+    }
+    let matches: Vec<String> = terms
+        .iter()
+        .flat_map(|pattern| {
+            [
+                format!("TXT LIKE '{pattern}' ESCAPE '\\'"),
+                format!("CAST(DATA AS TEXT) LIKE '{pattern}' ESCAPE '\\'"),
+            ]
+        })
+        .collect();
+    let who = author.map_or_else(|| "NULL".to_string(), |id| format!("'{id}'"));
+    format!(
+        "… WHERE ({}) AND ({who} IS NULL OR json_extract(DATA,'$.user') = {who}) LIMIT {limit}",
+        matches.join(" OR ")
+    )
+}
+
 fn open_ro(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
@@ -298,6 +374,25 @@ impl Corpus {
             }
         }
     }
+    /// An owned `Corpus` carrying only what `render::Ctx` reads out of one:
+    /// user names, channel names, user groups and the owner's id. Archives
+    /// and conversations are left empty — a worker thread renders message
+    /// text with this and its own `Archive`, and never borrows the real
+    /// corpus the UI thread is drawing from.
+    pub fn names_snapshot(&self) -> Corpus {
+        Corpus {
+            root: PathBuf::new(),
+            archives: Vec::new(),
+            convs: Vec::new(),
+            workspace_url: self.workspace_url.clone(),
+            me: self.me.clone(),
+            channel_names: self.channel_names.clone(),
+            half_life_days: self.half_life_days,
+            usergroups: self.usergroups.clone(),
+            users: self.users.clone(),
+        }
+    }
+
     /// Live-only conversations have no archive; their numeric index is a placeholder.
     pub fn conv_archive(&self, conv: &Conv) -> Option<&Archive> {
         if conv.live_only {
@@ -567,11 +662,22 @@ impl Archive {
             combined_sources: vec![],
             source_fingerprints: RefCell::new(vec![]),
             conn: Connection::open_in_memory().expect("in-memory sqlite"),
-            users: RefCell::new(Some(map)),
+            users: RefCell::new(Some(Arc::new(map))),
             channel_names: channels
                 .iter()
                 .map(|(id, name)| (id.to_string(), name.to_string()))
                 .collect(),
+        }
+    }
+
+    /// What another thread needs to open this archive for itself.
+    pub fn handle(&self) -> ArchiveHandle {
+        ArchiveHandle {
+            rel: self.rel.clone(),
+            dir: self.dir.clone(),
+            channel_names: self.channel_names.clone(),
+            combined: self.combined_sources.clone(),
+            users: self.loaded_users(),
         }
     }
 
@@ -703,12 +809,23 @@ impl Archive {
         Ok(map)
     }
 
-    pub fn users(&self) -> Ref<'_, HashMap<String, User>> {
+    pub fn users(&self) -> Arc<HashMap<String, User>> {
         if self.users.borrow().is_none() {
-            let map = self.load_users().unwrap_or_default();
+            let map = Arc::new(self.load_users().unwrap_or_default());
             *self.users.borrow_mut() = Some(map);
         }
-        Ref::map(self.users.borrow(), |o| o.as_ref().expect("users loaded"))
+        self.users.borrow().clone().expect("users loaded")
+    }
+
+    /// The user map only if it has already been read, for handing to a
+    /// worker without making it read the table again.
+    pub fn loaded_users(&self) -> Option<Arc<HashMap<String, User>>> {
+        self.users.borrow().clone()
+    }
+
+    /// Adopt a map another connection to the same archive already read.
+    pub fn adopt_users(&self, users: Arc<HashMap<String, User>>) {
+        *self.users.borrow_mut() = Some(users);
     }
 
     /// A user's name when this archive knows the user.
@@ -1250,19 +1367,7 @@ impl Archive {
     }
 
     pub fn search_filtered(&self, cid: Option<&str>, needle: &str, author: Option<&str>, limit: usize) -> rusqlite::Result<Vec<Msg>> {
-        let esc = |s: &str| {
-            s.replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        };
-        let like = format!("%{}%", esc(needle));
-        // Slack stores & < > as entities; a needle typed as displayed must
-        // also be tried in its stored form.
-        let stored = needle
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
-        let like_stored = format!("%{}%", esc(&stored));
+        let (like, like_stored) = search_patterns(needle);
         let sql = format!(
             "WITH ranked AS (SELECT m.*, ROW_NUMBER() OVER (PARTITION BY m.CHANNEL_ID, m.ID ORDER BY {order}) AS position \
              FROM MESSAGE m WHERE (?1 IS NULL OR m.CHANNEL_ID = ?1)) \

@@ -6,7 +6,7 @@ use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use serde_json::{Map, Value};
 
-pub const ROLE_COUNT: usize = 15;
+pub const ROLE_COUNT: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -26,6 +26,8 @@ pub enum Role {
     SelectionText,
     SelectionBackground,
     InactiveSelectionBackground,
+    /// The box a running /find draws its progress into.
+    ProgressOverlay,
 }
 
 pub const ROLES: [Role; ROLE_COUNT] = [
@@ -44,6 +46,7 @@ pub const ROLES: [Role; ROLE_COUNT] = [
     Role::SelectionText,
     Role::SelectionBackground,
     Role::InactiveSelectionBackground,
+    Role::ProgressOverlay,
 ];
 
 impl Role {
@@ -64,6 +67,7 @@ impl Role {
             Role::SelectionText => "selected text",
             Role::SelectionBackground => "selected row",
             Role::InactiveSelectionBackground => "inactive selected row",
+            Role::ProgressOverlay => "search progress box",
         }
     }
 
@@ -84,6 +88,7 @@ impl Role {
             Role::SelectionText => "selection_text",
             Role::SelectionBackground => "selection_background",
             Role::InactiveSelectionBackground => "inactive_selection_background",
+            Role::ProgressOverlay => "progress_overlay",
         }
     }
 
@@ -102,6 +107,7 @@ impl Role {
             Role::SelectionText => Color::Black,
             Role::SelectionBackground => Color::White,
             Role::InactiveSelectionBackground => Color::Gray,
+            Role::ProgressOverlay => Color::DarkGray,
         }
     }
 }

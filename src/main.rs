@@ -91,6 +91,17 @@ message: and from:@ combine: /find message: TEXT from:@name means both.
 A signed-in session also asks Slack the same question and folds in what it
 returns; without one the cached archives answer alone.
 
+A search across conversations runs in the background, behind a progress box
+over the middle four fifths of the screen: the SQLite filter it runs, then
+each conversation with its hit count, then the total, then the Slack query
+and what Slack answered. The box closes itself when the last of the two
+searches lands, and swallows every key but Esc while it is up. Esc during the
+archive scan abandons the search and shows nothing; once Slack has been asked
+the hits are already on screen, and Esc only closes the box while Slack's
+answer folds in as usual. The box's background is the color palette's
+\"search progress box\" role. The result title counts both sides: N more from
+Slack, and N only in cache for hits Slack did not return.
+
 SENT below SAVED shows sent messages newest first, using Slack search.
 Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.
 THREADS below MENTIONS opens what Ctrl-T opens: every cached thread you
@@ -829,7 +840,10 @@ fn tui(app: &mut App, no_images: bool, image_protocol: Option<bool>) -> std::io:
             session_log::record("slow_draw", serde_json::json!({"duration_ms":draw_elapsed.as_millis()}));
             trace(&format!("draw {} ms", draw_elapsed.as_millis()));
         }
-        match event::poll(Duration::from_millis(250)) {
+        // The /find progress box is animated, so it is redrawn more often
+        // than a still screen needs to be.
+        let wait = if app.scan_running() { 50 } else { 250 };
+        match event::poll(Duration::from_millis(wait)) {
             Ok(true) => match event::read() {
                 Ok(input) => {
                     session_log::input(&input, "event_loop");

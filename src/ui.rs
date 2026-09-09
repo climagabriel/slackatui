@@ -72,6 +72,78 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     .border_style(Style::new().fg(Color::DarkGray))),popup);
         }
     }
+    // Last of all, so nothing draws over what the reader is waiting on.
+    draw_scan_overlay(frame, app, area);
+}
+
+/// The rect a `/find` progress box takes: centred, four fifths of the
+/// screen in both directions.
+pub fn scan_overlay_rect(area: Rect) -> Rect {
+    let width = area.width * 4 / 5;
+    let height = area.height * 4 / 5;
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// What a running `/find` is doing, over everything else: the archive scan
+/// conversation by conversation, then Slack's answer. It closes itself once
+/// both halves have landed, so there is no key to press.
+fn draw_scan_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(scan) = &app.scan_overlay else { return };
+    if area.width < 8 || area.height < 4 {
+        return;
+    }
+    let rect = scan_overlay_rect(area);
+    let background = app.palette.get(Role::ProgressOverlay);
+    let spinner = crate::live::SPINNER[app.spinner % crate::live::SPINNER.len()];
+    let block = Block::bordered()
+        .title(app.palette.highlight_line(Line::from(format!(" {} ", scan.label))))
+        .title_bottom(Line::from(format!(
+            " {spinner} {}s · Esc ",
+            scan.started.elapsed().as_secs()
+        )))
+        .border_style(Style::new().fg(app.palette.get(Role::Accent)))
+        .style(Style::new().bg(background));
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // Newest at the bottom: take from the end until the box is full, counting
+    // the rows each line takes once wrapped.
+    let width = inner.width as usize;
+    let mut budget = inner.height as usize;
+    let mut first = scan.lines.len();
+    while first > 0 {
+        let rows = scan.lines[first - 1].text.width().div_ceil(width).max(1);
+        if rows > budget {
+            break;
+        }
+        budget -= rows;
+        first -= 1;
+    }
+    let lines: Vec<Line> = scan.lines[first..]
+        .iter()
+        .map(|line| {
+            let style = if line.dim {
+                Style::new().bg(background).add_modifier(Modifier::DIM)
+            } else {
+                Style::new().bg(background)
+            };
+            Line::from(Span::styled(line.text.clone(), style))
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(Style::new().bg(background)),
+        inner,
+    );
 }
 
 /// The palette's background, or nothing when the terminal keeps its own.
@@ -911,7 +983,7 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(
         Action::Command,
-        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; upload [path] sends a file with the next message, the clipboard's image when no path is given; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations; version shows the version in the corner",
+        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; upload [path] sends a file with the next message, the clipboard's image when no path is given; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation, and a search across conversations runs behind a progress box that Esc abandons; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations; version shows the version in the corner",
     ),
     HelpRow::Bound(Action::Keys, "rebind these keys (also /keys)"),
     HelpRow::Bound(
