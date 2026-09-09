@@ -1126,7 +1126,7 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(Action::GoToDate, "go to a date (YYYY-MM-DD)"),
     HelpRow::Bound(Action::ChannelTabs, "channel tabs: canvases, files and bookmarks"),
-    HelpRow::Bound(Action::MyThreads, "threads you took part in or were mentioned in, newest reply first"),
+    HelpRow::Bound(Action::MyThreads, "threads you took part in or were mentioned in, newest reply first: a card each, with the thread's first and last message"),
     HelpRow::Bound(
         Action::Images,
         "the selected message's images, full pane; j/k between them",

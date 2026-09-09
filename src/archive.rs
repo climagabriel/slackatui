@@ -1329,6 +1329,26 @@ impl Archive {
         Ok(out)
     }
 
+    /// The newest archived reply in one thread: what a THREADS card draws
+    /// under its root. None when the archive holds the root alone.
+    ///
+    /// Addressed through `PARENT_ID` rather than through the root's
+    /// `latest_reply_id`, which is the larger of Slack's `latest_reply` and
+    /// what the archive holds: when a refresh has not caught up, that id
+    /// names a reply no archive has, and a lookup by it finds nothing.
+    /// `ID <> PARENT_ID` drops the copy of the root that slackdump stores
+    /// with the replies.
+    pub fn last_reply(&self, cid: &str, root: i64) -> rusqlite::Result<Option<Msg>> {
+        let sql = format!(
+            "SELECT {cols} FROM MESSAGE m WHERE m.CHANNEL_ID = ?1 AND m.ID = \
+               (SELECT MAX(ID) FROM MESSAGE WHERE CHANNEL_ID = ?1 AND PARENT_ID = ?2 AND ID <> PARENT_ID) \
+             ORDER BY m.ID ASC, {order}",
+            cols = Self::COLS,
+            order = self.message_order()
+        );
+        Ok(self.query_msgs(&sql, &[&cid, &root])?.pop())
+    }
+
     /// Fill `archived_replies` / `latest_reply_id` for the parents in `msgs`.
     fn reply_stats(&self, cid: &str, msgs: &mut [Msg]) -> rusqlite::Result<()> {
         let (Some(lo), Some(hi)) = (
@@ -1661,6 +1681,20 @@ pub(crate) fn thread_database(dir: &Path, messages: &[(i64, i64, &str, &str)]) {
     }
 }
 
+/// Merge `extra` into one fixture message's stored JSON, so a root can carry
+/// what a Slack root carries: `reply_count`, `reply_users`,
+/// `reply_users_count`. `id` is the fixture's short id, not the message id.
+#[cfg(test)]
+pub(crate) fn set_message_data(dir: &Path, id: i64, extra: Value) {
+    let conn = Connection::open(dir.join("slackdump.sqlite")).unwrap();
+    let merged = extra.to_string();
+    conn.execute(
+        "UPDATE MESSAGE SET DATA = CAST(json_patch(CAST(DATA AS TEXT), ?1) AS BLOB) WHERE ID = ?2",
+        params![merged, id * 1_000_000],
+    )
+    .unwrap();
+}
+
 /// A scratch directory this test alone owns.
 #[cfg(test)]
 pub(crate) fn test_dir(slug: &str) -> PathBuf {
@@ -1768,6 +1802,35 @@ mod union_tests {
             archive.my_threads("U12").unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
             [7_000_000]
         );
+        drop(archive);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// What a THREADS card draws under its root: the newest reply the archive
+    /// holds, addressed through `PARENT_ID`. A root that Slack says has newer
+    /// replies than the last archive run fetched still gets the newest one
+    /// there is, and a root nobody answered gets none.
+    #[test]
+    fn last_reply_returns_the_newest_archived_reply_or_none() {
+        let root = test_dir("last-reply");
+        thread_database(&root, THREAD_FIXTURE);
+        // Slack has three more replies than the archive walked.
+        set_message_data(&root, 1, serde_json::json!({"reply_count": 4, "latest_reply": "99.000000"}));
+        let archive = Archive::open("test".into(), &root).unwrap();
+        let mine = archive.my_threads("U1").unwrap();
+        let ahead = mine.iter().find(|m| m.id == 1_000_000).expect("the owner's root");
+        assert_eq!(ahead.reply_count, 4);
+        assert_eq!(ahead.archived_replies, 1);
+        assert_eq!(ahead.latest_reply_id, Some(99_000_000), "a reply no archive holds");
+        let last = archive.last_reply("C1", 1_000_000).unwrap().expect("the newest archived reply");
+        assert_eq!((last.id, last.text.as_str()), (2_000_000, "someone else replies"));
+        // The thread whose newest reply is the mention, and one that is not a
+        // thread at all.
+        assert_eq!(archive.last_reply("C1", 5_000_000).unwrap().map(|m| m.id), Some(6_000_000));
+        assert!(archive.last_reply("C1", 9_000_000).unwrap().is_none());
+        // The root's own copy stored beside the replies is not a reply.
+        assert!(archive.last_reply("C1", 3_000_000).unwrap().is_some_and(|m| m.id == 4_000_000));
+        assert!(archive.last_reply("D1", 1_000_000).unwrap().is_none(), "another channel");
         drop(archive);
         std::fs::remove_dir_all(root).unwrap();
     }

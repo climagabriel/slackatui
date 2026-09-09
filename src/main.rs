@@ -116,8 +116,19 @@ budget of seven calls spent -- the count reads N not returned by Slack
 SENT below SAVED shows sent messages newest first, using Slack search.
 Enter opens the message/thread; h returns. At the end, j loads older results; r refreshes.
 THREADS below MENTIONS opens what Ctrl-T opens: every cached thread you
-took part in or were mentioned in, newest reply first, headed by its root
-message. It opens no conversation and leaves the sidebar cursor alone.
+took part in or were mentioned in, newest reply first, one card each. A card
+heads with the conversation and who took part, then the thread's first
+message, a dim count of the replies it leaves out, and the newest archived
+reply; there are no day dividers, and a blank line separates the cards.
+The cursor selects a whole card, Enter or l opens that thread, h returns.
+It opens no conversation and leaves the sidebar cursor alone. The count comes
+from Slack's reply_count where the archive has it, so a thread whose replies
+the last archive run did not reach shows the newest reply it does hold.
+A pane too short for a whole card drops the last reply, which the count then
+includes, and below that moves the count into the header line, where it keeps
+its room and the names beside it are cut. Deleting the reply a card draws
+folds it into the count; deleting one the count already stood for takes the
+count down.
 
 Conversations default to recent order: newest message first. Starred, muted,
 unread and search-match grouping take precedence. Press s to cycle recent,

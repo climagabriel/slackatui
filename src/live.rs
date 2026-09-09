@@ -84,9 +84,14 @@ pub enum JobKind {
         conv: usize,
         thread: Option<i64>,
     },
-    /// One of the owner's own messages withdrawn from Slack.
+    /// One of the owner's own messages withdrawn from Slack. The conversation
+    /// and the thread it was a reply in travel with it: a THREADS card counts
+    /// replies it does not draw, and the message is gone from every list by
+    /// the time Slack answers.
     Delete {
         id: i64,
+        cid: String,
+        root: Option<i64>,
     },
     /// Membership of `conv` given up.
     Leave {
@@ -671,11 +676,16 @@ pub fn api_upload(
 }
 
 /// Withdraw one of the owner's own messages.
-pub fn api_delete(client: Arc<Client>, cid: String, id: i64) -> Job {
-    spawn(JobKind::Delete { id }, "deleting".to_string(), move || {
-        client.delete_message(&cid, &id_to_ts(id))?;
-        Ok(Done::Deleted)
-    })
+pub fn api_delete(client: Arc<Client>, cid: String, id: i64, root: Option<i64>) -> Job {
+    let channel = cid.clone();
+    spawn(
+        JobKind::Delete { id, cid, root },
+        "deleting".to_string(),
+        move || {
+            client.delete_message(&channel, &id_to_ts(id))?;
+            Ok(Done::Deleted)
+        },
+    )
 }
 
 pub fn api_leave(client: Arc<Client>, conv: usize, cid: String) -> Job {

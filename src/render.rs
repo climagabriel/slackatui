@@ -1414,6 +1414,158 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i
     Rendered { lines, images }
 }
 
+/// One row of the THREADS view. Slack's Threads screen draws a card per
+/// thread; this carries what surrounds the root message — the conversation
+/// and participants line above it, how many replies the card leaves out, and
+/// the thread's newest reply. The root itself stays in the list's `msgs`, so
+/// the cursor and every list helper keep working on one item per card.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadCard {
+    /// `#channel`, or the DM/group name as the sidebar shows it.
+    pub conversation: String,
+    /// `a, b, and 3 others`: who took part, from the root's `reply_users`.
+    pub participants: String,
+    /// Replies the card does not draw: every one but the last.
+    pub hidden: i64,
+    /// The newest reply the archive held when the card was built: the drawn
+    /// reply's id, or the root's when there was none. A delete at or below it
+    /// is a reply this card counted. Above it the card cannot tell a reply
+    /// written since from one Slack's `reply_count` included and the archive
+    /// never held, so it leaves the count alone for both: a count that reads
+    /// high until the next open, rather than one that drops for a reply it
+    /// never stood for.
+    pub counted_through: i64,
+    /// The thread's newest archived reply; None when the archive holds none.
+    pub last: Option<Msg>,
+}
+
+/// How much of a card the pane can hold. `whole_message_viewport` draws
+/// nothing at all for an item taller than the pane, so a short pane sheds
+/// parts of the card rather than overflowing it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CardFit {
+    /// Header, root, elision, last reply.
+    Whole,
+    /// The last reply folded into the elision, which now counts it.
+    Folded,
+    /// The elision folded into the header. Six rows with a collapsed root,
+    /// which is the shortest pane `ui::draw` will draw a message into.
+    Root,
+}
+
+/// `N more replies`, the count both elisions share.
+fn replies_label(n: i64) -> String {
+    format!("{n} more {}", if n == 1 { "reply" } else { "replies" })
+}
+
+/// Clip to `room`, or give up: a budget that would go entirely on the
+/// ellipsis, or overflow on it, says nothing worth the columns.
+fn clip_or_drop(text: &str, room: usize) -> String {
+    if text.width() <= room {
+        return text.to_string();
+    }
+    if room < 4 {
+        return String::new();
+    }
+    crate::ui::clip(text, room)
+}
+/// The card's first line: which conversation the thread is in, who took part,
+/// and — only when the pane was too short to give the count a line of its own
+/// — how many replies are not drawn. Truncated to `width` here rather than by
+/// the draw: a count clipped off the end would be nowhere, the elision line
+/// having been dropped to make room in the first place. The count keeps its
+/// columns; the participants give theirs up first, the conversation next.
+pub fn card_header(
+    card: &ThreadCard,
+    palette: &Palette,
+    replies: i64,
+    width: usize,
+) -> Line<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let tail = if replies > 0 {
+        format!("  · {}", replies_label(replies))
+    } else {
+        String::new()
+    };
+    let room = width.saturating_sub(tail.width());
+    let conversation = clip_or_drop(&card.conversation, room);
+    let mut spans = Vec::new();
+    // Nothing but the count fits: it is the line.
+    if !conversation.is_empty() {
+        spans.push(Span::styled(
+            conversation.clone(),
+            Style::new()
+                .fg(palette.get(Role::Accent))
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !card.participants.is_empty() {
+            let people = clip_or_drop(
+                &format!("  {}", card.participants),
+                room - conversation.width(),
+            );
+            if !people.is_empty() {
+                spans.push(Span::styled(people, dim));
+            }
+        }
+    }
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail, dim));
+    }
+    Line::from(spans)
+}
+
+/// The replies the card does not draw, elided. Reads like the
+/// collapsed-message elision, so the two are one idiom.
+pub fn card_elision(hidden: i64) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  … {}", replies_label(hidden)),
+        Style::new().add_modifier(Modifier::DIM),
+    ))
+}
+
+impl ThreadCard {
+    /// Replies this card does not draw at `fit`: everything but the last one,
+    /// plus that one once it is folded away.
+    pub fn elided(&self, fit: CardFit) -> i64 {
+        self.hidden + i64::from(fit != CardFit::Whole && self.last.is_some())
+    }
+}
+
+/// Who took part in a thread, as Slack names them: at most two, then a count.
+/// `reply_users` on the root is the list Slack sends and `reply_users_count`
+/// how many there were, which can exceed what the list carries. An archived
+/// root without `reply_users` names its author alone; nothing here queries
+/// the thread, which would be one round trip per card.
+pub fn participants(m: &Msg, ctx: &Ctx) -> String {
+    let users: Vec<String> = m
+        .data
+        .get("reply_users")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|u| ctx.user(u))
+                .collect()
+        })
+        .unwrap_or_default();
+    if users.is_empty() {
+        return ctx.author(m);
+    }
+    let total = m
+        .data
+        .get("reply_users_count")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(users.len() as i64) as usize;
+    let named = users.len().min(2);
+    let shown = users[..named].join(", ");
+    match total - named {
+        0 => shown,
+        1 => format!("{shown}, and 1 other"),
+        others => format!("{shown}, and {others} others"),
+    }
+}
+
 /// Each bar of a divider: the line fits `width`, bars capped at 40 cells.
 fn bar_len(text: &str, width: usize) -> usize {
     (width.saturating_sub(text.width() + 2) / 2).clamp(1, 40)
@@ -1625,6 +1777,129 @@ mod tests {
 
     fn text(segs: &[Seg]) -> String {
         plain(segs)
+    }
+
+    /// A THREADS card names at most two participants and counts the rest,
+    /// resolving the ids the root carries through the user map. Slack's own
+    /// count wins when it exceeds the list it sent; a root without
+    /// `reply_users` names its author alone.
+    #[test]
+    fn a_card_names_two_participants_and_counts_the_rest() {
+        let archive = Archive::stub(
+            &[("U1", "ann"), ("U2", "bea"), ("U3", "cyd"), ("U4", "dee")],
+            &[],
+        );
+        let corpus = Corpus::stub(&[]);
+        let context = ctx(&archive, &corpus);
+        let root = |extra: Value| {
+            let mut data = serde_json::json!({"ts": "1.000000", "user": "U1", "text": "root"});
+            let (Value::Object(data_map), Value::Object(extra_map)) = (&mut data, extra) else {
+                unreachable!("both are objects")
+            };
+            data_map.extend(extra_map);
+            Msg::from_api("C1".to_string(), data).expect("a root")
+        };
+        let cases = [
+            (serde_json::json!({}), "ann"),
+            (serde_json::json!({"reply_users": []}), "ann"),
+            (serde_json::json!({"reply_users": ["U2"]}), "bea"),
+            (serde_json::json!({"reply_users": ["U2", "U3"]}), "bea, cyd"),
+            (
+                serde_json::json!({"reply_users": ["U2", "U3", "U4"]}),
+                "bea, cyd, and 1 other",
+            ),
+            (
+                // Slack sends five participants and names four of them.
+                serde_json::json!({"reply_users": ["U2","U3","U4","U9"], "reply_users_count": 5}),
+                "bea, cyd, and 3 others",
+            ),
+            (
+                // A count behind the list it came with does not shrink it.
+                serde_json::json!({"reply_users": ["U2","U3","U4"], "reply_users_count": 1}),
+                "bea, cyd, and 1 other",
+            ),
+            (
+                // An id no archive knows stays the id.
+                serde_json::json!({"reply_users": ["U9", "U2"]}),
+                "U9, bea",
+            ),
+        ];
+        for (extra, want) in cases {
+            let message = root(extra.clone());
+            assert_eq!(participants(&message, &context), want, "{extra}");
+        }
+    }
+
+    /// The card's own two lines: the conversation and participants above the
+    /// root, and the dim elision that stands for the replies it leaves out.
+    #[test]
+    fn a_card_heads_with_its_conversation_and_elides_the_replies_between() {
+        let card = ThreadCard {
+            conversation: "#team-alpha".to_string(),
+            participants: "bea, cyd, and 3 others".to_string(),
+            hidden: 5,
+            counted_through: 9_000_000,
+            last: None,
+        };
+        let header = card_header(&card, &TEST_PALETTE, 0, 80);
+        assert_eq!(
+            line_text(&header),
+            "#team-alpha  bea, cyd, and 3 others"
+        );
+        assert!(header.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(header.spans[1].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(line_text(&card_elision(5)), "  … 5 more replies");
+        assert_eq!(line_text(&card_elision(1)), "  … 1 more reply");
+        assert!(card_elision(5).spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::DIM));
+        // A pane too short for an elision line of its own carries the count
+        // in the header instead, in the same words.
+        assert_eq!(
+            line_text(&card_header(&card, &TEST_PALETTE, 6, 80)),
+            "#team-alpha  bea, cyd, and 3 others  · 6 more replies"
+        );
+        // That count is the only place the number is left, so it keeps its
+        // columns and the names above it give theirs up: the participants
+        // first, then the conversation, then the conversation entirely.
+        // 18 columns is the count itself; below that nothing can be saved.
+        for width in 18..=53 {
+            let header = line_text(&card_header(&card, &TEST_PALETTE, 6, width));
+            assert!(header.width() <= width, "{width}: {header:?}");
+            assert!(header.ends_with("· 6 more replies"), "{width}: {header:?}");
+        }
+        assert_eq!(
+            line_text(&card_header(&card, &TEST_PALETTE, 6, 40)),
+            "#team-alpha  bea, cyd…  · 6 more replies"
+        );
+        assert_eq!(
+            line_text(&card_header(&card, &TEST_PALETTE, 6, 26)),
+            "#team-a…  · 6 more replies"
+        );
+        assert_eq!(
+            line_text(&card_header(&card, &TEST_PALETTE, 6, 18)),
+            "  · 6 more replies"
+        );
+        // Folding the last reply away adds it to the count; dropping the
+        // elision line does not change what the count is.
+        let counted = ThreadCard { last: Some(Msg::from_api("C1".into(),
+            serde_json::json!({"ts": "2.000000", "user": "U2"})).expect("a reply")), ..card.clone() };
+        assert_eq!(counted.elided(CardFit::Whole), 5);
+        assert_eq!(counted.elided(CardFit::Folded), 6);
+        assert_eq!(counted.elided(CardFit::Root), 6);
+        // A thread whose only replies are already drawn folds to nothing.
+        let single = ThreadCard { hidden: 0, ..counted };
+        assert_eq!(single.elided(CardFit::Whole), 0);
+        assert_eq!(single.elided(CardFit::Folded), 1);
+        // No last reply at all: folding cannot invent one.
+        assert_eq!(card.elided(CardFit::Folded), 5);
+        // No participants known: the header is the conversation alone.
+        let bare = ThreadCard { participants: String::new(), ..card };
+        assert_eq!(line_text(&card_header(&bare, &TEST_PALETTE, 0, 80)), "#team-alpha");
     }
 
     #[test]

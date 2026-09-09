@@ -19,7 +19,7 @@ use crate::keys::{Action, Chord, Keymap, DEFAULTS};
 use crate::live::{self, Done, Job, JobKind};
 use crate::palette::PRESETS;
 use crate::palette::{Palette, Role, ROLES};
-use crate::render::{self, Ctx, ImageSlot, Tz};
+use crate::render::{self, CardFit, Ctx, ImageSlot, Tz};
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::{Protocol, StatefulProtocol};
@@ -72,6 +72,78 @@ pub struct FlatLine {
     pub image: Option<ImageSlot>,
 }
 
+/// One message's lines appended to `flat`, every one of them tagged as
+/// belonging to item `index`; a THREADS card calls this twice, for its root
+/// and for its last reply. A message taller than `budget` is collapsed to its
+/// first line, a hidden-line count and its last line, and the return says
+/// whether it was.
+#[allow(clippy::too_many_arguments)]
+fn push_message(
+    flat: &mut Vec<FlatLine>,
+    index: usize,
+    m: &Msg,
+    ctx: &Ctx,
+    width: usize,
+    in_thread: bool,
+    today: i64,
+    budget: Option<usize>,
+) -> bool {
+    let mut rendered = render::message_lines(m, ctx, width, in_thread, today);
+    let collapsed =
+        budget.is_some_and(|budget| rendered.lines.len() + 2 > budget) && rendered.lines.len() > 3;
+    if collapsed {
+        // Keep the message's own first and last rows around the elision, so a
+        // preview shows how the message ends as well as how it starts.
+        // Everything between them is the count.
+        let last_row = rendered.lines.len() - 1;
+        let hidden = last_row - 1;
+        let mut tail = rendered.lines.pop().expect("a collapsed message has lines");
+        // A message ending inside a taller-than-one-row image keeps one of that
+        // image's blank reserved rows as the preview's last line, and the
+        // retain below drops the image itself: the preview would end on
+        // nothing. Name the file there instead, with the label an uncollapsed
+        // render puts above those rows.
+        if let Some(slot) = rendered.images.iter().find(|slot| {
+            slot.rows > 1 && (slot.line..slot.line + usize::from(slot.rows)).contains(&last_row)
+        }) {
+            let render::ImageSource::File(f) = &slot.source;
+            // Through the same highlight pass `message_lines` gives its file
+            // lines, so a configured word colors the name here too.
+            tail = ctx.palette.highlight_line(render::file_label(f));
+        }
+        rendered.lines.truncate(1);
+        rendered
+            .lines
+            .push(Line::from(format!("  ... ({hidden} more lines)")));
+        rendered.lines.push(tail);
+        // Slot lines index the truncated vec, so the surviving last row has to
+        // be readdressed to index 2. Only a one-row image on that row
+        // survives: anything taller reaches rows the preview dropped, and
+        // would paint over the elision or the next message.
+        rendered.images.retain_mut(|slot| {
+            let keep = slot.line == last_row && slot.rows == 1;
+            if keep {
+                slot.line = 2;
+            }
+            keep
+        });
+    }
+    let base = flat.len();
+    for line in rendered.lines {
+        flat.push(FlatLine {
+            msg: Some(index),
+            line,
+            image: None,
+        });
+    }
+    for slot in rendered.images {
+        if let Some(fl) = flat.get_mut(base + slot.line) {
+            fl.image = Some(slot);
+        }
+    }
+    collapsed
+}
+
 /// A scrollable list of messages rendered into lines. The cursor is a
 /// message; the viewport is lines.
 #[derive(Default)]
@@ -79,6 +151,11 @@ pub struct MsgList {
     /// Channel requested for an empty thread, so a failed fetch can be retried.
     pub source_channel: Option<String>,
     pub msgs: Vec<Msg>,
+    /// THREADS only: what each item draws around `msgs[i]` — the header, the
+    /// elided reply count and the last reply. Empty in every other list, and
+    /// index-aligned with `msgs` when it is not: build one with `threads` and
+    /// drop items with `remove`, which is what keeps the two aligned.
+    cards: Vec<render::ThreadCard>,
     pub cursor: usize,
     pub scroll: usize,
     /// Read the selected message by screen line, without moving its cursor.
@@ -110,8 +187,70 @@ impl MsgList {
         }
     }
 
+    /// The THREADS list: one card per thread, the root as the item the cursor
+    /// selects. Taking the pairs is what makes a misaligned card impossible to
+    /// build. `in_thread` is set, so the root's rendered footer does not
+    /// repeat the reply count the card's own elision line carries.
+    pub fn threads(cards: Vec<(Msg, render::ThreadCard)>) -> MsgList {
+        let (msgs, cards) = cards.into_iter().unzip();
+        MsgList {
+            msgs,
+            cards,
+            dirty: true,
+            in_thread: true,
+            ..Default::default()
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.msgs.len()
+    }
+
+    /// Drop a deleted reply from the card of the thread `cid`/`root`: neither
+    /// the reply the card draws nor the ones it only counts live in `msgs`,
+    /// so removing an item does not reach either.
+    ///
+    /// A drawn reply is folded into the elision rather than replaced by the
+    /// next one down: the archive deliberately keeps messages that vanish
+    /// from Slack, so re-asking it for the newest reply hands back the one
+    /// just deleted, and excluding that id resurfaces it the moment a second
+    /// reply in the same thread is deleted. `hidden` then stays as it was —
+    /// it counted the replies the card did not draw, and one fewer thread
+    /// reply is matched by one fewer drawn. A reply the card only counted is
+    /// the other case, and there `hidden` is what has to come down.
+    ///
+    /// A reply the card never counted moves neither. The counts are a
+    /// snapshot taken when the view opened, so a reply written since — read
+    /// in the thread the card opens, and deleted from there — is past
+    /// `counted_through` and leaves the card alone.
+    pub fn drop_reply(&mut self, cid: &str, root: i64, id: i64) {
+        for i in 0..self.cards.len() {
+            let Some(parent) = self.msgs.get(i) else { break };
+            if parent.id != root || parent.channel_id != cid {
+                continue;
+            }
+            let card = &mut self.cards[i];
+            if card.last.as_ref().is_some_and(|last| last.id == id) {
+                card.last = None;
+            } else if id <= card.counted_through {
+                // Signed saturation lands at i64::MIN, and a count below
+                // zero would draw as one: clamp it here.
+                card.hidden = (card.hidden - 1).max(0);
+            } else {
+                continue;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Drop item `at`, its card with it, and keep the cursor in range.
+    pub fn remove(&mut self, at: usize) {
+        self.msgs.remove(at);
+        if at < self.cards.len() {
+            self.cards.remove(at);
+        }
+        self.cursor = self.cursor.min(self.len().saturating_sub(1));
+        self.mark_dirty();
     }
 
     pub fn selected(&self) -> Option<&Msg> {
@@ -175,90 +314,90 @@ impl MsgList {
             _ => "—".to_string(),
         };
         let unread_label = format!("new ({count})");
+        // A card stacks two messages under a header, so each gets a third of
+        // the pane where a lone message gets a half.
+        let cards = !self.cards.is_empty();
+        let budget = self
+            .pane_height
+            .map(|height| if cards { height / 3 } else { height / 2 });
         for (i, m) in self.msgs.iter().enumerate() {
-            let day = ctx.tz.day(m.secs());
-            // The first message past the read marker opens the unread part:
-            // its day divider lights up, or a "new" line stands in for one.
-            let new_here = !new_marked && ctx.last_read.is_some_and(|lr| m.id > lr);
-            if prev_day != Some(day) {
-                let text = ctx.tz.date_label(m.secs(), today);
-                let line = if new_here {
-                    render::divider_new(&format!("{text} · {unread_label}"), width, ctx.palette)
-                } else {
-                    render::divider(&text, width)
-                };
-                self.flat.push(FlatLine {
-                    msg: None,
-                    line,
-                    image: None,
-                });
-                prev_day = Some(day);
-            } else if new_here {
-                self.flat.push(FlatLine {
-                    msg: None,
-                    line: render::divider_new(&unread_label, width, ctx.palette),
-                    image: None,
-                });
-            }
-            if new_here {
-                new_marked = true;
-            }
-            let mut rendered = render::message_lines(m, ctx, width, self.in_thread, today);
-            let collapsed = self.pane_height.is_some_and(|height| rendered.lines.len() + 2 > height / 2)
-                && rendered.lines.len() > 3;
-            self.collapsed.push(collapsed);
-            if collapsed {
-                // Keep the message's own first and last rows around the
-                // elision, so a preview shows how the message ends as well as
-                // how it starts. Everything between them is the count.
-                let last_row = rendered.lines.len() - 1;
-                let hidden = last_row - 1;
-                let mut tail = rendered.lines.pop().expect("a collapsed message has lines");
-                // A message ending inside a taller-than-one-row image keeps one
-                // of that image's blank reserved rows as the preview's last
-                // line, and the retain below drops the image itself: the
-                // preview would end on nothing. Name the file there instead,
-                // with the label an uncollapsed render puts above those rows.
-                if let Some(slot) = rendered.images.iter().find(|slot| {
-                    slot.rows > 1
-                        && (slot.line..slot.line + usize::from(slot.rows)).contains(&last_row)
-                }) {
-                    let render::ImageSource::File(f) = &slot.source;
-                    // Through the same highlight pass `message_lines` gives its
-                    // file lines, so a configured word colors the name here too.
-                    tail = ctx.palette.highlight_line(render::file_label(f));
+            // Slack's Threads screen has no day dividers, and the cards carry
+            // their own timestamps: one between cards would be noise.
+            if !cards {
+                let day = ctx.tz.day(m.secs());
+                // The first message past the read marker opens the unread part:
+                // its day divider lights up, or a "new" line stands in for one.
+                let new_here = !new_marked && ctx.last_read.is_some_and(|lr| m.id > lr);
+                if prev_day != Some(day) {
+                    let text = ctx.tz.date_label(m.secs(), today);
+                    let line = if new_here {
+                        render::divider_new(&format!("{text} · {unread_label}"), width, ctx.palette)
+                    } else {
+                        render::divider(&text, width)
+                    };
+                    self.flat.push(FlatLine {
+                        msg: None,
+                        line,
+                        image: None,
+                    });
+                    prev_day = Some(day);
+                } else if new_here {
+                    self.flat.push(FlatLine {
+                        msg: None,
+                        line: render::divider_new(&unread_label, width, ctx.palette),
+                        image: None,
+                    });
                 }
-                rendered.lines.truncate(1);
-                rendered.lines.push(Line::from(format!("  ... ({hidden} more lines)")));
-                rendered.lines.push(tail);
-                // Slot lines index the truncated vec, so the surviving last row
-                // has to be readdressed to index 2. Only a one-row image on
-                // that row survives: anything taller reaches rows the preview
-                // dropped, and would paint over the elision or the next
-                // message.
-                rendered.images.retain_mut(|slot| {
-                    let keep = slot.line == last_row && slot.rows == 1;
-                    if keep {
-                        slot.line = 2;
+                if new_here {
+                    new_marked = true;
+                }
+            }
+            let start = self.flat.len();
+            self.first.push(start);
+            let mut collapsed = false;
+            // An item taller than the pane makes `whole_message_viewport`
+            // draw nothing at all, so a card that does not fit sheds its last
+            // reply, then its elision line, rather than blanking the view.
+            // The first fit that fits wins; without a card there is only one.
+            for fit in [CardFit::Whole, CardFit::Folded, CardFit::Root] {
+                self.flat.truncate(start);
+                self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
+                let card = self.cards.get(i);
+                if let Some(card) = card {
+                    let in_header = if fit == CardFit::Root { card.elided(fit) } else { 0 };
+                    self.flat.push(FlatLine {
+                        msg: Some(i),
+                        line: render::card_header(card, ctx.palette, in_header, width),
+                        image: None,
+                    });
+                }
+                collapsed =
+                    push_message(&mut self.flat, i, m, ctx, width, self.in_thread, today, budget);
+                if let Some(card) = card {
+                    let elided = card.elided(fit);
+                    if fit != CardFit::Root && elided > 0 {
+                        self.flat.push(FlatLine {
+                            msg: Some(i),
+                            line: render::card_elision(elided),
+                            image: None,
+                        });
                     }
-                    keep
-                });
-            }
-            self.first.push(self.flat.len());
-            self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
-            let base = self.flat.len();
-            for line in rendered.lines {
-                self.flat.push(FlatLine {
-                    msg: Some(i),
-                    line,
-                    image: None,
-                });
-            }
-            for slot in rendered.images {
-                if let Some(fl) = self.flat.get_mut(base + slot.line) {
-                    fl.image = Some(slot);
+                    if fit == CardFit::Whole {
+                        if let Some(last) = &card.last {
+                            collapsed |= push_message(
+                                &mut self.flat, i, last, ctx, width, self.in_thread, today, budget,
+                            );
+                        }
+                    }
+                }
+                // One more row for the trailing blank below.
+                let rows = self.flat.len() + 1 - start;
+                let fits = self.pane_height.is_none_or(|height| rows <= height);
+                if fits || fit == CardFit::Root || self.cards.is_empty() {
+                    break;
                 }
             }
+            self.collapsed.push(collapsed);
             self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
             self.last.push(self.flat.len().saturating_sub(1));
         }
@@ -386,6 +525,10 @@ pub struct Draft {
 pub struct PendingDelete {
     pub cid: String,
     pub id: i64,
+    /// The thread this message is a reply in, taken from the message while it
+    /// is still selected: a THREADS card counts the replies it does not draw,
+    /// and after the delete there is nothing left to read the thread off.
+    pub root: Option<i64>,
 }
 
 /// Where `c` sends: a conversation, and a thread in it when replying.
@@ -1748,7 +1891,7 @@ impl App {
                 self.status = "a fetch is already running; press D again in a moment".to_string();
                 return;
             }
-            self.job = Some(live::api_delete(c, pending.cid, pending.id));
+            self.job = Some(live::api_delete(c, pending.cid, pending.id, pending.root));
             return;
         }
         if self.api.is_none() {
@@ -1777,6 +1920,7 @@ impl App {
         self.pending_delete = Some(PendingDelete {
             cid: m.channel_id.clone(),
             id: m.id,
+            root: m.parent_id.filter(|root| *root != m.id),
         });
         self.status = if shown.is_empty() {
             "delete this message? D again confirms, any other key cancels".to_string()
@@ -1785,8 +1929,11 @@ impl App {
         };
     }
 
-    /// Drop a deleted message from every list holding it.
-    fn drop_message(&mut self, id: i64) {
+    /// Drop a deleted message from every list holding it, and from the
+    /// THREADS card of the thread it was a reply in. `root` is None for a
+    /// message that is not a reply; deleting a thread's root drops that
+    /// card whole, through `remove`.
+    fn drop_message(&mut self, cid: &str, root: Option<i64>, id: i64) {
         let mut lists: Vec<&mut MsgList> = Vec::new();
         if let Some(o) = self.open.as_mut() {
             lists.push(&mut o.list);
@@ -1800,12 +1947,15 @@ impl App {
             }
         }
         for list in lists {
+            // A THREADS card draws, and counts, replies that are in no
+            // list's `msgs`.
+            if let Some(root) = root {
+                list.drop_reply(cid, root, id);
+            }
             let Some(at) = list.msgs.iter().position(|m| m.id == id) else {
                 continue;
             };
-            list.msgs.remove(at);
-            list.cursor = list.cursor.min(list.len().saturating_sub(1));
-            list.mark_dirty();
+            list.remove(at);
         }
     }
 
@@ -3377,8 +3527,10 @@ impl App {
     }
 
     /// Every thread the owner took part in or was mentioned in, newest reply
-    /// first, from the cache. Archive-wide: it opens no conversation, and the
-    /// conversation cursor stays where it was.
+    /// first, from the cache, one card per thread: the conversation and its
+    /// participants, the root, the replies between elided, and the newest
+    /// reply. Archive-wide: it opens no conversation, and the conversation
+    /// cursor stays where it was.
     fn open_my_threads(&mut self) {
         // Leaving for THREADS.
         self.nav_generation = self.nav_generation.wrapping_add(1);
@@ -3386,29 +3538,61 @@ impl App {
             self.status = "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
             return;
         };
-        let mut roots: Vec<Msg> = Vec::new();
+        let mut cards: Vec<(Msg, render::ThreadCard)> = Vec::new();
         let mut seen: HashSet<(String, i64)> = HashSet::new();
         for (ai, a) in self.corpus.archives.iter().enumerate() {
             let Ok(msgs) = a.my_threads(&me) else {
                 continue;
             };
-            for mut m in msgs {
-                if !seen.insert((m.channel_id.clone(), m.id)) {
+            let ctx = Ctx {
+                archive: Some(a),
+                corpus: &self.corpus,
+                tz: self.tz,
+                image_font: None,
+                last_read: None,
+                palette: &self.palette,
+            };
+            for mut root in msgs {
+                if !seen.insert((root.channel_id.clone(), root.id)) {
                     continue;
                 }
-                m.channel_name = self
+                let conversation = self
                     .corpus
                     .convs
                     .iter()
-                    .find(|c| c.archive == ai && c.id == m.channel_id && !c.live_only)
-                    .map(|c| c.name.clone());
-                roots.push(m);
+                    .find(|c| c.archive == ai && c.id == root.channel_id && !c.live_only)
+                    .map(|c| c.name.clone())
+                    .or_else(|| a.channel_name(&root.channel_id).map(|n| format!("#{n}")))
+                    .unwrap_or_else(|| root.channel_id.clone());
+                let participants = render::participants(&root, &ctx);
+                let mut last = a.last_reply(&root.channel_id, root.id).ok().flatten();
+                // The card's header names the conversation; a message header
+                // would say it again under it.
+                root.channel_name = None;
+                if let Some(last) = last.as_mut() {
+                    last.channel_name = None;
+                }
+                // Slack's count where it has one, the archive's where it is
+                // ahead, minus the one reply the card draws.
+                let total = root.reply_count.max(root.archived_replies);
+                let hidden = (total - i64::from(last.is_some())).max(0);
+                let counted_through = last.as_ref().map_or(root.id, |last| last.id);
+                cards.push((
+                    root,
+                    render::ThreadCard {
+                        conversation,
+                        participants,
+                        hidden,
+                        counted_through,
+                        last,
+                    },
+                ));
             }
         }
-        roots.sort_by_key(|m| std::cmp::Reverse(m.latest_reply_id.unwrap_or(m.id)));
-        let n = roots.len();
+        cards.sort_by_key(|(root, _)| std::cmp::Reverse(root.latest_reply_id.unwrap_or(root.id)));
+        let n = cards.len();
         self.stack.push(View::Threads {
-            list: MsgList::new(roots, false),
+            list: MsgList::threads(cards),
         });
         self.focus = Focus::Msgs;
         self.status = format!("{n} threads you took part in or were mentioned in, newest reply first");
@@ -3912,6 +4096,7 @@ impl App {
         }
         // The scan's own slot: the archive search, which must never be
         // refused because the other two are busy.
+        let job_before_scan = self.job.is_some();
         if let Some(outcome) = self.scan.as_ref().and_then(|job| job.poll()) {
             let job = self.scan.take().expect("polled");
             match outcome {
@@ -3930,6 +4115,10 @@ impl App {
                 }
             }
         }
+        // A Slack search the scan just started is left for the next tick:
+        // polled here it would replace the line the scan wrote before that
+        // line is ever drawn, the same one-tick grace the box gets above.
+        let scan_started_job = !job_before_scan && self.job.is_some();
         // The quiet slot: sign-in, the conversation list, counts, tails.
         if let Some(outcome) = self.bg.as_ref().and_then(|j| j.poll()) {
             let job = self.bg.take().expect("polled");
@@ -4105,6 +4294,9 @@ impl App {
             }
         }
         // The user's slot.
+        if scan_started_job {
+            return;
+        }
         let Some(outcome) = self.job.as_ref().and_then(|j| j.poll()) else {
             return;
         };
@@ -4281,8 +4473,8 @@ impl App {
                     }
                 }
             }
-            (JobKind::Delete { id }, Done::Deleted) => {
-                self.drop_message(id);
+            (JobKind::Delete { id, cid, root }, Done::Deleted) => {
+                self.drop_message(&cid, root, id);
                 self.status = "message deleted".to_string();
             }
             (JobKind::Leave { conv }, Done::Left) => {
@@ -4439,7 +4631,7 @@ impl App {
                 )
             }
             Some(View::Threads { list }) => format!(
-                "threads you took part in or were mentioned in · {} · newest reply first",
+                "threads you took part in or were mentioned in · {} · first and last message · newest reply first",
                 list.len()
             ),
             Some(View::Thread {
@@ -6484,17 +6676,35 @@ pub(crate) mod tests {
             Ok(json!({"messages":{"matches":[]}}))
         })));
         app.live = true;
+        // Each round collects the Slack half it started before the next one
+        // begins. A round that leaves it pending refuses the next round's
+        // live search ("another request is running") and then replaces that
+        // round's status line with its own.
+        let collect_slack = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.job.is_some() && Instant::now() < deadline {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(app.job.is_none(), "the Slack search never finished");
+        };
         app.go_home();
         app.run_command("/find message: nginx", "");
         app.finish_archive_scan_for_test();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nginx");
         assert!(app.status.contains("cached message matches"), "{}", app.status);
+        // The tick that started the Slack half does not also collect it, or
+        // the line above would never be drawn.
+        assert!(app.job.is_some(), "the Slack half was collected where it was started");
+        collect_slack(&mut app);
+        assert!(app.status.starts_with("Slack: 0 hits"), "{}", app.status);
         app.go_home();
         app.run_command("/find message: nginx from:@me", "");
         app.finish_archive_scan_for_test();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1 nginx");
         assert!(app.status.contains("cached author matches"), "{}", app.status);
         assert_eq!(hits(&app).len(), 3);
+        collect_slack(&mut app);
 
         // A quoted phrase keeps its quotes out of the needle and out of the
         // Slack query when an author sits beside them.
@@ -6504,6 +6714,7 @@ pub(crate) mod tests {
             app.finish_archive_scan_for_test();
             assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1 foo bar", "{line}");
             assert_eq!(hits(&app), ["a quoted foo bar phrase"], "{line}");
+            collect_slack(&mut app);
         }
         // Blanks stay empty even with an author: that is an author search.
         app.go_home();
@@ -7267,6 +7478,9 @@ pub(crate) mod tests {
         let drawn = screen(&mut terminal, &mut app);
         assert!(!drawn.contains("select a conversation"), "THREADS list not drawn:\n{drawn}");
         assert!(drawn.contains("quiet root"));
+        // Each root is drawn as a card headed by its conversation and, with no
+        // reply_users in the fixture, by its own author.
+        assert_eq!(drawn.matches("#one  U").count(), 3, "one card header each:\n{drawn}");
         // Selecting a row opens that thread over the list, as SAVED and
         // MENTIONS do, still with no conversation open, and it draws too.
         app.on_msg_key(Some(Action::Open));
@@ -7287,6 +7501,402 @@ pub(crate) mod tests {
         assert_eq!(app.conv_cursor,1);
         assert_eq!(app.active_list().unwrap().msgs.iter().map(|m|m.id).collect::<Vec<_>>(),
             [5_000_000,3_000_000,1_000_000]);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Four threads for the card tests: six replies, exactly one, none at all,
+    /// and one whose root carries no `reply_users`. The ids order the cards
+    /// newest reply first, so they come out 50, 40, 30, 10.
+    const CARD_FIXTURE: &[(i64, i64, &str, &str)] = &[
+        (50, 50, "U1", "root with six"),
+        (51, 50, "U2", "reply one"),
+        (52, 50, "U3", "reply two"),
+        (53, 50, "U4", "reply three"),
+        (54, 50, "U5", "reply four"),
+        (55, 50, "U6", "reply five"),
+        (56, 50, "U2", "freshest answer"),
+        (40, 40, "U1", "root with one"),
+        (41, 40, "U2", "the only reply"),
+        (30, 30, "U1", "unanswered root"),
+        (10, 10, "U1", "root without reply users"),
+        (11, 10, "U2", "unnamed alpha"),
+        (12, 10, "U2", "unnamed omega"),
+    ];
+
+    /// THREADS draws Slack's Threads screen: one card per thread, headed by
+    /// the conversation and its participants, then the thread's first message,
+    /// a count of the replies between, and the newest reply. No day dividers,
+    /// a blank line between cards, and the cursor selects a whole card.
+    #[test]
+    fn each_thread_draws_as_a_card_with_its_first_and_last_message() {
+        let dir = crate::archive::test_dir("threads-cards");
+        crate::archive::thread_database(&dir, CARD_FIXTURE);
+        crate::archive::set_message_data(&dir, 50,
+            json!({"reply_count":6,"reply_users":["U2","U3","U4","U9"],"reply_users_count":5}));
+        crate::archive::set_message_data(&dir, 40,
+            json!({"reply_count":1,"reply_users":["U2"],"reply_users_count":1}));
+        // The root nobody answered, and the root Slack sent no participants
+        // for: both fall back to naming their author.
+        crate::archive::set_message_data(&dir, 10, json!({"reply_count":2}));
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        let names = [("U1","ann"),("U2","bea"),("U3","cyd"),("U4","dee"),("U5","eve"),("U6","fay")];
+        // The card's participants line resolves through the archive it was
+        // built from; the message headers resolve through the corpus, which
+        // `Corpus::open` fills from the archive with the most users.
+        app.corpus.archives[0].adopt_users(Arc::new(
+            names.into_iter()
+                .map(|(id, name)| (id.to_string(), crate::archive::User { name: name.to_string(), is_bot: false }))
+                .collect(),
+        ));
+        app.corpus.merge_profiles(names.iter().map(|(id, name)| json!({"id": id, "name": name})).collect());
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(matches!(app.stack.last(), Some(View::Threads { .. })));
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [50_000_000, 40_000_000, 30_000_000, 10_000_000]
+        );
+        assert!(app.title().contains("first and last message"), "{}", app.title());
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 44)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string())
+            .collect();
+        let screen = rows.join("\n");
+        let row_of = |needle: &str| {
+            rows.iter().position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{screen}"))
+        };
+        let blank = |row: &String| row.chars().all(|c| c == '│' || c == ' ');
+        // Six replies: header, root, the five between elided, the newest, and
+        // the newest reply's author over it.
+        let head = row_of("#one  bea, cyd, and 3 others");
+        let root = row_of("root with six");
+        let elision = row_of("… 5 more replies");
+        let last = row_of("freshest answer");
+        assert!(head < root && root < elision && elision < last, "card out of order:\n{screen}");
+        assert!(rows[last - 1].contains("bea"), "the last reply names its author:\n{screen}");
+        // Only the newest reply is drawn, not the five before it.
+        for hidden in ["reply one", "reply two", "reply three", "reply four", "reply five"] {
+            assert!(!screen.contains(hidden), "{hidden:?} should be elided:\n{screen}");
+        }
+        // Exactly one reply: no elision line between root and reply. The
+        // trailing space keeps the needle off the first card's header.
+        let one_head = row_of("#one  bea ");
+        let one_root = row_of("root with one");
+        let one_last = row_of("the only reply");
+        assert!(one_head < one_root && one_root < one_last, "second card out of order:\n{screen}");
+        assert!(!rows[one_root + 1..one_last].iter().any(|row| row.contains('…')),
+            "a single reply is elided:\n{screen}");
+        // The two cards whose participants are the root's author alone: the
+        // thread nobody answered, and the root Slack sent no reply_users for.
+        let author_heads: Vec<usize> = rows.iter().enumerate()
+            .filter(|(_, row)| row.contains("#one  ann")).map(|(y, _)| y).collect();
+        assert_eq!(author_heads.len(), 2, "reply_users absent should name the author:\n{screen}");
+        // No replies at all: the header and the root, and nothing under it.
+        let quiet_root = row_of("unanswered root");
+        assert!(author_heads[0] < quiet_root && blank(&rows[quiet_root + 1]),
+            "an unanswered root draws something under it:\n{screen}");
+        // No reply_users, two replies: the second is elided, the newest drawn.
+        assert!(author_heads[1] < row_of("root without reply users"));
+        assert!(row_of("… 1 more reply") < row_of("unnamed omega"));
+        assert!(!screen.contains("unnamed alpha"), "{screen}");
+        // Slack's Threads screen has no day dividers; the only lines a card
+        // list draws that belong to no item would be dividers, and it has none.
+        let list = app.active_list().unwrap();
+        assert!(list.flat.iter().all(|line| line.msg.is_some()), "a divider is in the list");
+        assert!(!screen.contains("1970-01-01 ─"), "a day divider is drawn:\n{screen}");
+        // A blank row above every card but the first, whose own blank the
+        // cursor box has taken for its top edge.
+        for card_head in [one_head, author_heads[0], author_heads[1]] {
+            assert!(blank(&rows[card_head - 1]),
+                "no blank line above the card at row {card_head}:\n{screen}");
+        }
+        assert!(rows[head - 1].contains('╭'), "the selected card is not boxed:\n{screen}");
+
+        // The cursor selects a whole card: down moves to the next thread, and
+        // l opens that one, not the one it started on.
+        assert_eq!(app.selected().unwrap().id, 50_000_000);
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected().unwrap().id, 40_000_000);
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(), Some(View::Thread { root: 40_000_000, .. })), "l opened the wrong thread");
+        assert_eq!(app.selected().unwrap().text, "root with one");
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(), Some(View::Threads { .. })));
+        assert_eq!(app.active_list().unwrap().cursor, 1);
+        assert_eq!(app.selected().unwrap().id, 40_000_000);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Neither the reply a card draws nor the ones it only counts are in any
+    /// list's `msgs`, so deleting either has to reach the card itself. The
+    /// drawn one folds into the elision, whose count stays as it was; a
+    /// counted one takes the count down with it. Both orders, because the
+    /// card only knows which case it is in by looking at what it draws.
+    #[test]
+    fn deleting_a_reply_leaves_the_card_counting_the_replies_that_are_left() {
+        // One thread, root plus three replies; the card draws the newest.
+        let build = || {
+            let dir = crate::archive::test_dir("threads-delete");
+            crate::archive::thread_database(&dir, &[
+                (1, 1, "U1", "root of three"),
+                (2, 1, "U2", "oldest reply"),
+                (3, 1, "U2", "middle reply"),
+                (4, 1, "U2", "freshest answer"),
+            ]);
+            crate::archive::set_message_data(&dir, 1, json!({"reply_count": 3}));
+            let mut app = mute_test_app();
+            app.corpus.me = Some("U1".into());
+            app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+            app.corpus.convs[0].archive = 0;
+            app.corpus.convs[0].live_only = false;
+            app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+            (app, dir, ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap())
+        };
+        let screen = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, app: &mut App| {
+            terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height).map(|y| (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+        let card_last = |app: &App| match app.stack.last() {
+            Some(View::Threads { list }) => list.cards[0].last.as_ref().map(|m| m.id),
+            _ => panic!("not the THREADS view"),
+        };
+        // Slack confirms a delete: the reply's own id, and the thread it was
+        // a reply in, which travelled with the job from the armed `D`.
+        let deleted = |app: &mut App, id: i64| {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C1".into(), root: Some(1_000_000) },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        };
+        // Newest first: the drawn reply goes, then one of the two left.
+        let (mut app, dir, mut terminal) = build();
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(drawn.contains("freshest answer"), "{drawn}");
+        assert!(drawn.contains("… 2 more replies"), "{drawn}");
+        assert_eq!(card_last(&app), Some(4_000_000));
+        deleted(&mut app, 4_000_000);
+        assert_eq!(card_last(&app), None, "the deleted reply survived on the card");
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(!drawn.contains("freshest answer"), "the deleted reply is still drawn:\n{drawn}");
+        assert!(drawn.contains("root of three"), "{drawn}");
+        // Two replies are left and none is drawn, so the count is unchanged.
+        assert!(drawn.contains("… 2 more replies"), "the elision count is wrong:\n{drawn}");
+        deleted(&mut app, 3_000_000);
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(drawn.contains("… 1 more reply"), "a counted reply left the count alone:\n{drawn}");
+        // Deleting the root drops the whole card, cards and roots together.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 1_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        match app.stack.last() {
+            Some(View::Threads { list }) => {
+                assert!(list.msgs.is_empty() && list.cards.is_empty(), "roots and cards diverged");
+            }
+            _ => panic!("not the THREADS view"),
+        }
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // The other order: a counted reply first, and the drawn one after.
+        let (mut app, dir, mut terminal) = build();
+        screen(&mut terminal, &mut app);
+        deleted(&mut app, 3_000_000);
+        let drawn = screen(&mut terminal, &mut app);
+        assert_eq!(card_last(&app), Some(4_000_000), "the wrong reply left the card");
+        assert!(drawn.contains("freshest answer"), "{drawn}");
+        assert!(drawn.contains("… 1 more reply"), "a counted reply left the count alone:\n{drawn}");
+        deleted(&mut app, 4_000_000);
+        let drawn = screen(&mut terminal, &mut app);
+        assert_eq!(card_last(&app), None, "the deleted reply survived on the card");
+        assert!(!drawn.contains("freshest answer"), "the deleted reply is still drawn:\n{drawn}");
+        // One reply is left, undrawn, and the count says so.
+        assert!(drawn.contains("… 1 more reply"), "the elision count is wrong:\n{drawn}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // A reply written after the view opened was never counted, so
+        // deleting it must leave the count where it is. It is reachable
+        // exactly this way: open the card's thread, read it, delete it there.
+        let (mut app, dir, mut terminal) = build();
+        screen(&mut terminal, &mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        let fresh = Msg::from_api("C1".into(), json!({
+            "ts": "5.000000", "user": "U1", "thread_ts": "1.000000", "text": "written just now",
+        })).expect("a reply");
+        match app.stack.last_mut() {
+            Some(View::Thread { list, .. }) => {
+                list.msgs.push(fresh);
+                list.mark_dirty();
+            }
+            _ => panic!("l did not open the thread"),
+        }
+        deleted(&mut app, 5_000_000);
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        let drawn = screen(&mut terminal, &mut app);
+        assert_eq!(card_last(&app), Some(4_000_000), "the card lost the reply it draws");
+        assert!(drawn.contains("… 2 more replies"), "a reply the card never counted moved the count:\n{drawn}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `hidden` is signed, so an unguarded decrement lands at −1 and the card
+    /// would offer to elide a negative number of replies. The last counted
+    /// reply going leaves zero, and zero draws no elision line at all.
+    #[test]
+    fn the_last_counted_reply_leaves_the_card_at_zero_never_below() {
+        let card = render::ThreadCard {
+            conversation: "#one".into(),
+            participants: "bea".into(),
+            hidden: 1,
+            counted_through: 2_000_000,
+            last: None,
+        };
+        let mut list = MsgList::threads(vec![(msg(1, "root of one"), card)]);
+        list.drop_reply("C1", 1_000_000, 2_000_000);
+        assert_eq!(list.cards[0].hidden, 0);
+        // Nothing left to elide, at any fit: there is no drawn reply to fold.
+        assert_eq!(list.cards[0].elided(render::CardFit::Whole), 0);
+        assert_eq!(list.cards[0].elided(render::CardFit::Folded), 0);
+        assert_eq!(list.cards[0].elided(render::CardFit::Root), 0);
+        // A repeat of the same delete, and a reply the card never counted,
+        // cannot take it below zero either.
+        list.drop_reply("C1", 1_000_000, 2_000_000);
+        list.drop_reply("C1", 1_000_000, 9_000_000);
+        assert_eq!(list.cards[0].hidden, 0);
+        let corpus = Corpus::stub(&[]);
+        let palette = Palette::default();
+        let context = Ctx { archive: None, corpus: &corpus, tz: Tz::Utc,
+            image_font: None, last_read: None, palette: &palette };
+        list.rebuild_for_pane(&context, 120, 24);
+        let rows: Vec<String> = list.flat.iter().map(|line| line.line.to_string()).collect();
+        assert!(rows.iter().any(|row| row.contains("#one")), "no card drawn: {rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("more repl")), "an elision line at zero: {rows:?}");
+    }
+
+    /// A pane too short for a whole card sheds parts of it instead of drawing
+    /// nothing: `whole_message_viewport` shows no item taller than the pane,
+    /// and THREADS went blank at six rows.
+    #[test]
+    fn a_short_pane_sheds_the_reply_and_then_the_elision_line() {
+        let dir = crate::archive::test_dir("threads-short-pane");
+        // A root that wraps past three lines, so a short pane collapses it to
+        // a preview and the card still has to shed the parts around it.
+        crate::archive::thread_database(&dir, &[
+            (1, 1, "U1", "a root long enough to wrap over four lines in this pane, so that a short \
+                          pane collapses it to its first line, a hidden-line count and its last \
+                          line, which is the tallest a collapsed message ever gets and therefore \
+                          the worst case the card has to fit around"),
+            (2, 1, "U2", "oldest reply"),
+            (3, 1, "U2", "freshest answer"),
+        ]);
+        crate::archive::set_message_data(&dir, 1, json!({"reply_count": 2}));
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // `ui::draw` refuses to draw a message into fewer than six inner rows,
+        // so six and eight are the shortest panes a card must survive. Two of
+        // the terminal's rows are the pane border and one is the status line.
+        // At six the whole count moves into the header; at eight it gets its
+        // own elision line; on a tall pane the last reply is drawn and the
+        // count drops to the one reply left over.
+        // A collapsed root keeps its own last line, so this is on screen at
+        // every height and proves the card was drawn at all.
+        let tail = "worst case the card has to fit around";
+        let cases = [
+            (6 + 3, false, "#one  U1  · 2 more replies", ""),
+            (8 + 3, false, "#one  U1", "… 2 more replies"),
+            (30, true, "#one  U1", "… 1 more reply"),
+        ];
+        for (height, want_reply, want_header, want_elision) in cases {
+            let mut terminal = ratatui::Terminal::new(
+                ratatui::backend::TestBackend::new(100, height)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let drawn: String = (0..buffer.area.height).map(|y| (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+            assert!(drawn.contains(tail), "nothing drawn at height {height}:\n{drawn}");
+            assert_eq!(drawn.contains("freshest answer"), want_reply, "reply at height {height}:\n{drawn}");
+            assert!(drawn.contains(want_header), "header at height {height}:\n{drawn}");
+            // The count lives on the elision line, or in the header when the
+            // pane cannot spare a line for it, and never in both.
+            // Two spaces before the ellipsis is the elision line's own
+            // indent; the pane title truncates with a bare one.
+            assert_eq!(drawn.contains("  … "), !want_elision.is_empty(),
+                "the elision line at height {height}:\n{drawn}");
+            if !want_elision.is_empty() {
+                assert!(drawn.contains(want_elision), "{want_elision:?} missing at height {height}:\n{drawn}");
+            }
+            assert_eq!(drawn.contains("· 2 more replies"), want_header.contains('·'),
+                "the count is in the wrong place at height {height}:\n{drawn}");
+            // The whole card fits the pane, so the viewport can show it.
+            let list = app.active_list().unwrap();
+            let rows = list.last[0] - list.first[0] + 1;
+            assert!(rows <= app.msgs_height, "card is {rows} rows in a {} row pane:\n{drawn}", app.msgs_height);
+        }
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// At six rows the count is on the header, and a narrow pane must not
+    /// clip it off the end: the elision line it moved out of is gone, so a
+    /// clipped count is a count nowhere.
+    #[test]
+    fn a_narrow_header_truncates_the_names_and_keeps_the_count() {
+        let dir = crate::archive::test_dir("threads-narrow");
+        crate::archive::thread_database(&dir, &[
+            (1, 1, "U1", "a root long enough to wrap over several lines at forty columns, so the \
+                          pane collapses it and the card has to shed everything around it"),
+            (2, 1, "U2", "oldest reply"),
+            (3, 1, "U3", "freshest answer"),
+        ]);
+        crate::archive::set_message_data(&dir, 1, json!({
+            "reply_count": 2,
+            "reply_users": ["U2", "U3", "U4"],
+            "reply_users_count": 3,
+        }));
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.merge_profiles(vec![
+            json!({"id":"U2","name":"alexander.robinson"}),
+            json!({"id":"U3","name":"marcus.shellington"}),
+            json!({"id":"U4","name":"martin.kingsford"}),
+        ]);
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        app.corpus.convs[0].name = "#team-cdn-core-alpha-and-everything".into();
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // Six inner rows and forty columns: the count is the last thing on
+        // the header and the first thing a clip would take.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(66, 9)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height).map(|y| (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect();
+        let drawn = rows.join("\n");
+        let header = rows.iter().find(|row| row.contains("· 2 more replies"))
+            .unwrap_or_else(|| panic!("the count was clipped off the header:\n{drawn}"));
+        // The conversation survives, cut; the participants gave way first.
+        assert!(header.contains("#team-cdn"), "the conversation is gone:\n{drawn}");
+        assert!(!header.contains("alexander.robinson"), "the names kept their room:\n{drawn}");
+        assert!(!drawn.contains("  … "), "the elision line is back:\n{drawn}");
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -7326,7 +7936,7 @@ pub(crate) mod tests {
             let expected = command == "/save";
             assert_eq!(parse_command(command),Some(Command::Save(expected)));
             assert_eq!(app.keymap.action(KeyEvent::new(KeyCode::Char(code),modifiers)),Some(if expected {Action::Save}else{Action::Unsave}));
-            app.pending_delete = Some(PendingDelete {cid:"D1".into(),id:1});
+            app.pending_delete = Some(PendingDelete {cid:"D1".into(),id:1,root:None});
             app.on_key(KeyEvent::new(KeyCode::Char(code),modifiers));
             assert!(app.pending_delete.is_none());
             assert!(app.status.contains("sign-in")); assert!(app.job.is_none());
