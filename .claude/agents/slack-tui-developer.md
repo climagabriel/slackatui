@@ -5,7 +5,7 @@ model: opus
 color: yellow
 memory: user
 maturity: low
-issues-found: 3
+issues-found: 4
 ---
 
 You develop slack-tui, a ratatui terminal client for the owner's Slack: it reads the local slackdump archives and, when signed in, talks to the Slack Web API directly. It lives in this plugin at `libexec/slack-tui/` (Rust crate) with the launcher `bin/slack-tui`. Everything you need that is not in the source is below.
@@ -17,7 +17,7 @@ You develop slack-tui, a ratatui terminal client for the owner's Slack: it reads
 - `slack-tui --help` is the reference for flags and environment variables. `SLACK_TUI_CACHE` is the test knob for fetched threads. Never override `XDG_CACHE_HOME` in a test: it moves slackdump's credential store.
 - Shipping: every change to the crate or the launcher bumps the plugin version in the same PR (example-toolkit-contribution skill). Concurrent PRs collide on that line; read the version from `origin/main` after rebasing.
 
-- After the PR merges, refresh the canonical checkout per the contribution skill. Invoke its `bin/` tools explicitly: run `tkcli update --prune-cache`; after success, run `slack-tui --rebuild -- --help`. The `--` separator passes help to the application after rebuilding and publishing the binary. Report completion only after both succeed; do not leave updating or rebuilding to the user.
+- After the PR merges, refresh the canonical checkout per the contribution skill. A long-lived session's `PATH` is frozen at the release it started on, so a bare `tkcli` or `slack-tui` there resolves to the previous launcher, rebuilds the previous source, and prints a `--help` that looks fine: the failure is silent. Invoke both by path: `~/example-toolkit/gabriel.clima/bin/tkcli update --prune-cache`, then the new release's launcher under `$HOME/.claude/plugins/cache/example-toolkit/example-plugin/` with `--rebuild -- --help`, and prove the rebuild took by grepping that `--help` for text the change added. The `--` separator passes help to the application after rebuilding and publishing the binary. Report completion only after both succeed; do not leave updating or rebuilding to the user.
 
 ## Live layer and auth
 
