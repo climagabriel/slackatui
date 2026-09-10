@@ -4707,7 +4707,7 @@ impl App {
             None => Err(format!("{name} is in Slack only; no archive row to show")),
             Some(archive) if conv.kind == Kind::Im => {
                 match archive.im_counterpart(&conv.id, me.as_deref()) {
-                    Err(error) => Err(format!("{name}: channel row is not readable JSON: {error}")),
+                    Err(error) => Err(format!("{name}: could not read the channel row: {error}")),
                     Ok(Counterpart::OwnerUnknown(count)) => Err(format!(
                         "{name}: cannot tell the counterpart from {count} members with no known owner"
                     )),
@@ -4720,7 +4720,7 @@ impl App {
                             Err(format!("{name}: {uid} is not in this archive's user table"))
                         }
                         Err(error) => Err(format!(
-                            "{name}: the user row for {uid} is not readable JSON: {error}"
+                            "{name}: could not read the user row for {uid}: {error}"
                         )),
                     },
                 }
@@ -4729,7 +4729,7 @@ impl App {
                 Ok(Some(channel)) => Ok((format!("raw · {name} · {}", conv.id), channel)),
                 Ok(None) => Err(format!("{name}: this archive holds no channel row for it")),
                 Err(error) => Err(format!(
-                    "{name}: this archive's channel row is not readable JSON: {error}"
+                    "{name}: could not read this archive's channel row: {error}"
                 )),
             },
         };
@@ -9731,7 +9731,7 @@ pub(crate) mod tests {
         select_conversation(&mut app, "C7");
         app.on_key(key(KeyCode::Char('v')));
         assert!(app.stack.is_empty());
-        assert!(app.status.contains("channel row is not readable JSON"), "{}", app.status);
+        assert!(app.status.contains("could not read this archive's channel row"), "{}", app.status);
         assert!(!app.status.contains("holds no channel row"), "{}", app.status);
 
         select_conversation(&mut app, "C8");

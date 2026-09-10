@@ -919,11 +919,14 @@ impl Archive {
             .conn
             .prepare("SELECT DISTINCT USER_ID FROM CHANNEL_USER WHERE CHANNEL_ID = ?1")
             .map_err(|error| error.to_string())?;
+        // A member row that cannot be read is an error, not a member to
+        // skip: dropping it could leave exactly one other member and settle
+        // the counterpart on the wrong person.
         let members: Vec<String> = stmt
             .query_map(params![cid], |r| r.get::<_, String>(0))
             .map_err(|error| error.to_string())?
-            .flatten()
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
         let Some(me) = me else {
             return Ok(Counterpart::OwnerUnknown(members.len()));
         };
