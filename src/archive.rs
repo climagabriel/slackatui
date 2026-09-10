@@ -513,6 +513,17 @@ impl Corpus {
         }
     }
 
+    /// Where an archive's `rel` puts it among `ARCHIVE_SETS`. A directory
+    /// under no known set sorts last, so one dropped in by hand never
+    /// displaces a real archive.
+    fn set_rank(rel: &str) -> usize {
+        let set = rel.split('/').next().unwrap_or("");
+        ARCHIVE_SETS
+            .iter()
+            .position(|known| *known == set)
+            .unwrap_or(ARCHIVE_SETS.len())
+    }
+
     /// Register an archive directory created after startup; returns the
     /// indices of its conversations.
     pub fn add_archive(&mut self, dir: &Path) -> Result<Vec<usize>, String> {
@@ -533,6 +544,45 @@ impl Corpus {
             if let Some(index) = self.conv_by_channel(&conv.id) {
                 if self.convs[index].live_only {
                     self.convs[index] = conv;
+                } else if Self::set_rank(&self.archives[ai].rel)
+                    < Self::set_rank(&self.archives[self.convs[index].archive].rel)
+                {
+                    // The new archive comes from an earlier set than the one
+                    // holding this conversation, so it takes over as primary,
+                    // exactly as ARCHIVE_SETS order would decide at a restart.
+                    // Without this the conversation keeps reading its name,
+                    // kind and membership out of the lesser archive — a
+                    // `threads/` archive has no members at all — until the
+                    // next start silently changes them.
+                    let old = self.convs[index].archive;
+                    let mut dirs = vec![self.archives[old].dir.clone()];
+                    // Whatever the old primary had already folded in for this
+                    // channel has to come along, or it is lost.
+                    dirs.extend(self.archives[old].combined_dirs_for(&conv.id));
+                    let sources: Vec<(PathBuf, Vec<String>)> = dirs
+                        .into_iter()
+                        .map(|source| (source, vec![conv.id.clone()]))
+                        .collect();
+                    self.archives[ai]
+                        .combine_sources(&sources)
+                        .map_err(|e| e.to_string())?;
+                    let updated = self.archives[ai]
+                        .scan_convs(ai, self.me.as_deref(), self.half_life_days, None)
+                        .map_err(|e| e.to_string())?;
+                    if let Some(mut fresh) = updated.into_iter().find(|c| c.id == conv.id) {
+                        // The name, kind and stats are the new primary's; what
+                        // Slack told this session about the conversation is not
+                        // in any archive and has to survive the swap.
+                        let existing = &self.convs[index];
+                        fresh.left = existing.left;
+                        fresh.muted = existing.muted;
+                        fresh.unread = existing.unread;
+                        fresh.unread_count = existing.unread_count;
+                        fresh.unread_snapshot = existing.unread_snapshot.clone();
+                        fresh.mentions = existing.mentions;
+                        fresh.last_read = existing.last_read;
+                        self.convs[index] = fresh;
+                    }
                 } else {
                     let primary = self.convs[index].archive;
                     self.archives[primary].combine_sources(&[(dir.to_path_buf(), vec![conv.id.clone()])]).map_err(|e| e.to_string())?;
@@ -1077,6 +1127,15 @@ impl Archive {
         }
         convs.sort_by(|x, y| x.id.cmp(&y.id));
         Ok(convs)
+    }
+
+    /// The directories this archive has already folded in that carry `cid`.
+    fn combined_dirs_for(&self, cid: &str) -> Vec<PathBuf> {
+        self.combined_sources
+            .iter()
+            .filter(|(_, ids)| ids.iter().any(|id| id == cid))
+            .map(|(dir, _)| dir.clone())
+            .collect()
     }
 
     fn combine_sources(&mut self, sources: &[(PathBuf, Vec<String>)]) -> rusqlite::Result<()> {

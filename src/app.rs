@@ -9812,6 +9812,18 @@ pub(crate) mod tests {
             .join("\n")
     }
 
+    /// Walk the open timeline's cursor to the message with this text, so a
+    /// test does not depend on how many top-level messages sit below it.
+    fn select_message(app: &mut App, text: &str) {
+        for _ in 0..64 {
+            if app.selected().map(|m| m.text.as_str()) == Some(text) {
+                return;
+            }
+            app.on_msg_key(Some(Action::Up));
+        }
+        panic!("{text:?} is not in the open timeline");
+    }
+
     fn open_named(app: &mut App, name: &str) {
         let idx = app.corpus.conv_by_name(name).unwrap_or_else(|| {
             panic!("{name} is not in the conversation list: {:?}",
@@ -9920,7 +9932,7 @@ pub(crate) mod tests {
         open_named(&mut app, "#deploys");
         let screen = drawn(&mut app, 120, 30);
         assert!(screen.contains("the root") && screen.contains("unrelated line"), "{screen}");
-        app.on_msg_key(Some(Action::Up));
+        select_message(&mut app, "the root");
         app.on_msg_key(Some(Action::Open));
         let screen = drawn(&mut app, 120, 30);
         assert!(screen.contains("my reply") && screen.contains("their answer"), "{screen}");
@@ -10000,9 +10012,11 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// `me` still comes from `dms/`. A `threads/` archive can carry direct
-    /// messages of its own; asking it first would name the wrong owner, which
-    /// is what listing `threads` ahead of `dms` would do.
+    /// `me` still comes from `dms/` when a `threads/` archive carries direct
+    /// messages of its own. This pins owner discovery, not the set order:
+    /// `Corpus::open` sorts `dms/` archives to the front before asking any of
+    /// them, whatever position `dms` has in `ARCHIVE_SETS`. The set order is
+    /// what the two union tests above pin.
     #[test]
     fn the_owner_is_read_from_the_dm_archive_not_a_thread_archive() {
         let root = crate::archive::test_dir("threads-set-me");
@@ -10036,6 +10050,146 @@ pub(crate) mod tests {
             [1_000_000]
         );
         assert!(drawn(&mut app, 120, 30).contains("the root"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `threads/` archive of a direct message unions into the `dms/`
+    /// archive, not the other way round. That pins `threads` after `dms` in
+    /// `ARCHIVE_SETS`: the thread archive's `CHANNEL` row for a DM carries no
+    /// membership, so were it the primary the conversation would lose its
+    /// counterpart and answer to `@D1`.
+    #[test]
+    fn a_thread_archive_of_a_direct_message_unions_into_the_dm_archive() {
+        let root = crate::archive::test_dir("threads-set-dm");
+        let dms = root.join("dms/self");
+        crate::archive::channel_database(
+            &dms,
+            &[("D1", "", Kind::Im), ("D2", "", Kind::Im)],
+            &[
+                ("D1", 10, 10, "U5", "dm root"),
+                ("D1", 11, 0, "U1", "plain dm line"),
+                ("D2", 101, 0, "U7", "hi"),
+            ],
+        );
+        crate::archive::add_members(
+            &dms,
+            &[("D1", "U1"), ("D1", "U5"), ("D2", "U1"), ("D2", "U7")],
+        );
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("D1", "", Kind::Im)],
+            &[("D1", 10, 10, "U5", "dm root"), ("D1", 12, 10, "U1", "my dm reply")],
+        );
+        let mut app = corpus_app(&root);
+        assert_eq!(app.corpus.me.as_deref(), Some("U1"));
+        assert_eq!(app.corpus.convs.iter().filter(|c| c.id == "D1").count(), 1);
+        let conv = &app.corpus.convs[app.corpus.conv_by_channel("D1").unwrap()];
+        let archive = app.corpus.conv_archive(conv).unwrap();
+        assert_eq!(archive.rel, "dms/self");
+        // The name and the counterpart both come off the membership the
+        // thread archive has none of.
+        assert_eq!((conv.name.as_str(), conv.kind), ("@u5", Kind::Im));
+        assert_eq!(
+            archive.im_counterpart("D1", Some("U1")),
+            Ok(Counterpart::User("U5".to_string()))
+        );
+        // The thread archive's reply is unioned in, and the root both hold is
+        // one message.
+        assert_eq!(
+            archive.thread("D1", 10_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [10_000_000, 12_000_000]
+        );
+        assert_eq!((conv.msgs, conv.mine), (3, 2));
+
+        open_named(&mut app, "@u5");
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("@u5") && screen.contains("dm root"), "{screen}");
+        assert!(!screen.contains("@D1"), "{screen}");
+        select_message(&mut app, "dm root");
+        app.on_msg_key(Some(Action::Open));
+        assert!(drawn(&mut app, 120, 30).contains("my dm reply"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `/cache start` on a channel only a `threads/` archive holds: the new
+    /// `full/` archive takes over as primary the moment it is registered,
+    /// rather than at the next restart. Until it does, the conversation reads
+    /// its name, kind and membership out of the thread archive, which has no
+    /// members at all.
+    #[test]
+    fn a_full_archive_added_at_runtime_takes_over_from_a_thread_archive() {
+        let root = crate::archive::test_dir("threads-set-takeover");
+        dm_archive(&root.join("dms/self"), "U1");
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 1, 1, "U2", "the root"), ("C9", 2, 1, "U1", "my reply")],
+        );
+        let mut app = corpus_app(&root);
+        open_named(&mut app, "#deploys");
+        let index = app.corpus.conv_by_channel("C9").unwrap();
+        assert_eq!(app.corpus.archives[app.corpus.convs[index].archive].rel, "threads/x");
+        assert_eq!(
+            app.corpus.archives[app.corpus.convs[index].archive]
+                .im_counterpart("C9", Some("U1")),
+            Ok(Counterpart::Ambiguous(0))
+        );
+
+        // A second thread of the same channel arrives first and folds into the
+        // one already primary, both being in the same set. It has to come
+        // along when the primary changes, or its messages are lost.
+        let sibling = root.join("threads/y");
+        crate::archive::channel_database(
+            &sibling,
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 3, 3, "U2", "another root"), ("C9", 4, 3, "U1", "another reply")],
+        );
+        app.corpus.add_archive(&sibling).unwrap();
+
+        // What the ArchiveNew job leaves behind: slackdump writes the whole
+        // channel into a hidden directory under full/, and the Done arm hands
+        // it to finish_archive, which names it and registers it.
+        let written = root.join("full/.new-1");
+        crate::archive::channel_database(
+            &written,
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 1, 1, "U2", "the root"), ("C9", 9, 0, "U3", "unrelated line")],
+        );
+        crate::archive::add_members(&written, &[("C9", "U1"), ("C9", "U2"), ("C9", "U3")]);
+        app.finish_archive(&written, "#deploys", false);
+        assert!(app.status.starts_with("archived deploys"), "{}", app.status);
+
+        let index = app.corpus.conv_by_channel("C9").unwrap();
+        let conv = &app.corpus.convs[index];
+        let archive = app.corpus.conv_archive(conv).unwrap();
+        assert!(archive.rel.starts_with("full/"), "{}", archive.rel);
+        // Both thread archives are now its sources, not its replacements.
+        assert_eq!(archive.source_dirs.len(), 3);
+        assert_eq!(
+            archive.thread("C9", 3_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [3_000_000, 4_000_000],
+            "the sibling thread archive came along"
+        );
+        assert_eq!(
+            archive.im_counterpart("C9", Some("U1")),
+            Ok(Counterpart::Ambiguous(3))
+        );
+        assert_eq!((conv.name.as_str(), conv.kind, conv.msgs, conv.mine), ("#deploys", Kind::Channel, 5, 2));
+        assert_eq!(
+            archive.thread("C9", 1_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000, 2_000_000]
+        );
+
+        // Reopening reads the union: the full archive's own line and the
+        // thread archive's reply are both there.
+        open_named(&mut app, "#deploys");
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("the root") && screen.contains("unrelated line"), "{screen}");
+        select_message(&mut app, "the root");
+        app.on_msg_key(Some(Action::Open));
+        assert!(drawn(&mut app, 120, 30).contains("my reply"));
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
