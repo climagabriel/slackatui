@@ -802,6 +802,9 @@ pub enum Mode {
     Prompt {
         kind: PromptKind,
         buf: Editor,
+        /// What Esc restores or compares against: the list filter in force
+        /// before a `/` command, the text `>` prefilled into a compose box,
+        /// and empty everywhere else.
         previous: String,
     },
 }
@@ -2212,17 +2215,28 @@ impl App {
         } else {
             "quoted above your draft".to_string()
         };
-        let cursor = quote.len();
-        let mut buf = Editor::with(format!("{quote}{kept}"));
+        // The answer always gets an empty line of its own. `quote` already ends
+        // in the newline that closes its last quoted line, so a kept draft
+        // needs a second one: without it the draft occupies the row the cursor
+        // is on, and the first character typed joins the answer to it.
+        let body = if kept.is_empty() {
+            quote.clone()
+        } else {
+            format!("{quote}\n{kept}")
+        };
         // The empty line under the quote, which `Editor::with` would leave the
         // cursor past when a kept draft follows it.
+        let cursor = quote.len();
+        let mut buf = Editor::with(body.clone());
         buf.cursor = cursor;
         self.compose = Some(target);
         self.attach_note = None;
         self.mode = Mode::Prompt {
             kind: PromptKind::Compose,
             buf,
-            previous: String::new(),
+            // What was prefilled, so Esc can tell an untouched quote from one
+            // that was written into. Empty for every other prompt.
+            previous: body,
         };
     }
 
@@ -5589,6 +5603,7 @@ impl App {
         match k.code {
             KeyCode::Esc => {
                 let typed = buf.text.clone();
+                let prefill = previous.clone();
                 if kind == PromptKind::Command && self.focus == Focus::Convs {
                     self.filter = previous.clone();
                     self.mode = Mode::Normal;
@@ -5597,7 +5612,16 @@ impl App {
                     self.mode = Mode::Normal;
                 }
                 if kind == PromptKind::Compose {
-                    self.keep_draft(typed);
+                    // A quote `>` prefilled and nobody wrote into is not a
+                    // draft. Keeping it would stash a quotation with no answer
+                    // under it, and the draft slot is single, so it would also
+                    // evict the draft another conversation is holding. Only a
+                    // quote-reply has a prefill; `c` opens with none, so an
+                    // emptied `c` prompt still drops its own draft as before.
+                    let untouched_quote = !prefill.is_empty() && typed == prefill;
+                    if !untouched_quote {
+                        self.keep_draft(typed);
+                    }
                     if let Some(name) = self.drop_attachment() {
                         self.status = format!("{name} not sent");
                     }
@@ -7641,25 +7665,74 @@ pub(crate) mod tests {
             MsgList::new(vec![msg(2000, "and the cache is warm")], false);
         app.on_key(press(KeyCode::Char('>')));
         assert_eq!(app.status, "quoted above your draft");
+        let quote = "> and the cache is warm\n";
+        let kept = "> deploy is done\nthanks";
         let Mode::Prompt { buf, .. } = &app.mode else { panic!("no prompt opened") };
-        assert_eq!(
-            buf.text,
-            "> and the cache is warm\n> deploy is done\nthanks"
-        );
-        // The cursor is on the new quote's empty line, above the kept draft.
-        assert_eq!(buf.cursor, "> and the cache is warm\n".len());
+        // The answer gets an empty line of its own; the kept draft starts on
+        // the line below it, not on the one the cursor is on.
+        assert_eq!(buf.text, format!("{quote}\n{kept}"));
+        assert_eq!(buf.cursor, quote.len());
         let rows = app.prompt_rows(60, 20);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
         terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
         assert_eq!(
             box_rows(terminal.backend().buffer(), rows),
-            ["> and the cache is warm", "> deploy is done", "thanks"]
+            ["> and the cache is warm", "", "> deploy is done", "thanks"]
         );
         assert_eq!(
             terminal.get_cursor_position().unwrap(),
             ratatui::layout::Position::new(1, 20 - rows + 2)
         );
+        // What is typed there is the answer, on its own line: it neither joins
+        // the kept draft nor pushes a `>` into the middle of a line.
+        for c in "answer".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        let Mode::Prompt { buf, .. } = &app.mode else { panic!("no prompt opened") };
+        assert_eq!(buf.text, format!("{quote}answer\n{kept}"));
+    }
+
+    /// The draft slot is single, so a quote nobody wrote into must not be
+    /// stashed: doing so would throw away whatever another conversation is
+    /// holding, which plain `c` on an empty prompt never does.
+    #[test]
+    fn a_quote_left_untouched_is_not_kept_and_spares_another_target_s_draft() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        // Half a message typed in the DM, kept by Esc.
+        app.open_conv(1);
+        app.focus = Focus::Msgs;
+        let elsewhere = app.corpus.convs[1].id.clone();
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1000, "a DM")], false);
+        app.on_key(press(KeyCode::Char('c')));
+        for c in "half typed".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Esc));
+        assert_eq!(app.draft.as_ref().expect("the DM draft").text, "half typed");
+
+        // `>` in the other conversation, cancelled without a character typed.
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(2000, "quotable")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        app.on_key(press(KeyCode::Esc));
+        let draft = app.draft.as_ref().expect("the DM draft survived the quote");
+        assert_eq!(draft.cid, elsewhere);
+        assert_eq!(draft.text, "half typed");
+
+        // One character makes it a draft, and the single slot then costs the
+        // DM its own. Pinned here so the trade is deliberate, not incidental.
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(2000, "quotable")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        app.on_key(press(KeyCode::Char('!')));
+        app.on_key(press(KeyCode::Esc));
+        let draft = app.draft.as_ref().expect("a quote written into is kept");
+        assert_eq!(draft.cid, "C1");
+        assert_eq!(draft.text, "> quotable\n!");
     }
 
     /// The two refusals, and the sign-in the prompt needs: each says why in
