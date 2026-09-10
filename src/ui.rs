@@ -1259,6 +1259,10 @@ const HELP: &[HelpRow] = &[
         "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Ctrl-v attaches the clipboard's image, Ctrl-j and Alt-Enter break the line, Enter sends, Esc keeps the draft and returns home",
     ),
     HelpRow::Bound(
+        Action::QuoteReply,
+        "quote the selected message and answer under it, in one new message: every line of its own text takes a > , the cursor waits on the empty line below, and a draft already typed for the same target stays under the quote. It goes where c would go from here",
+    ),
+    HelpRow::Bound(
         Action::Delete,
         "delete the selected message, which Slack allows only for your own; the same key again confirms, any other cancels",
     ),
@@ -1890,6 +1894,38 @@ mod compose_tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(row_text(terminal.backend().buffer(), 17)
             .contains("message to #one · no image on the clipboard"));
+    }
+
+
+    /// Plain `c`: the box it opens, captured cell for cell before the quote
+    /// key existed, so a later change to that key cannot move it.
+    #[test]
+    fn the_box_plain_compose_opens_is_unchanged() {
+        let mut app = mute_test_app();
+        app.api = Some(std::sync::Arc::new(crate::api::Client::for_test(|_, _| {
+            Err("test".to_string())
+        })));
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.on_key(crate::event::KeyEvent::new(
+            crate::event::KeyCode::Char('c'),
+            crate::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.prompt_rows(60, 20), 3);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            row_text(buffer, 17),
+            "\u{250c} message to #one \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} Enter send \u{b7} Ctrl-j newline \u{2510}"
+        );
+        assert_eq!(row_text(buffer, 18), "\u{2502}                                                          \u{2502}");
+        assert_eq!(row_text(buffer, 19), "\u{2514}".to_string() + &"\u{2500}".repeat(58) + "\u{2518}");
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 18)
+        );
     }
 
     /// Ctrl-j adds a row to the box; Esc closes it and gives the status line

@@ -2167,6 +2167,65 @@ impl App {
         }
     }
 
+    /// `>`: the selected message quoted, with the answer written under it.
+    ///
+    /// Slack has no quote-reply gesture, so this writes the convention people
+    /// hand-roll: the earlier message as a `>` block, an empty line, and the
+    /// cursor on it. Nothing is sent here — the prompt this opens is an
+    /// ordinary compose draft, and `send_message` is still what posts it.
+    ///
+    /// What is quoted is the message's own `text`, not the terminal's rendering
+    /// of it, so mentions and links post as mentions and links. Where it goes
+    /// is whatever `compose_target` says from this position, so `>` and `c`
+    /// never disagree about the destination.
+    fn quote_reply(&mut self) {
+        if self.api.is_none() {
+            self.status = "sending needs the Slack sign-in".to_string();
+            return;
+        }
+        let Some(source) = self.selected().map(|m| m.text.clone()) else {
+            self.status = "select a message first".to_string();
+            return;
+        };
+        if source.trim().is_empty() {
+            self.status = "nothing to quote".to_string();
+            return;
+        }
+        let target = match self.compose_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let quote = format!("{}\n", crate::edit::quote_block(&source));
+        // A draft already typed for this target is kept, below the quote: the
+        // key adds a quotation, it never discards what was written.
+        let kept = match &self.draft {
+            Some(d) if d.cid == target.cid && d.thread == target.thread => d.text.clone(),
+            _ => String::new(),
+        };
+        // Cleared rather than left alone, so a "nothing to quote" from the
+        // message before this one cannot sit under an open box contradicting it.
+        self.status = if kept.is_empty() {
+            String::new()
+        } else {
+            "quoted above your draft".to_string()
+        };
+        let cursor = quote.len();
+        let mut buf = Editor::with(format!("{quote}{kept}"));
+        // The empty line under the quote, which `Editor::with` would leave the
+        // cursor past when a kept draft follows it.
+        buf.cursor = cursor;
+        self.compose = Some(target);
+        self.attach_note = None;
+        self.mode = Mode::Prompt {
+            kind: PromptKind::Compose,
+            buf,
+            previous: String::new(),
+        };
+    }
+
     /// The typed text, remembered with the target the prompt was opened for.
     /// An emptied prompt drops its own draft and leaves another target's alone.
     fn keep_draft(&mut self, text: String) {
@@ -5302,6 +5361,8 @@ impl App {
             Some(Action::MyThreads) => self.open_my_threads(),
             Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
             Some(Action::Compose) => self.compose(),
+            // `>` quotes the message under the cursor, and this pane has none.
+            Some(Action::QuoteReply) => self.status = "select a message first".to_string(),
             Some(Action::React) => self.view_reactions(),
             Some(Action::MarkRead) => self.mark_read(),
             Some(Action::MarkUnread) => self.mark_unread(),
@@ -5471,6 +5532,7 @@ impl App {
             Some(Action::MyThreads) => self.open_my_threads(),
             Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
             Some(Action::Compose) => self.compose(),
+            Some(Action::QuoteReply) => self.quote_reply(),
             Some(Action::React) => self.view_reactions(),
             Some(Action::Delete) => self.delete_selected(),
             Some(Action::Images) => self.open_images(),
@@ -7404,6 +7466,245 @@ pub(crate) mod tests {
         let target=app.compose_target().unwrap();
         assert_eq!(target.cid,app.corpus.convs[app.filtered[1]].id);assert!(target.thread.is_none());
         for section in TopSection::ALL {app.top_section=Some(section);assert!(app.compose_target().is_err());}
+    }
+
+    /// An application signed in far enough for the compose prompt to open;
+    /// nothing in these tests reaches the network, and `>` never asks it to.
+    fn quote_test_app() -> App {
+        let mut app = mute_test_app();
+        app.api = Some(Arc::new(Client::for_test(|method, _| {
+            // Opening a conversation reads; the quote key must never write.
+            assert!(
+                method.starts_with("conversations.") && method != "conversations.mark",
+                "{method} called: the quote key writes nothing to Slack"
+            );
+            Ok(json!({ "messages": [] }))
+        })));
+        app
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The interior rows of the compose box at the bottom of `buffer`, borders
+    /// stripped, so a row can be compared with what was quoted into it.
+    fn box_rows(buffer: &ratatui::buffer::Buffer, rows: u16) -> Vec<String> {
+        let width = buffer.area.width;
+        let top = buffer.area.height - rows;
+        (top + 1..buffer.area.height - 1)
+            .map(|y| {
+                (1..width - 1)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// `>` in a conversation: the message's own Slack text quoted line by line
+    /// into the compose box, the cursor on the empty line under it, and the
+    /// box addressed where `c` would have addressed it.
+    #[test]
+    fn quote_opens_the_compose_box_with_the_message_and_the_cursor_below_it() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        // Mentions, a labelled link, a blank line and a line already quoted.
+        let text = "<@U1> see <https://example.org|the docs>\n\n> earlier";
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1000, text)], false);
+        app.on_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT));
+        let target = app.compose.as_ref().expect("the compose target");
+        assert_eq!(target.label, "message to #one");
+        assert_eq!(target.cid, "C1");
+        assert!(target.thread.is_none(), "a timeline quote is not a threaded reply");
+        let Mode::Prompt { kind, buf, .. } = &app.mode else { panic!("no prompt opened") };
+        assert_eq!(*kind, PromptKind::Compose);
+        assert_eq!(buf.text, format!("{}\n", crate::edit::quote_block(text)));
+        assert_eq!(buf.cursor, buf.text.len());
+        // Nothing was sent, and nothing was queued to send.
+        assert!(!matches!(
+            app.job.as_ref().map(|job| &job.kind),
+            Some(JobKind::Send { .. } | JobKind::Upload { .. })
+        ));
+        let rows = app.prompt_rows(60, 20);
+        assert_eq!(rows, 6, "three quoted rows and the empty one below them");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            box_rows(buffer, rows),
+            [
+                "> <@U1> see <https://example.org|the docs>",
+                ">",
+                "> > earlier",
+                "",
+            ]
+        );
+        // The label rides the top border, as it does for `c`.
+        let border: String = (0..60).map(|x| buffer[(x, 14)].symbol()).collect();
+        assert!(border.contains("message to #one"), "{border:?}");
+        // The cursor is the first cell of the empty line under the quote.
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 18)
+        );
+    }
+
+    /// Inside a thread the quote replies in that thread, exactly as `c` does.
+    #[test]
+    fn quote_inside_a_thread_replies_in_that_thread() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.stack.push(View::Thread {
+            root: 1_000_000,
+            list: MsgList::new(vec![msg(1, "the root"), msg(2, "a reply")], true),
+            live: None,
+            place: None,
+        });
+        app.active_list_mut().unwrap().cursor = 1;
+        app.on_key(press(KeyCode::Char('>')));
+        let target = app.compose.as_ref().expect("the compose target");
+        assert_eq!(target.label, "reply in this thread in #one");
+        assert_eq!(target.thread, Some(1_000_000));
+        let rows = app.prompt_rows(60, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(box_rows(terminal.backend().buffer(), rows), ["> a reply", ""]);
+        let border: String = (0..60)
+            .map(|x| terminal.backend().buffer()[(x, 20 - rows)].symbol())
+            .collect();
+        assert!(border.contains("reply in this thread"), "{border:?}");
+    }
+
+    /// From a THREADS card the target is that card's thread, and the root is
+    /// what gets quoted.
+    #[test]
+    fn quote_from_the_threads_view_targets_the_selected_thread() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.focus = Focus::Msgs;
+        let card = crate::render::ThreadCard {
+            conversation: "#one".to_string(),
+            participants: "alice, bob".to_string(),
+            hidden: 2,
+            counted_through: 3_000_000,
+            last: Some(msg(3000, "the newest reply")),
+        };
+        app.stack.push(View::Threads {
+            list: MsgList::threads(vec![(msg(1000, "the thread root"), card)]),
+        });
+        app.on_key(press(KeyCode::Char('>')));
+        let target = app.compose.as_ref().expect("the compose target");
+        assert_eq!(target.cid, "C1");
+        assert_eq!(target.thread, Some(1_000_000_000));
+        assert!(target.label.ends_with("thread in #one"), "{}", target.label);
+        let rows = app.prompt_rows(60, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            box_rows(terminal.backend().buffer(), rows),
+            ["> the thread root", ""]
+        );
+    }
+
+    /// Esc keeps a quoted draft the way it keeps a typed one, and quoting a
+    /// second message for the same target puts the new quote above it rather
+    /// than dropping what was written.
+    #[test]
+    fn escape_keeps_the_quote_and_a_second_quote_goes_above_the_draft() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1000, "deploy is done")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        for c in "thanks".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+        let draft = app.draft.as_ref().expect("Esc kept the draft");
+        assert_eq!(draft.text, "> deploy is done\nthanks");
+        assert_eq!((draft.cid.as_str(), draft.thread), ("C1", None));
+
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list =
+            MsgList::new(vec![msg(2000, "and the cache is warm")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "quoted above your draft");
+        let Mode::Prompt { buf, .. } = &app.mode else { panic!("no prompt opened") };
+        assert_eq!(
+            buf.text,
+            "> and the cache is warm\n> deploy is done\nthanks"
+        );
+        // The cursor is on the new quote's empty line, above the kept draft.
+        assert_eq!(buf.cursor, "> and the cache is warm\n".len());
+        let rows = app.prompt_rows(60, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            box_rows(terminal.backend().buffer(), rows),
+            ["> and the cache is warm", "> deploy is done", "thanks"]
+        );
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 20 - rows + 2)
+        );
+    }
+
+    /// The two refusals, and the sign-in the prompt needs: each says why in
+    /// the status line and opens nothing.
+    #[test]
+    fn quote_says_what_it_cannot_quote_and_opens_nothing() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        // The conversations pane has no message under its cursor.
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "select a message first");
+        assert!(matches!(app.mode, Mode::Normal) && app.compose.is_none());
+        // A conversation with nothing loaded: still no message.
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(Vec::new(), false);
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "select a message first");
+        assert!(matches!(app.mode, Mode::Normal) && app.compose.is_none());
+        // A file-only message has no text a quote could carry.
+        let file_only = Msg::from_api(
+            "C1".to_string(),
+            json!({
+                "ts": "1000.000000", "user": "U1", "text": "",
+                "files": [{ "id": "F1", "title": "shot.png", "mimetype": "image/png" }]
+            }),
+        )
+        .unwrap();
+        app.open.as_mut().unwrap().list = MsgList::new(vec![file_only], false);
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "nothing to quote");
+        assert!(matches!(app.mode, Mode::Normal) && app.compose.is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let status: String = (0..60)
+            .map(|x| terminal.backend().buffer()[(x, 19)].symbol())
+            .collect();
+        assert!(status.contains("nothing to quote"), "{status:?}");
+        // Without the sign-in the prompt cannot send, so it does not open.
+        app.api = None;
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1000, "quotable")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "sending needs the Slack sign-in");
+        assert!(matches!(app.mode, Mode::Normal) && app.compose.is_none());
     }
 
     #[test]

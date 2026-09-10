@@ -209,6 +209,7 @@ keys (also ? inside)
   R refresh from Slack, a archive a conversation not cached yet,
   i view a message's images, I inline thumbnails on/off,
   m mark read, M mark unread from the cursor, D delete your own message,
+  > quote the selected message and answer under it in one new message,
   T channel tabs and canvases; Ctrl-T threads you took part in or were mentioned in,
   Ctrl-B cycles the conversations pane: always shown, always hidden,
   auto-hide inside a conversation (shown again on leaving it),
@@ -258,7 +259,14 @@ wraps a long line at its spaces and grows to eight rows before it scrolls to
 follow the cursor. Its top border carries the target on the left and
 Enter send · Ctrl-j newline · Esc cancel · Ctrl-v image on the right, dropping
 hints from the right as the terminal narrows. Alt-Enter breaks the line where
-Ctrl-j does; D deletes one of your own messages, the
+Ctrl-j does. > opens the same box already holding the selected message as a
+quote: every line of its own Slack text prefixed with > , an empty quoted line
+where the message had a blank one, a second > where the line was already a
+quote, then an empty line with the cursor on it. It carries no author line and
+no permalink, it sends where c would send from the same place, and a draft
+already typed for that target is kept below the quote rather than replaced.
+Editing it and sending it are the compose prompt's own keys; the key itself
+writes nothing to Slack. D deletes one of your own messages, the
 same key again confirming; /upload [path] sends a file
 with the next message, and Ctrl-v in the compose prompt attaches the image on
 the clipboard (through wl-paste or xclip); /leave leaves a channel.

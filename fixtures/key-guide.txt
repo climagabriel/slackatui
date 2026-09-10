@@ -46,13 +46,13 @@
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
  23 |│      │  c                            write a message: to the open conversation, into the open thread│      │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
- 24 |│      │  D                            delete the selected message, which Slack allows only for your o│      │|
+ 24 |│      │  >                            quote the selected message and answer under it, in one new mess│      │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
- 25 |│      │  e                            view reactions on the selected message: cached counts and known│      │|
+ 25 |│      │  D                            delete the selected message, which Slack allows only for your o│      │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
- 26 |│      │  m                            mark read: the highlighted conversation, or the open one at its│      │|
+ 26 |│      │  e                            view reactions on the selected message: cached counts and known│      │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
- 27 |│      │  M                            mark unread from the message under the cursor (the highlighted │      │|
+ 27 |│      │  m                            mark read: the highlighted conversation, or the open one at its│      │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
  28 |└──────└──────────────────────────────────────────────────────────────────────────────────────────────┘──────┘|
     0..103:fg=Cyan,bg=Reset,ul=Reset 103..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM

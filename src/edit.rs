@@ -4,6 +4,33 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// One message's text as the Slack blockquote a quote-reply is written with.
+///
+/// Every line takes `> `; an empty line becomes a bare `>`, so the quote is one
+/// block rather than two with a gap between them; a line that is already a
+/// quote gets a second marker and nests. A code fence is quoted line by line
+/// like any other line — Slack renders that acceptably and the draft is
+/// editable. One trailing newline is dropped, so the empty line the caller puts
+/// below the quote is the only blank line at its end.
+///
+/// The input is the message's own `text` as Slack stores it, not the rendered
+/// terminal text: `<@U…>` mentions and `<url|label>` links then survive the
+/// round trip and post as mentions and links again.
+pub fn quote_block(text: &str) -> String {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    body.split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.trim().is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct Editor {
     pub text: String,
@@ -180,6 +207,38 @@ mod tests {
         for c in s.chars() {
             press(e, KeyCode::Char(c), KeyModifiers::NONE);
         }
+    }
+
+    #[test]
+    fn a_quote_takes_every_line_and_leaves_one_blank_line_at_its_end() {
+        assert_eq!(quote_block("one line"), "> one line");
+        // A blank line inside the message keeps the quote in one block.
+        assert_eq!(
+            quote_block("first\n\nthird"),
+            "> first\n>\n> third"
+        );
+        // A line of spaces is blank too; nothing carries its whitespace.
+        assert_eq!(quote_block("a\n   \nb"), "> a\n>\n> b");
+        // An existing quote nests rather than merging into this one.
+        assert_eq!(quote_block("> they said\nI answered"), "> > they said\n> I answered");
+        // A fence is quoted line by line, marker rows included.
+        assert_eq!(
+            quote_block("look:\n```\nnginx -t\n```"),
+            "> look:\n> ```\n> nginx -t\n> ```"
+        );
+        // Slack's own markup is quoted verbatim, so it posts as markup again.
+        assert_eq!(
+            quote_block("<@U1> see <https://example.org|the docs> *now*"),
+            "> <@U1> see <https://example.org|the docs> *now*"
+        );
+        // One trailing newline goes: the caller's own blank line follows, and
+        // two would leave the answer a row further down than it belongs.
+        assert_eq!(quote_block("one line\n"), "> one line");
+        assert_eq!(format!("{}\n", quote_block("one line\n")), "> one line\n");
+        // A second trailing newline is a blank line the author wrote.
+        assert_eq!(quote_block("one line\n\n"), "> one line\n>");
+        // CRLF is a line ending, not a character to quote.
+        assert_eq!(quote_block("a\r\nb\r\n"), "> a\n> b");
     }
 
     #[test]
