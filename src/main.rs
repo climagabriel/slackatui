@@ -11,6 +11,7 @@ mod auth;
 mod clip;
 mod complete;
 mod conv_age;
+mod conv_type;
 mod conversations_pane;
 mod edit;
 mod keys;
@@ -304,15 +305,25 @@ from below: the line sits under the last conversation whose newest message is
 under 24, 48 and 168 hours old, and under the last of the rest.
 The age is elapsed time, not a calendar date, so no timezone applies; a
 conversation with no cached message, or one dated ahead of now, falls under
-earlier. Only unstarred, unmuted conversations are grouped: starred ones sit
-above the first grouped conversation and muted ones below the last divider. A
-group with nobody in it draws no line, no other sort draws one, and none is
-drawn while a /find filter is typed: the needle re-sorts the list by how
-closely each name matches it, which is no longer age order. The grouped
-conversations are one sequence, so with unread first on an unread and a read
-conversation of the same age share one line; an unread conversation older than
-the read ones below it closes its own group where it sits. A divider is not a
-conversation: j and k step over it.
+earlier. Under the type sort the same lines name Slack's conversation types, in
+this order: public channels, private channels, Slack Connect channels, direct
+messages, group direct messages, direct messages with apps, archived. The type
+is decided in that priority rather than by the kind alone -- an archived
+conversation of any kind is archived; then a direct message whose counterpart
+is a bot user, which is how an app appears in a direct message, and Slackbot;
+then is_shared or is_ext_shared on a public or private channel, which is what
+Slack Connect is -- a shared flag on a direct or group message does not move
+it; then the kind. A counterpart the archive cannot name, and one with no user
+record, count as a person. Inside a type the order is the recent one, newest
+message first. Only unstarred, unmuted conversations are grouped, under either
+sort: starred ones sit above the first grouped conversation and muted ones
+below the last divider. A group with nobody in it draws no line, the other
+sorts draw none, and none is drawn while a /find filter is typed: the needle
+re-sorts the list by how closely each name matches it, which is neither order.
+The grouped conversations are one sequence, so with unread first on an unread
+and a read conversation of the same group share one line; an unread
+conversation of a group below the read ones above it closes its own group where
+it sits. A divider is not a conversation: j and k step over it.
 /conversations-pane selects visible categories and individual conversations.
 Ctrl-Shift-P opens the same menu and /keys can rebind it. Terminals must report
 the Shift modifier separately; otherwise use the command or rebind the action.

@@ -270,26 +270,37 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     // not a row of the list at all, so `j`/`k` cannot land on one, the cursor
     // arithmetic below stays a count of conversations, and the line scrolls
     // with the conversation it belongs to. The starred boundary leads its
-    // item; an age divider closes its group, so it trails the item of the last
-    // conversation in that group — rows are boundary, name, divider.
+    // item; a group divider closes its group, so it trails the item of the
+    // last conversation in that group — rows are boundary, name, divider.
     //
-    // One clock for the whole pane, and the age dividers only under `Recent`
-    // with no filter typed. No other sort puts the list in age order, and a
-    // `/find` needle re-sorts what `Recent` ordered by how closely each name
-    // matches it, which breaks the age order inside the run: the lines would
-    // come out `today`, `earlier`, `today` and mean nothing. Both are read
-    // here at every draw rather than recorded when the list was built, so `s`
-    // and a typed or cleared filter add or remove the lines on the very next
-    // frame.
+    // Two sorts group the list, and each names its groups on the same kind of
+    // line: `Recent` by the age of the newest message, against one clock for
+    // the whole pane, and `Type` by Slack's conversation types. The other
+    // sorts put the list in neither order and draw nothing, and no line is
+    // drawn while a `/find` needle is typed: the needle re-sorts what the sort
+    // ordered by how closely each name matches it, which breaks the grouping
+    // inside the run — the lines would come out `today`, `earlier`, `today`
+    // and mean nothing. Both the sort and the filter are read here at every
+    // draw rather than recorded when the list was built, so `s` and a typed or
+    // cleared filter add, change or remove the lines on the very next frame.
     let now = app.now_secs();
-    let age_dividers = app.sort == Sort::Recent && app.filter.trim().is_empty();
-    // Starred conversations, above, and muted ones, below, are not part of the
-    // age-ordered run and have no group; neither has a row past the end of the
-    // list, which is what makes the last eligible conversation close its group.
-    let group = |k: usize| -> Option<crate::conv_age::AgeGroup> {
+    let dividers = matches!(app.sort, Sort::Recent | Sort::Type) && app.filter.trim().is_empty();
+    // The group of row `k` as the label that names it, so one closure answers
+    // for both sorts and the loop below compares labels rather than knowing
+    // which grouping is on. Starred conversations, above, and muted ones,
+    // below, are not part of the grouped run and have no group; neither has a
+    // row past the end of the list, which is what makes the last eligible
+    // conversation close its group.
+    let group = |k: usize| -> Option<&'static str> {
         let c = app.conv(*app.filtered.get(k)?);
-        (!c.muted && !app.starred.contains(&c.id))
-            .then(|| crate::conv_age::AgeGroup::of(c.last_id, now))
+        if c.muted || app.starred.contains(&c.id) {
+            return None;
+        }
+        match app.sort {
+            Sort::Recent => Some(crate::conv_age::AgeGroup::of(c.last_id, now).label()),
+            Sort::Type => Some(app.conv_type(c).label()),
+            _ => None,
+        }
     };
     let items: Vec<ListItem> = items
         .into_iter()
@@ -303,20 +314,20 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
                 rows.push(Line::from(Span::styled("─".repeat(width), dim)));
             }
             rows.push(line);
-            if age_dividers {
+            if dividers {
                 if let Some(g) = group(k) {
                     // The whole eligible run is one sequence: a line goes under
                     // row `k` when the row after it leaves the run — the end of
                     // the list, or the muted block — or belongs to a different
                     // group. So a group with no conversations draws none, and
-                    // two conversations of the same age share the one line
-                    // under the older of them. The unread/read boundary is not
+                    // two conversations of the same group share the one line
+                    // under the lower of them. The unread/read boundary is not
                     // a restart: with `U` on, unread and read conversations of
-                    // the same age share a line, and an unread conversation
-                    // older than the read ones above the boundary closes its
-                    // own group where it sits.
+                    // the same group share a line, and an unread conversation
+                    // of a group below the read ones above the boundary closes
+                    // its own group where it sits.
                     if group(k + 1) != Some(g) {
-                        rows.push(crate::render::divider(g.label(), width));
+                        rows.push(crate::render::divider(g, width));
                     }
                 }
             }
@@ -2122,8 +2133,8 @@ mod conv_age_tests {
     const LABELS: [&str; 4] = ["today", "yesterday", "this week", "earlier"];
 
     /// The conversations pane drawn over the whole terminal, as one string per
-    /// row with the trailing blanks cut.
-    fn rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    /// row with the trailing blanks cut. The type tests below draw with it too.
+    pub(super) fn rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw_convs(frame, app, frame.area())).unwrap();
@@ -2214,14 +2225,14 @@ mod conv_age_tests {
             app.apply_filter();
             assert!(age_lines(&rows(&mut app, 60, 20)).is_empty(), "{sort:?}");
         }
-        // `s` cycles Recent -> Size -> Mine -> Name -> Recent.
+        // `s` cycles Recent -> Size -> Type -> Mine -> Name -> Recent.
         app.sort = Sort::Recent;
         app.focus = Focus::Convs;
         let s = || KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
         app.on_key(s());
         assert_ne!(app.sort, Sort::Recent);
         assert!(age_lines(&rows(&mut app, 60, 20)).is_empty());
-        for _ in 0..3 {
+        for _ in 0..4 {
             app.on_key(s());
         }
         assert_eq!(app.sort, Sort::Recent);
@@ -2374,5 +2385,324 @@ mod conv_age_tests {
                 "cursor {cursor} on {name}: {rows:#?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod conv_type_tests {
+    use super::conv_age_tests::rows;
+    use super::*;
+    use crate::app::tests::type_test_app;
+    use crate::app::Sort;
+    use crate::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::{json, Value};
+
+    const NOW: i64 = 1_700_000_000;
+    const HOUR: i64 = 60 * 60;
+    /// The seven labels, in the order the pane lists the types.
+    const LABELS: [&str; 7] = [
+        "public channels",
+        "private channels",
+        "Slack Connect channels",
+        "direct messages",
+        "group direct messages",
+        "direct messages with apps",
+        "archived",
+    ];
+
+    /// A divider names its group between two bars, so the bar on the right is
+    /// what tells `direct messages` from `direct messages with apps`: only the
+    /// shorter label's own line has one directly after it.
+    fn is_line(row: &str, label: &str) -> bool {
+        row.contains(&format!("─ {label} ─"))
+    }
+
+    /// The type dividers the pane drew, top to bottom.
+    fn type_lines(rows: &[String]) -> Vec<&'static str> {
+        rows.iter()
+            .filter_map(|row| LABELS.into_iter().find(|label| is_line(row, label)))
+            .collect()
+    }
+
+    /// The row a divider is on.
+    fn line_at(rows: &[String], label: &str) -> usize {
+        rows.iter()
+            .position(|row| is_line(row, label))
+            .unwrap_or_else(|| panic!("no {label:?} divider in {rows:#?}"))
+    }
+
+    /// The row a conversation is on.
+    fn row_of(rows: &[String], name: &str) -> usize {
+        rows.iter()
+            .position(|row| row.contains(name))
+            .unwrap_or_else(|| panic!("no {name:?} row in {rows:#?}"))
+    }
+
+    /// A public channel, unshared and unarchived.
+    fn public(name: &str) -> Value {
+        json!({ "name": name, "is_member": true })
+    }
+
+    /// One conversation of each of the seven types, in the order they are
+    /// listed here, with distinct ages so nothing about the order inside a
+    /// type is left to chance.
+    fn one_of_each() -> Vec<(&'static str, Value, Option<i64>)> {
+        vec![
+            ("#public", public("public"), Some(HOUR)),
+            (
+                "#private",
+                json!({"name":"private","is_private":true,"is_member":true}),
+                Some(2 * HOUR),
+            ),
+            (
+                "#connect",
+                json!({"name":"connect","is_shared":true,"is_member":true}),
+                Some(3 * HOUR),
+            ),
+            ("@alice", json!({"user":"UHUMAN","is_im":true}), Some(4 * HOUR)),
+            (
+                "@group",
+                json!({"name":"mpdm-alice--bob-1","is_mpim":true}),
+                Some(5 * HOUR),
+            ),
+            ("@appbot", json!({"user":"UBOT","is_im":true}), Some(6 * HOUR)),
+            (
+                "#retired",
+                json!({"name":"retired","is_archived":true,"is_member":true}),
+                Some(7 * HOUR),
+            ),
+        ]
+    }
+
+    /// The seven types, one conversation each, in the order the pane lists
+    /// them, every conversation directly above the line that names its type.
+    #[test]
+    fn seven_types_draw_the_seven_lines_in_order() {
+        let convs = one_of_each();
+        let mut app = type_test_app(NOW, &convs);
+        app.sort = Sort::Type;
+        app.apply_filter();
+        let rows = rows(&mut app, 60, 30);
+        assert_eq!(type_lines(&rows), LABELS, "{rows:#?}");
+        for (label, (name, _, _)) in LABELS.into_iter().zip(&convs) {
+            let at = line_at(&rows, label);
+            assert!(rows[at - 1].contains(name), "{label}: {:?}", rows[at - 1]);
+        }
+        // Every conversation carries a closing line here, and `j` steps over
+        // each of them onto the next conversation rather than onto the line.
+        app.focus = Focus::Convs;
+        app.conv_cursor = 0;
+        for (k, (name, _, _)) in convs.iter().enumerate().skip(1) {
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+            assert_eq!(app.conv_cursor, k);
+            assert_eq!(&app.conv(app.filtered[app.conv_cursor]).name, name);
+        }
+    }
+
+    /// Only `Type` puts the list in type order, so only `Type` names the
+    /// types: the same seven conversations under `recent` draw none of the
+    /// lines, and `s` brings them back on the very next render.
+    #[test]
+    fn no_other_sort_names_a_type() {
+        let mut app = type_test_app(NOW, &one_of_each());
+        assert_eq!(app.sort, Sort::Recent);
+        assert!(type_lines(&rows(&mut app, 60, 30)).is_empty());
+        for sort in [Sort::Name, Sort::Mine, Sort::Size] {
+            app.sort = sort;
+            app.apply_filter();
+            assert!(type_lines(&rows(&mut app, 60, 30)).is_empty(), "{sort:?}");
+        }
+        app.sort = Sort::Type;
+        app.apply_filter();
+        assert_eq!(type_lines(&rows(&mut app, 60, 30)), LABELS);
+    }
+
+    /// A `/find` needle re-sorts the list by how closely each name matches it,
+    /// which breaks the type order, so no line is drawn while one is typed.
+    #[test]
+    fn a_typed_filter_names_no_type() {
+        let mut app = type_test_app(
+            NOW,
+            &[("#public", public("public"), Some(HOUR)), ("@alice", json!({"user":"UHUMAN","is_im":true}), Some(2 * HOUR))],
+        );
+        app.sort = Sort::Type;
+        app.apply_filter();
+        assert_eq!(type_lines(&rows(&mut app, 60, 20)), ["public channels", "direct messages"]);
+        app.filter = "a".to_string();
+        app.apply_filter();
+        assert!(type_lines(&rows(&mut app, 60, 20)).is_empty());
+        app.filter.clear();
+        app.apply_filter();
+        assert_eq!(type_lines(&rows(&mut app, 60, 20)), ["public channels", "direct messages"]);
+    }
+
+    /// Inside a type the order is `recent`: two public channels come out
+    /// newest first, under the one line that closes their type.
+    #[test]
+    fn two_public_channels_are_newest_first() {
+        let mut app = type_test_app(
+            NOW,
+            &[("#older", public("older"), Some(2 * HOUR)), ("#newer", public("newer"), Some(HOUR))],
+        );
+        app.sort = Sort::Type;
+        app.apply_filter();
+        let rows = rows(&mut app, 60, 20);
+        assert_eq!(type_lines(&rows), ["public channels"]);
+        let line = line_at(&rows, "public channels");
+        assert!(rows[line - 2].contains("#newer"), "{rows:#?}");
+        assert!(rows[line - 1].contains("#older"), "{rows:#?}");
+    }
+
+    /// Either shared flag on its own makes a channel Slack Connect, public or
+    /// private; the channels without them stay in their own types. Slack
+    /// Connect is a shared channel, so the same flag on a direct message
+    /// leaves it among the direct messages.
+    #[test]
+    fn either_shared_flag_lands_in_slack_connect() {
+        let mut app = type_test_app(
+            NOW,
+            &[
+                ("#public", public("public"), Some(HOUR)),
+                ("#private", json!({"name":"private","is_private":true,"is_member":true}), Some(2 * HOUR)),
+                ("#shared-public", json!({"name":"sp","is_shared":true,"is_member":true}), Some(3 * HOUR)),
+                (
+                    "#shared-private",
+                    json!({"name":"spriv","is_private":true,"is_ext_shared":true,"is_member":true}),
+                    Some(4 * HOUR),
+                ),
+                (
+                    "@shared-alice",
+                    json!({"user":"UHUMAN","is_im":true,"is_shared":true,"is_ext_shared":true}),
+                    Some(5 * HOUR),
+                ),
+            ],
+        );
+        app.sort = Sort::Type;
+        app.apply_filter();
+        let rows = rows(&mut app, 60, 20);
+        assert_eq!(
+            type_lines(&rows),
+            ["public channels", "private channels", "Slack Connect channels", "direct messages"],
+            "{rows:#?}"
+        );
+        let connect = line_at(&rows, "Slack Connect channels");
+        assert!(rows[connect - 2].contains("#shared-public"), "{rows:#?}");
+        assert!(rows[connect - 1].contains("#shared-private"), "{rows:#?}");
+        assert!(rows[line_at(&rows, "public channels") - 1].contains("#public"));
+        assert!(rows[line_at(&rows, "private channels") - 1].contains("#private"));
+        assert!(rows[line_at(&rows, "direct messages") - 1].contains("@shared-alice"), "{rows:#?}");
+    }
+
+    /// A direct message is one with an app when its counterpart's user record
+    /// says `is_bot`, and when it is Slackbot, whose record does not carry the
+    /// flag. A counterpart with no user record, and one the archive cannot
+    /// name at all, are both people.
+    #[test]
+    fn a_bot_counterpart_makes_a_direct_message_an_app_one() {
+        let mut app = type_test_app(
+            NOW,
+            &[
+                ("@appbot", json!({"user":"UBOT","is_im":true}), Some(HOUR)),
+                ("@alice", json!({"user":"UHUMAN","is_im":true}), Some(HOUR)),
+                ("@slackbot", json!({"user":"USLACKBOT","is_im":true}), Some(2 * HOUR)),
+                ("@nobody", json!({"is_im":true}), Some(2 * HOUR)),
+                ("@stranger", json!({"user":"UNKNOWN","is_im":true}), Some(3 * HOUR)),
+            ],
+        );
+        app.sort = Sort::Type;
+        app.apply_filter();
+        let rows = rows(&mut app, 60, 20);
+        assert_eq!(type_lines(&rows), ["direct messages", "direct messages with apps"], "{rows:#?}");
+        let people = line_at(&rows, "direct messages");
+        let apps = line_at(&rows, "direct messages with apps");
+        for name in ["@alice", "@nobody", "@stranger"] {
+            assert!(row_of(&rows, name) < people, "{name} above the people line: {rows:#?}");
+        }
+        for name in ["@appbot", "@slackbot"] {
+            assert!(
+                (people..apps).contains(&row_of(&rows, name)),
+                "{name} between the two lines: {rows:#?}"
+            );
+        }
+    }
+
+    /// Archived outranks every other rule: an archived Slack Connect channel
+    /// and an archived direct message with an app are both archived, under the
+    /// one line that closes the list.
+    #[test]
+    fn archived_outranks_the_other_rules() {
+        let mut app = type_test_app(
+            NOW,
+            &[
+                ("#public", public("public"), Some(3 * HOUR)),
+                (
+                    "#retired-connect",
+                    json!({"name":"rc","is_shared":true,"is_archived":true,"is_member":true}),
+                    Some(HOUR),
+                ),
+                (
+                    "@retired-appbot",
+                    json!({"user":"UBOT","is_im":true,"is_archived":true}),
+                    Some(2 * HOUR),
+                ),
+            ],
+        );
+        app.sort = Sort::Type;
+        app.apply_filter();
+        let rows = rows(&mut app, 60, 20);
+        assert_eq!(type_lines(&rows), ["public channels", "archived"], "{rows:#?}");
+        let archived = line_at(&rows, "archived");
+        assert!(rows[archived - 2].contains("#retired-connect"), "{rows:#?}");
+        assert!(rows[archived - 1].contains("@retired-appbot"), "{rows:#?}");
+        assert!(rows[line_at(&rows, "public channels") - 1].contains("#public"));
+    }
+
+    /// The precedence every sort has holds here too: a starred conversation
+    /// sits above the types however low its own type is, and a muted one below
+    /// them; neither is grouped, so neither carries or moves a line.
+    #[test]
+    fn a_starred_app_direct_message_sits_above_the_public_channels() {
+        let mut app = type_test_app(
+            NOW,
+            &[
+                ("#public", public("public"), Some(HOUR)),
+                ("@appbot", json!({"user":"UBOT","is_im":true}), Some(2 * HOUR)),
+                ("#quiet", public("quiet"), Some(3 * HOUR)),
+            ],
+        );
+        app.sort = Sort::Type;
+        app.starred.insert("C2".to_string());
+        app.muted.insert("C3".to_string());
+        app.apply_filter();
+        let rows = rows(&mut app, 60, 20);
+        assert_eq!(type_lines(&rows), ["public channels"], "{rows:#?}");
+        let starred = row_of(&rows, "@appbot");
+        let public = row_of(&rows, "#public");
+        let muted = row_of(&rows, "#quiet");
+        assert!(starred < public, "{rows:#?}");
+        assert_eq!(line_at(&rows, "public channels"), public + 1, "{rows:#?}");
+        assert_eq!(muted, public + 2, "{rows:#?}");
+    }
+
+    /// `s` from `size` reaches `type`, and `s` again `my activity`; both the
+    /// pane title and the status line name the sort the way the others are
+    /// named.
+    #[test]
+    fn s_from_size_reaches_type_and_then_my_activity() {
+        let mut app = type_test_app(NOW, &[("#public", public("public"), Some(HOUR))]);
+        app.sort = Sort::Size;
+        app.focus = Focus::Convs;
+        app.apply_filter();
+        let s = || KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        app.on_key(s());
+        assert_eq!(app.sort, Sort::Type);
+        assert_eq!(app.sort_label(), "type");
+        assert_eq!(app.status, "sorted by type");
+        let drawn = rows(&mut app, 60, 20);
+        assert!(drawn[0].contains("by type"), "{:?}", drawn[0]);
+        assert_eq!(type_lines(&drawn), ["public channels"]);
+        app.on_key(s());
+        assert_eq!(app.sort, Sort::Mine);
+        assert!(type_lines(&rows(&mut app, 60, 20)).is_empty());
     }
 }

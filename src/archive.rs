@@ -21,6 +21,9 @@ pub const ARCHIVE_SETS: [&str; 3] = ["full", "dms", "threads"];
 pub const PAGE: usize = 200;
 /// Cap on search candidates fetched from SQL.
 pub const SEARCH_CAP: usize = 500;
+/// Slackbot's user id. Its `S_USER` row carries no `is_bot`, so anything
+/// asking whether a user is an app has to name it.
+pub const SLACKBOT: &str = "USLACKBOT";
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Kind {
@@ -50,6 +53,35 @@ pub enum Counterpart {
     Ambiguous(usize),
     /// The archive owner is unknown, so no member can be ruled out.
     OwnerUnknown(usize),
+}
+
+impl Counterpart {
+    /// The rule `im_counterpart` applies, over what the caller already holds:
+    /// the channel object's own `user` field, the channel's members, and the
+    /// archive owner. Kept apart from the queries so that `scan_convs`, which
+    /// has both in memory for every channel at once, settles the counterpart
+    /// the same way without a query per conversation.
+    pub fn resolve(im_user: Option<&str>, members: &[String], me: Option<&str>) -> Counterpart {
+        if let Some(user) = im_user.filter(|user| !user.is_empty()) {
+            return Counterpart::User(user.to_string());
+        }
+        let Some(me) = me else {
+            return Counterpart::OwnerUnknown(members.len());
+        };
+        let mut others = members.iter().filter(|user| user.as_str() != me);
+        match (others.next(), others.next()) {
+            (Some(user), None) => Counterpart::User(user.clone()),
+            _ => Counterpart::Ambiguous(members.len()),
+        }
+    }
+
+    /// The user this named, when it named one.
+    pub fn user(&self) -> Option<&str> {
+        match self {
+            Counterpart::User(user) => Some(user),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -110,6 +142,16 @@ pub struct Conv {
     pub name: String,
     pub kind: Kind,
     pub archived: bool,
+    /// `is_shared` or `is_ext_shared` on the channel object: the conversation
+    /// is shared with another organization, which is what makes it a Slack
+    /// Connect conversation. The flags are authoritative; the name is not.
+    pub shared: bool,
+    /// The other side of a direct message, as `im_counterpart` settles it, and
+    /// `None` for every other kind and for a direct message whose counterpart
+    /// the archive cannot name. Kept rather than the answer to "is this an
+    /// app", so that a user record learned later — from a live profile fetch
+    /// after the archive was scanned — decides it on the next sort.
+    pub im_counterpart: Option<String>,
     /// Distinct message timestamps, the same figure `slq cache list` shows.
     pub msgs: i64,
     /// Messages written by the archive's owner, replies included.
@@ -903,7 +945,7 @@ impl Archive {
     }
 
     pub fn user_name(&self, uid: &str) -> String {
-        if uid == "USLACKBOT" {
+        if uid == SLACKBOT {
             return "Slackbot".to_string();
         }
         self.user(uid).unwrap_or_else(|| uid.to_string())
@@ -964,12 +1006,11 @@ impl Archive {
     /// picking a member — a group conversation misfiled as an IM would
     /// otherwise open an arbitrary person's user object.
     pub fn im_counterpart(&self, cid: &str, me: Option<&str>) -> Result<Counterpart, String> {
-        if let Some(user) = self
+        let im_user = self
             .channel_json(cid)?
-            .and_then(|channel| channel["user"].as_str().map(str::to_string))
-            .filter(|user| !user.is_empty())
-        {
-            return Ok(Counterpart::User(user));
+            .and_then(|channel| channel["user"].as_str().map(str::to_string));
+        if let Some(user) = im_user.as_deref().filter(|user| !user.is_empty()) {
+            return Ok(Counterpart::User(user.to_string()));
         }
         let mut stmt = self
             .conn
@@ -983,14 +1024,7 @@ impl Archive {
             .map_err(|error| error.to_string())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        let Some(me) = me else {
-            return Ok(Counterpart::OwnerUnknown(members.len()));
-        };
-        let mut others = members.iter().filter(|user| user.as_str() != me);
-        match (others.next(), others.next()) {
-            (Some(user), None) => Ok(Counterpart::User(user.clone())),
-            _ => Ok(Counterpart::Ambiguous(members.len())),
-        }
+        Ok(Counterpart::resolve(im_user.as_deref(), &members, me))
     }
 
     pub fn channel_name(&self, cid: &str) -> Option<String> {
@@ -1011,15 +1045,21 @@ impl Archive {
             name: String,
             kind: Kind,
             archived: bool,
+            shared: bool,
             im_user: Option<String>,
             members: Vec<String>,
+            /// A `CHANNEL_USER` row of this channel whose user id could not be
+            /// read — a NULL among them, say. The membership is then not a
+            /// membership this can reason about.
+            members_unreadable: bool,
         }
         let mut meta: HashMap<String, Meta> = HashMap::new();
         {
             let mut stmt = self.conn.prepare(
                 "SELECT ID, NAME, json_extract(DATA, '$.is_im'), json_extract(DATA, '$.is_mpim'), \
                  json_extract(DATA, '$.is_private'), json_extract(DATA, '$.is_archived'), \
-                 json_extract(DATA, '$.user') FROM CHANNEL ORDER BY CHUNK_ID",
+                 json_extract(DATA, '$.user'), json_extract(DATA, '$.is_shared'), \
+                 json_extract(DATA, '$.is_ext_shared') FROM CHANNEL ORDER BY CHUNK_ID",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -1030,9 +1070,13 @@ impl Archive {
                     r.get::<_, Option<i64>>(4)?,
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
                 ))
             })?;
-            for (id, name, is_im, is_mpim, is_private, is_archived, im_user) in rows.flatten() {
+            for (id, name, is_im, is_mpim, is_private, is_archived, im_user, is_shared, is_ext_shared) in
+                rows.flatten()
+            {
                 let kind = if is_im.unwrap_or(0) != 0 {
                     Kind::Im
                 } else if is_mpim.unwrap_or(0) != 0 {
@@ -1050,8 +1094,14 @@ impl Archive {
                         name,
                         kind,
                         archived: is_archived.unwrap_or(0) != 0,
+                        // Either flag makes it a Slack Connect conversation:
+                        // `is_shared` is set on a channel shared at all,
+                        // `is_ext_shared` on one shared outside the workspace,
+                        // and a channel can carry one without the other.
+                        shared: is_shared.unwrap_or(0) != 0 || is_ext_shared.unwrap_or(0) != 0,
                         im_user,
                         members: Vec::new(),
+                        members_unreadable: false,
                     },
                 );
             }
@@ -1060,11 +1110,18 @@ impl Archive {
             let mut stmt = self
                 .conn
                 .prepare("SELECT DISTINCT CHANNEL_ID, USER_ID FROM CHANNEL_USER")?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            // The user id is read inside the row rather than as part of it, so
+            // a row that cannot be read still says which channel it belonged
+            // to. Dropping it silently is what `im_counterpart` refuses to do:
+            // one member fewer can leave exactly one other member and settle a
+            // direct message's counterpart on the wrong person.
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1))))?;
             for (cid, uid) in rows.flatten() {
                 if let Some(m) = meta.get_mut(&cid) {
-                    m.members.push(uid);
+                    match uid {
+                        Ok(uid) => m.members.push(uid),
+                        Err(_) => m.members_unreadable = true,
+                    }
                 }
             }
         }
@@ -1094,13 +1151,35 @@ impl Archive {
         let half_life_secs = half_life_days.max(0.01) * 86_400.0;
         let mut convs = Vec::new();
         for (cid, st) in stats.channels {
-            let (name, kind, archived) = match meta.get(&cid) {
+            // A conversation with messages but no channel row is a public
+            // channel with nothing known about it: not shared, and with no
+            // counterpart to name.
+            let (name, kind, archived, shared, im_counterpart) = match meta.get(&cid) {
                 Some(m) => (
                     self.display_name(&cid, m.kind, &m.name, m.im_user.as_deref(), &m.members, me),
                     m.kind,
                     m.archived,
+                    m.shared,
+                    (m.kind == Kind::Im)
+                        .then(|| {
+                            // Where the channel object names the counterpart
+                            // the membership is not consulted at all, exactly
+                            // as `im_counterpart` returns before querying it.
+                            // Without one, a membership carrying a row that
+                            // could not be read names nobody: `im_counterpart`
+                            // fails on the same archive, and a counterpart
+                            // that cannot be resolved counts as a person.
+                            let named = m.im_user.as_deref().filter(|user| !user.is_empty());
+                            if named.is_none() && m.members_unreadable {
+                                return None;
+                            }
+                            Counterpart::resolve(named, &m.members, me)
+                                .user()
+                                .map(str::to_string)
+                        })
+                        .flatten(),
                 ),
-                None => (cid.clone(), Kind::Channel, false),
+                None => (cid.clone(), Kind::Channel, false, false, None),
             };
             let score: f64 = st
                 .mine
@@ -1113,6 +1192,8 @@ impl Archive {
                 name,
                 kind,
                 archived,
+                shared,
+                im_counterpart,
                 msgs: st.msgs,
                 mine: st.mine.len() as i64,
                 score,
@@ -2130,6 +2211,177 @@ mod union_tests {
         assert_eq!(archive.search("C1","message",14).unwrap().len(),13);
         drop(corpus);
         drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// What `scan_convs` reads off a real `CHANNEL` row for the `Type` sort: the
+/// shared flags and the counterpart of a direct message.
+#[cfg(test)]
+mod conv_type_scan_tests {
+    use super::*;
+
+    /// An archive whose channels are the ones given as `(id, name, flags)`,
+    /// each with one message so it reaches the conversation list, and whose
+    /// `CHANNEL_USER` rows are the memberships given.
+    fn database(dir: &Path, channels: &[(&str, &str, Value)], members: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let conn = Connection::open(dir.join("slackdump.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE CHUNK(ID INTEGER, UNIX_TS INTEGER);
+             CREATE TABLE CHANNEL(ID TEXT, NAME TEXT, DATA BLOB, CHUNK_ID INTEGER);
+             CREATE TABLE CHANNEL_USER(CHANNEL_ID TEXT, USER_ID TEXT);
+             CREATE TABLE MESSAGE(ID INTEGER, CHUNK_ID INTEGER, CHANNEL_ID TEXT, TS TEXT,
+                 PARENT_ID INTEGER, THREAD_TS TEXT, IS_PARENT INTEGER, LATEST_REPLY TEXT,
+                 TXT TEXT, DATA BLOB);
+             INSERT INTO CHUNK VALUES(1,100);",
+        )
+        .unwrap();
+        for (index, (id, name, flags)) in channels.iter().enumerate() {
+            let mut data = flags.clone();
+            data["id"] = serde_json::json!(id);
+            data["name"] = serde_json::json!(name);
+            conn.execute(
+                "INSERT INTO CHANNEL VALUES(?1,?2,?3,1)",
+                params![id, name, data.to_string().into_bytes()],
+            )
+            .unwrap();
+            let ts = format!("{}.000000", index + 1);
+            let data = serde_json::json!({"text":"hi","ts":ts,"user":"U1"})
+                .to_string()
+                .into_bytes();
+            conn.execute(
+                "INSERT INTO MESSAGE VALUES(?1,1,?2,?3,NULL,NULL,0,NULL,'hi',?4)",
+                params![(index as i64 + 1) * 1_000_000, id, ts, data],
+            )
+            .unwrap();
+        }
+        for (cid, uid) in members {
+            conn.execute("INSERT INTO CHANNEL_USER VALUES(?1,?2)", params![cid, uid])
+                .unwrap();
+        }
+    }
+
+    /// Either shared flag lands on `Conv::shared`, a channel with neither is
+    /// unshared, and a direct message's counterpart is the channel object's
+    /// own `user` where there is one and the single other member where the
+    /// membership settles it — and nobody where it does not.
+    #[test]
+    fn the_shared_flags_and_the_counterpart_come_off_the_channel_row() {
+        let root = std::env::temp_dir().join(format!(
+            "slack-conv-type-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        database(
+            &root,
+            &[
+                ("C1", "public", serde_json::json!({})),
+                ("C2", "connect", serde_json::json!({"is_shared":true})),
+                (
+                    "C3",
+                    "ext",
+                    serde_json::json!({"is_private":true,"is_ext_shared":true}),
+                ),
+                ("D1", "", serde_json::json!({"is_im":true,"user":"UBOT"})),
+                ("D2", "", serde_json::json!({"is_im":true})),
+                ("D3", "", serde_json::json!({"is_im":true})),
+            ],
+            // D2's membership settles its counterpart; D3's does not.
+            &[("D2", "U1"), ("D2", "U9"), ("D3", "U1"), ("D3", "U8"), ("D3", "U7")],
+        );
+        let mut archive = Archive::open("test".into(), &root).unwrap();
+        let convs = archive.scan_convs(0, Some("U1"), 30.0, None).unwrap();
+        let conv = |id: &str| {
+            convs
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no {id} in the scan"))
+        };
+        assert!(!conv("C1").shared);
+        assert!(conv("C2").shared);
+        assert!(conv("C3").shared);
+        assert_eq!(conv("C3").kind, Kind::Private);
+        assert_eq!(conv("D1").im_counterpart.as_deref(), Some("UBOT"));
+        assert_eq!(conv("D2").im_counterpart.as_deref(), Some("U9"));
+        assert_eq!(conv("D3").im_counterpart, None);
+        // A channel is not a direct message, whatever its members.
+        assert_eq!(conv("C1").im_counterpart, None);
+        drop(archive);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A membership row whose user id cannot be read is not a member to skip.
+    /// Dropping it would leave exactly one other member and settle the
+    /// counterpart on that one — typing a direct message as one with an app on
+    /// the strength of a row the scan could not read — while
+    /// `Archive::im_counterpart` fails on the same archive. The scan names
+    /// nobody instead, and a counterpart that cannot be resolved is a person.
+    /// The channel object's own `user` still answers where there is one: that
+    /// resolution never reaches the membership.
+    #[test]
+    fn an_unreadable_membership_row_leaves_a_direct_message_without_a_counterpart() {
+        let root = std::env::temp_dir().join(format!(
+            "slack-conv-type-null-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        database(
+            &root,
+            &[
+                ("D1", "", serde_json::json!({"is_im":true})),
+                ("D2", "", serde_json::json!({"is_im":true,"user":"UBOT"})),
+                ("D3", "", serde_json::json!({"is_im":true})),
+            ],
+            &[
+                ("D1", "U1"),
+                ("D1", "UBOT"),
+                ("D2", "U1"),
+                ("D2", "UBOT"),
+                ("D3", "U1"),
+                ("D3", "UBOT"),
+            ],
+        );
+        {
+            let conn = Connection::open(root.join("slackdump.sqlite")).unwrap();
+            // The row the scan used to drop: it belongs to D1 and D2, so both
+            // memberships carry one, and D3 keeps a readable membership.
+            for cid in ["D1", "D2"] {
+                conn.execute("INSERT INTO CHANNEL_USER VALUES(?1,NULL)", params![cid])
+                    .unwrap();
+            }
+        }
+        let mut archive = Archive::open("test".into(), &root).unwrap();
+        let convs = archive.scan_convs(0, Some("U1"), 30.0, None).unwrap();
+        let conv = |id: &str| {
+            convs
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no {id} in the scan"))
+        };
+        assert_eq!(conv("D1").im_counterpart, None);
+        // The channel object names D2's counterpart, so its membership, NULL
+        // row and all, is never read.
+        assert_eq!(conv("D2").im_counterpart.as_deref(), Some("UBOT"));
+        assert_eq!(conv("D3").im_counterpart.as_deref(), Some("UBOT"));
+        // The two answers agree: where the scan names nobody the method fails,
+        // and where the scan names somebody the method names the same user.
+        assert!(archive.im_counterpart("D1", Some("U1")).is_err());
+        assert_eq!(
+            archive.im_counterpart("D2", Some("U1")).unwrap(),
+            Counterpart::User("UBOT".to_string())
+        );
+        assert_eq!(
+            archive.im_counterpart("D3", Some("U1")).unwrap(),
+            Counterpart::User("UBOT".to_string())
+        );
+        drop(archive);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -12,7 +12,7 @@ use ratatui::text::Line;
 use serde_json::Value;
 
 use crate::api::Client;
-use crate::archive::{ts_to_id, Archive, Conv, Corpus, Counterpart, Kind, Msg, PAGE, SEARCH_CAP};
+use crate::archive::{ts_to_id, Archive, Conv, Corpus, Counterpart, Kind, Msg, PAGE, SEARCH_CAP, SLACKBOT};
 use crate::complete;
 use crate::edit::Editor;
 use crate::keys::{Action, Chord, Keymap, DEFAULTS};
@@ -44,6 +44,9 @@ pub enum Sort {
     Name,
     Recent,
     Size,
+    /// Grouped by Slack's conversation types, newest message first inside a
+    /// type. The pane names each type on a line under it.
+    Type,
 }
 
 impl Sort {
@@ -53,6 +56,7 @@ impl Sort {
             Sort::Name => "name",
             Sort::Recent => "recent",
             Sort::Size => "size",
+            Sort::Type => "type",
         }
     }
     fn next(self) -> Sort {
@@ -60,7 +64,8 @@ impl Sort {
             Sort::Mine => Sort::Name,
             Sort::Name => Sort::Recent,
             Sort::Recent => Sort::Size,
-            Sort::Size => Sort::Mine,
+            Sort::Size => Sort::Type,
+            Sort::Type => Sort::Mine,
         }
     }
 }
@@ -2331,6 +2336,25 @@ impl App {
         &self.corpus.convs[i]
     }
 
+    /// Which of Slack's conversation types a conversation is: what the `Type`
+    /// sort orders by and what the line under it names.
+    pub fn conv_type(&self, c: &Conv) -> crate::conv_type::ConvType {
+        crate::conv_type::ConvType::of(c.kind, c.archived, c.shared, self.is_app_dm(c))
+    }
+
+    /// A direct message whose counterpart is an app. An app appears in a
+    /// direct message as a bot user, so the counterpart's own record answers
+    /// — except Slackbot, whose record carries no `is_bot`, and which is named
+    /// here instead. A counterpart the archive could not settle, and one with
+    /// no user record at all, is a person: the flag is what makes it an app,
+    /// and nothing else may stand in for it.
+    fn is_app_dm(&self, c: &Conv) -> bool {
+        c.kind == Kind::Im
+            && c.im_counterpart
+                .as_deref()
+                .is_some_and(|user| user == SLACKBOT || self.corpus.user_is_bot(user))
+    }
+
     pub fn open_conv_ref(&self) -> Option<&Conv> {
         self.open.as_ref().map(|o| &self.corpus.convs[o.conv])
     }
@@ -2394,6 +2418,13 @@ impl App {
             }),
             Sort::Recent => idx.sort_by(|&a, &b| convs[b].last_id.cmp(&convs[a].last_id)),
             Sort::Size => idx.sort_by(|&a, &b| convs[b].msgs.cmp(&convs[a].msgs)),
+            // Slack's conversation types in the order `ConvType` declares
+            // them, and inside a type the `Recent` order, newest first.
+            Sort::Type => idx.sort_by(|&a, &b| {
+                self.conv_type(&convs[a])
+                    .cmp(&self.conv_type(&convs[b]))
+                    .then(convs[b].last_id.cmp(&convs[a].last_id))
+            }),
         }
         // Unread conversations first, in the same order among themselves;
         // a typed filter still puts the closer name matches above.
@@ -3553,9 +3584,14 @@ impl App {
             let s = |k: &str| ch.get(k).and_then(Value::as_str).unwrap_or("").to_string();
             let b = |k: &str| ch.get(k).and_then(Value::as_bool).unwrap_or(false);
             let raw = s("name");
+            // The counterpart of a live-only direct message is the channel
+            // object's own `user`, the same field the archive reads; an empty
+            // one names nobody rather than a user called "".
+            let mut im_counterpart = None;
             let (kind, name) = if b("is_im") {
                 let u = s("user");
                 self.dm_users.insert(id.clone(), u.clone());
+                im_counterpart = Some(u.clone()).filter(|u| !u.is_empty());
                 let n = self.corpus.user_name(&u).unwrap_or_else(|| u.clone());
                 (
                     Kind::Im,
@@ -3586,6 +3622,8 @@ impl App {
                 name,
                 kind,
                 archived: false,
+                shared: b("is_shared") || b("is_ext_shared"),
+                im_counterpart,
                 msgs: 0,
                 mine: 0,
                 score: 0.0,
@@ -8989,7 +9027,9 @@ pub(crate) mod tests {
         app.starred.insert("D1".into());
         app.muted.insert("D1".into());
         app.corpus.convs[0].unread = true;
-        for sort in [Sort::Name, Sort::Mine, Sort::Recent, Sort::Size] {
+        // Type comes first so the drawing below still runs under Size, the one
+        // sort in this list that draws no group divider of its own.
+        for sort in [Sort::Type, Sort::Name, Sort::Mine, Sort::Recent, Sort::Size] {
             app.sort = sort;
             app.apply_filter();
             assert_eq!(app.conv(app.filtered[0]).id, "D1");
@@ -9160,6 +9200,57 @@ pub(crate) mod tests {
         for (i, (_, age)) in convs.iter().enumerate() {
             app.corpus.convs[i].last_id = age.map_or(0, |age| (now - age) * 1_000_000);
             app.corpus.convs[i].live_only = false;
+        }
+        app.apply_filter();
+        app
+    }
+
+    /// An app on a pinned clock whose conversations are the ones described:
+    /// the name the pane is to draw, the channel object Slack would answer
+    /// with, and how old the newest message is — `None` for none at all, which
+    /// only matters for the order inside a type.
+    ///
+    /// The name is written over the one the merge derives, so a row stays
+    /// findable whatever the channel object says; `is_archived` is applied
+    /// here because the live membership merge does not read it. Two users are
+    /// known to the corpus: `UBOT` is an app and `UHUMAN` a person. `USLACKBOT`
+    /// is deliberately absent from the map, the way its own record carries no
+    /// `is_bot`, and so is `UNKNOWN`.
+    pub(crate) fn type_test_app(now: i64, convs: &[(&str, Value, Option<i64>)]) -> App {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        );
+        app.clock = Some(now);
+        app.corpus.merge_profiles(vec![
+            json!({"id":"UBOT","name":"appbot","is_bot":true}),
+            json!({"id":"UHUMAN","name":"alice"}),
+        ]);
+        app.merge_conversations(
+            convs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, channel, _))| {
+                    let mut channel = channel.clone();
+                    channel["id"] = json!(format!("C{}", i + 1));
+                    channel
+                })
+                .collect(),
+        );
+        for (i, (name, channel, age)) in convs.iter().enumerate() {
+            let conv = &mut app.corpus.convs[i];
+            conv.name = (*name).to_string();
+            conv.last_id = age.map_or(0, |age| (now - age) * 1_000_000);
+            conv.archived = channel["is_archived"].as_bool().unwrap_or(false);
+            conv.live_only = false;
         }
         app.apply_filter();
         app
