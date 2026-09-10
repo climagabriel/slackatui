@@ -159,6 +159,7 @@ fn unreads() -> App {
     app.stack.push(View::Unreads {
         list: MsgList::with_cards(vec![(msg(1000, "the first unread message"), card)]),
         deleted: Vec::new(),
+        fetched: Default::default(),
     });
     app
 }

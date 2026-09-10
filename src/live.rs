@@ -97,6 +97,11 @@ pub enum JobKind {
     Leave {
         conv: usize,
     },
+    /// The unread messages of one conversation, for an UNREADS card the
+    /// archive could not fill.
+    UnreadHistory {
+        cid: String,
+    },
     /// The channels muted in Slack itself.
     MutedChannels {
         gen: u64,
@@ -122,6 +127,7 @@ impl JobKind {
             Self::Profiles => "profiles", Self::Usergroups => "usergroups", Self::Counts {..} => "counts",
             Self::File {..} => "file", Self::Mark {..} => "mark", Self::Send {..} => "send", Self::Upload {..} => "upload",
             Self::Delete {..} => "delete", Self::Leave {..} => "leave",
+            Self::UnreadHistory {..} => "unread_history",
             Self::MutedChannels {..} => "muted_channels", Self::SetMuted => "set_muted",
             Self::StarredChannels {..} => "starred_channels", Self::SetStarred => "set_starred",
         }
@@ -148,6 +154,19 @@ pub enum Done {
         hits: Vec<Msg>,
         capped: bool,
         users: Vec<(usize, std::sync::Arc<std::collections::HashMap<String, crate::archive::User>>)>,
+    },
+    /// The unread messages of one conversation, straight from Slack, oldest
+    /// first. They go on the view's card and nowhere else: slackdump stays
+    /// the only writer of an archive. Which conversation they belong to
+    /// travels on the job's own `UnreadHistory` kind.
+    UnreadHistory {
+        msgs: Vec<Msg>,
+        /// The walk reached the read marker, so `msgs` is the whole unread
+        /// run and its first message is the first unread one. False when the
+        /// page cap or Slack's own count stopped the walk short: the oldest
+        /// message fetched is then only the oldest of a window, and the card
+        /// must not present it as the first unread message.
+        complete: bool,
     },
     Archived(PathBuf),
     Auth(Arc<Client>, String),
@@ -511,6 +530,117 @@ pub fn archive_scan(
             .filter_map(|(index, archive)| Some((*index, archive.loaded_users()?)))
             .collect();
         Ok(Done::ArchiveHits { hits, capped, users })
+    })
+}
+
+// ---------------------------------------------------------- unread fetch
+
+/// One conversation the UNREADS live phase asks Slack about.
+pub struct UnreadTarget {
+    pub cid: String,
+    /// The conversation as the list names it, for the progress line.
+    pub name: String,
+    /// The read marker, which the call passes as `oldest`, exclusive.
+    pub oldest: i64,
+    /// What Slack last said is unread there, where it said anything. Only a
+    /// count can say that a full page is not the whole run.
+    pub unread_count: Option<i64>,
+}
+
+/// Messages per `conversations.history` call.
+const UNREAD_PAGE: usize = 100;
+/// Calls per conversation. Three pages is three hundred unread messages, and
+/// a conversation past that is not one anybody reads off a card.
+const UNREAD_PAGES: usize = 3;
+
+/// The unread messages of one conversation from Slack: `conversations.history`
+/// from the read marker forward, newest first, a page at a time, walking
+/// `latest` back towards the marker. A page goes out only while Slack says
+/// there is more behind the one before it and its own count says the run is
+/// not covered yet.
+///
+/// Paging is driven by `has_more` and the cursor, never by a page coming back
+/// full: Slack is free to return fewer rows than the limit and still have
+/// more, and a fetch that stopped on a short page would report that short
+/// page as the whole unread run.
+///
+/// One HTTP request per turn of the loop, so `UNREAD_PAGES` caps the requests
+/// and not merely the pages that carried something. `history_page` would read
+/// through empty pages on its own, a hundred requests deep, with no way for
+/// this side to give up in the middle of them.
+///
+/// Narrates one line per request into `progress`, and that send is the
+/// cancellation check: the box holds the other end, so Esc stops the walk at
+/// the next request boundary rather than at the next conversation.
+pub fn api_unread_history(
+    client: Arc<Client>,
+    target: UnreadTarget,
+    progress: mpsc::Sender<ScanLine>,
+) -> Job {
+    let UnreadTarget { cid, name, oldest, unread_count } = target;
+    let label = format!("fetching the unread messages of {name}");
+    let channel = cid.clone();
+    spawn(JobKind::UnreadHistory { cid }, label, move || {
+        let marker = id_to_ts(oldest);
+        let mut collected: Vec<Msg> = Vec::new();
+        let mut complete = false;
+        // `latest` walks the pages back towards the marker; `oldest` stays
+        // where the reader left off, so every call names the same marker.
+        let mut latest: Option<String> = None;
+        // Set only while reading through a page that came back empty; a page
+        // with messages in it is walked from with `latest` instead.
+        let mut cursor: Option<String> = None;
+        for _ in 0..UNREAD_PAGES {
+            // `inclusive` is false, so the message the marker names — the
+            // last one the reader has read — is never part of the answer.
+            let (page, more, next) = crate::file_message::history_request(
+                &client,
+                &channel,
+                latest.as_deref(),
+                Some(&marker),
+                false,
+                UNREAD_PAGE,
+                cursor.as_deref(),
+            )?;
+            let got = page.len();
+            progress
+                .send(ScanLine::plain(format!(
+                    "conversations.history {name} oldest={marker} → {got} message{}",
+                    if got == 1 { "" } else { "s" }
+                )))
+                .map_err(|_| "unread fetch cancelled".to_string())?;
+            let edge = page.first().map(|message| id_to_ts(message.id));
+            // Each page is older than the one before it.
+            collected.splice(0..0, page);
+            if !more {
+                // Slack has nothing left between the marker and this page:
+                // the walk reached the marker and the run is whole.
+                complete = true;
+                break;
+            }
+            // Enough: Slack's count is covered by what came back, or, with no
+            // count to go by, a page carried something and that is as far as
+            // one card is worth reading. An empty page has collected nothing,
+            // so it is never enough — it is the case the cursor is for.
+            if !collected.is_empty()
+                && !unread_count.is_some_and(|count| (collected.len() as i64) < count)
+            {
+                break;
+            }
+            match edge {
+                // An empty page carries no bound to walk from, so the cursor
+                // is the only way on — and it costs one of the three
+                // requests, not a hundred.
+                None if !next.is_empty() => cursor = Some(next),
+                None => break,
+                Some(edge) => {
+                    cursor = None;
+                    latest = Some(edge);
+                }
+            }
+        }
+        collected.dedup_by_key(|message| message.id);
+        Ok(Done::UnreadHistory { msgs: collected, complete })
     })
 }
 

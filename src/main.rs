@@ -158,6 +158,20 @@ message the archive does hold instead; a conversation with no archived message
 at all draws a note in its place, and Enter opens it the way the list does,
 loading it from Slack when signed in.
 
+A signed-in session then fetches those cards' unread messages from Slack, one
+conversations.history call per conversation from the read marker forward,
+paging while Slack says there is more behind the page, at most three pages of
+a hundred, behind the same progress box /find draws. Each card that answers
+becomes an ordinary one on the messages that came back. Where the walk stops
+short of the marker, the card holds the newest of the unread run rather than
+all of it, and its header says so: \"400 unread · newest 300 fetched\", or
+\"100+ unread · newest 100 fetched\" where the count was reached and the marker
+was not. A conversation whose read marker Slack has not reported is not
+fetched, having no marker to fetch from. The messages live in the view for the
+session and reach no archive -- slackdump remains the only writer of one. Esc abandons the
+phase and keeps the cards it had already replaced; a rate-limit reply stops it
+and says so, leaving the rest as they were; r runs both phases again.
+
 Conversations default to recent order: newest message first. Starred, muted
 and search-match grouping take precedence. Press s to cycle recent,
 size, my activity, and name. My activity weights your messages by recency

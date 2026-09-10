@@ -62,6 +62,57 @@ pub fn newer(
     history_page(client, channel, None, Some(since), false, limit)
 }
 
+/// One page of `conversations.history`, sorted oldest first, with whether
+/// Slack says there is more behind it and the cursor that would ask for the
+/// next one. Exactly one HTTP request: a caller that needs the cursor
+/// followed does so itself, so it stays in charge of how many requests go out
+/// and can give up between them.
+pub fn history_request(
+    client: &Client,
+    channel: &str,
+    latest: Option<&str>,
+    oldest: Option<&str>,
+    inclusive: bool,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<(Vec<Msg>, bool, String), String> {
+    let count = limit.to_string();
+    let mut params = vec![
+        ("channel", channel),
+        ("inclusive", if inclusive { "true" } else { "false" }),
+        ("limit", count.as_str()),
+    ];
+    if let Some(latest) = latest {
+        params.push(("latest", latest));
+    }
+    if let Some(oldest) = oldest {
+        params.push(("oldest", oldest));
+    }
+    if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+        params.push(("cursor", cursor));
+    }
+    let response = client.call("conversations.history", &params)?;
+    let rows = response["messages"]
+        .as_array()
+        .ok_or("Slack returned no message list")?;
+    let mut messages: Vec<Msg> = rows
+        .iter()
+        .filter_map(|row| Msg::from_api(channel.into(), row.clone()))
+        .collect();
+    let next = response
+        .pointer("/response_metadata/next_cursor")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let more = response["has_more"].as_bool().unwrap_or(false) || !next.is_empty();
+    messages.sort_by_key(|message| message.id);
+    Ok((messages, more, next))
+}
+
+/// A page with messages in it: empty pages that say there is more are read
+/// through, following the cursor, until one carries something. Unbounded in
+/// requests as far as its caller is concerned, so it is not for a path that
+/// has to stay interruptible.
 pub fn history_page(
     client: &Client,
     channel: &str,
@@ -70,45 +121,19 @@ pub fn history_page(
     inclusive: bool,
     limit: usize,
 ) -> Result<(Vec<Msg>, bool), String> {
-    let count = limit.to_string();
     let mut cursor = String::new();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..100 {
-        let mut params = vec![
-            ("channel", channel),
-            ("inclusive", if inclusive { "true" } else { "false" }),
-            ("limit", count.as_str()),
-        ];
-        if let Some(latest) = latest {
-            params.push(("latest", latest));
-        }
-        if let Some(oldest) = oldest {
-            params.push(("oldest", oldest));
-        }
-        if !cursor.is_empty() {
-            params.push(("cursor", cursor.as_str()));
-        }
-        let response = client.call("conversations.history", &params)?;
-        let rows = response["messages"]
-            .as_array()
-            .ok_or("Slack returned no message list")?;
-        let mut messages: Vec<Msg> = rows
-            .iter()
-            .filter_map(|row| Msg::from_api(channel.into(), row.clone()))
-            .collect();
-        let next = response
-            .pointer("/response_metadata/next_cursor")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let more = response["has_more"].as_bool().unwrap_or(false) || !next.is_empty();
+        let (messages, more, next) = history_request(
+            client, channel, latest, oldest, inclusive, limit, Some(cursor.as_str()),
+        )?;
         if !messages.is_empty() || !more {
-            messages.sort_by_key(|message| message.id);
             return Ok((messages, more));
         }
-        if next.is_empty() || !seen.insert(next.to_string()) {
+        if next.is_empty() || !seen.insert(next.clone()) {
             return Err("Slack history pagination did not advance".into());
         }
-        cursor = next.into();
+        cursor = next;
     }
     Err("Slack returned too many empty history pages; retry the lookup".into())
 }

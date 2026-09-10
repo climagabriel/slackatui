@@ -295,6 +295,19 @@ impl MsgList {
         Some(card.hidden + card.tail.len() as i64 + 1)
     }
 
+    /// Put a rebuilt card in place of item `at`. Taking the pair is what
+    /// keeps `msgs` and `cards` aligned, the same reason `with_cards` takes
+    /// pairs; the cursor stays where it is, the item standing for the same
+    /// conversation before and after.
+    pub fn replace_card(&mut self, at: usize, lead: Msg, card: render::Card) {
+        if at >= self.msgs.len() || at >= self.cards.len() {
+            return;
+        }
+        self.msgs[at] = lead;
+        self.cards[at] = card;
+        self.mark_dirty();
+    }
+
     /// Drop item `at`, its card with it, and keep the cursor in range.
     pub fn remove(&mut self, at: usize) {
         self.msgs.remove(at);
@@ -721,10 +734,56 @@ pub struct ArchiveSearch {
     unwatched: Option<std::sync::mpsc::Receiver<crate::live::ScanLine>>,
 }
 
+/// The Slack half of UNREADS: the fallback cards whose unread messages are
+/// still to come from Slack, one conversation at a time.
+pub struct UnreadFetch {
+    /// Conversations not asked about yet, in the order the cards are drawn.
+    queue: std::collections::VecDeque<live::UnreadTarget>,
+    /// Where the reader was when the phase started. A different generation
+    /// when a page lands means they have gone elsewhere, and it lands nowhere.
+    nav_generation: u64,
+    /// Cloned into every call's worker, which narrates through it. The box
+    /// holds the other end, so dropping the box ends the call in flight.
+    progress: std::sync::mpsc::Sender<crate::live::ScanLine>,
+    /// Fallback cards replaced so far, out of the conversations asked about.
+    replaced: usize,
+    asked: usize,
+}
+
 /// The `/find` progress box: what the archive scan has said so far, and
 /// whether a Slack search for the same query is still out. It is drawn while
 /// it exists and dropped when the last phase lands.
+/// One conversation's unread messages as Slack handed them over, kept for as
+/// long as the UNREADS view lives. The card draws four of them; the rest are
+/// here, because the archive cannot be asked for them — the fetch exists
+/// exactly because it does not hold them — and a delete that takes the drawn
+/// ones off has to come back for the next.
+pub struct UnreadRun {
+    /// Oldest first, as the fetch collected them.
+    pub msgs: Vec<Msg>,
+    /// The walk reached the read marker, so `msgs` is the whole unread run.
+    pub complete: bool,
+    /// What Slack said was unread when the fetch ran.
+    pub claimed: Option<i64>,
+}
+
+/// Which phase a progress box belongs to. A job that lands after its own box
+/// is gone must not write into, or close, the box a later phase opened: the
+/// two share one slot, and closing another phase's box drops the channel its
+/// worker narrates through, which stops that phase mid-call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanOwner {
+    /// `/find`, across both its halves: the archive scan and the Slack search.
+    Search,
+    /// The UNREADS live phase.
+    UnreadFetch,
+}
+
 pub struct ScanOverlay {
+    /// The phase that opened the box, and the navigation generation it was
+    /// opened under. Both have to match for a landing job to touch it.
+    pub owner: ScanOwner,
+    pub nav_generation: u64,
     /// The command as typed, shown as the box's title.
     pub label: String,
     pub lines: Vec<crate::live::ScanLine>,
@@ -744,6 +803,8 @@ impl ScanOverlay {
     pub(crate) fn for_test(label: &str, lines: Vec<crate::live::ScanLine>) -> ScanOverlay {
         let (_sender, progress) = std::sync::mpsc::channel();
         ScanOverlay {
+            owner: ScanOwner::Search,
+            nav_generation: 0,
             label: label.to_string(),
             lines,
             started: Instant::now(),
@@ -802,6 +863,10 @@ pub enum View {
         /// keeps what Slack no longer has, so a card rebuilt from it would
         /// hand these back; every rebuild leaves them out.
         deleted: Vec<(String, i64)>,
+        /// What the live phase fetched, by channel. A card rebuilt after a
+        /// delete is built from this before the archive is tried; a refresh
+        /// clears it and fetches again.
+        fetched: HashMap<String, UnreadRun>,
     },
     /// `/colorpalette`: edit semantic UI colors with a live preview.
     ColorPalette {
@@ -901,6 +966,8 @@ pub struct App {
     pub scan: Option<Job>,
     /// The progress box a running `/find` draws over everything else.
     pub scan_overlay: Option<ScanOverlay>,
+    /// The UNREADS live phase, while it has conversations left to fetch.
+    unread_fetch: Option<UnreadFetch>,
     /// The archive scan in flight and what to do with what it finds.
     pending_search: Option<ArchiveSearch>,
     /// Holds the next scan's worker until a test lets it run.
@@ -1066,6 +1133,7 @@ impl App {
             job: None,
             scan: None,
             scan_overlay: None,
+            unread_fetch: None,
             pending_search: None,
             #[cfg(test)]
             scan_gate: None,
@@ -2126,7 +2194,7 @@ impl App {
     /// and by a rebuild from the archive when the card drew nothing else but
     /// still counts messages it did not draw.
     fn drop_from_unreads(&mut self, view: usize, cid: &str, id: i64) {
-        let Some(View::Unreads { list, deleted }) = self.stack.get_mut(view) else { return };
+        let Some(View::Unreads { list, deleted, .. }) = self.stack.get_mut(view) else { return };
         deleted.push((cid.to_string(), id));
         let skip = Self::deleted_in(deleted, cid);
         // What each card stood for before the delete: the header carries that
@@ -2170,10 +2238,19 @@ impl App {
             }
         }
         let Some(at) = refill else { return };
-        let rebuilt = self
-            .corpus
-            .conv_by_channel(cid)
-            .and_then(|index| self.refill_unread_card(index, &skip));
+        let Some(index) = self.corpus.conv_by_channel(cid) else { return };
+        // What the live phase fetched first. The archive is what could not
+        // build this card in the first place, so asking it for the messages
+        // the card still counts drops a card that has unread messages left.
+        let name = self.corpus.convs[index].name.clone();
+        let last_id = self.corpus.convs[index].last_id;
+        let rebuilt = match self.stack.get(view) {
+            Some(View::Unreads { fetched, .. }) => fetched
+                .get(cid)
+                .and_then(|run| Self::fetched_unread_card(name, run, &skip, last_id)),
+            _ => None,
+        }
+        .or_else(|| self.refill_unread_card(index, &skip));
         let Some(View::Unreads { list, .. }) = self.stack.get_mut(view) else { return };
         match rebuilt {
             Some((lead, card)) => {
@@ -2885,6 +2962,7 @@ impl App {
         self.scan = None;
         self.scan_overlay = None;
         self.pending_search = None;
+        self.unread_fetch = None;
     }
 
     pub fn open_thread_in(&mut self, cid: String, root: i64, focus: i64) {
@@ -3205,6 +3283,8 @@ impl App {
         let label = label.trim();
         let label = if label.starts_with('/') { label.to_string() } else { format!("/{label}") };
         self.scan_overlay = Some(ScanOverlay {
+            owner: ScanOwner::Search,
+            nav_generation: self.nav_generation,
             label,
             lines: Vec::new(),
             started: Instant::now(),
@@ -3219,7 +3299,7 @@ impl App {
     fn finish_archive_search(&mut self, query: &str, hits: Vec<Msg>, capped: bool) {
         let Some(pending) = self.pending_search.take().filter(|p| p.query == query) else {
             self.status = format!("{} archive hits arrived after their view closed", hits.len());
-            self.close_scan_overlay();
+            self.close_scan_overlay(ScanOwner::Search);
             return;
         };
         // The reader navigated while this ran. A search of one conversation
@@ -3243,21 +3323,54 @@ impl App {
             else if self.live && self.job.is_some() { "; Slack was not searched: another request is running; retry when it finishes" } else { "" });
         if go_live {
             let slack_query = match &pending.cid { Some(cid) => format!("in:<#{cid}> {}", pending.slack), None => pending.slack.clone() };
-            self.say_in_scan(live::ScanLine::dim(format!("search.messages query={slack_query:?}")));
+            self.say_in_scan(ScanOwner::Search, live::ScanLine::dim(format!("search.messages query={slack_query:?}")));
             if let Some(overlay) = self.scan_overlay.as_mut() { overlay.live_pending = true; }
             self.job = Some(live::api_search_labeled(self.api.clone().expect("signed in"), slack_query, query.to_string()));
             return;
         }
         if pending.author_unresolved { self.status = "Own user ID unavailable; sign in to search from:@me".into(); }
         // Nothing follows the scan, so the box has said everything it will.
-        if !go_live && self.live { self.say_in_scan(live::ScanLine::dim(self.status.clone())); }
-        self.close_scan_overlay();
+        if !go_live && self.live { self.say_in_scan(ScanOwner::Search, live::ScanLine::dim(self.status.clone())); }
+        self.close_scan_overlay(ScanOwner::Search);
     }
 
-    /// Mark the box done. It is drawn once more, so its last line is read,
-    /// and the next tick takes it off the screen.
-    fn close_scan_overlay(&mut self) {
-        if let Some(overlay) = self.scan_overlay.as_mut() { overlay.finished = true; }
+    /// Mark `owner`'s box done. It is drawn once more, so its last line is
+    /// read, and the next tick takes it off the screen. A box belonging to
+    /// another phase, or to another navigation generation, is left alone:
+    /// see `ScanOwner`.
+    fn close_scan_overlay(&mut self, owner: ScanOwner) {
+        if let Some(overlay) = self.own_scan_overlay(owner) { overlay.finished = true; }
+    }
+
+    /// The open box, when it is `owner`'s and was opened where the reader
+    /// still is.
+    fn own_scan_overlay(&mut self, owner: ScanOwner) -> Option<&mut ScanOverlay> {
+        let generation = self.nav_generation;
+        self.scan_overlay
+            .as_mut()
+            .filter(|overlay| overlay.owner == owner && overlay.nav_generation == generation)
+    }
+
+    /// Drive the UNREADS live phase to its end the way the event loop does,
+    /// and hand back what the progress box said while it ran.
+    #[cfg(test)]
+    pub(crate) fn finish_unread_fetch_for_test(&mut self) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.unread_fetch.is_some() && Instant::now() < deadline {
+            self.tick();
+            if self.unread_fetch.is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(self.unread_fetch.is_none(), "the unread fetch never finished");
+        let lines = self
+            .scan_overlay
+            .as_ref()
+            .map(|overlay| overlay.lines.iter().map(|line| line.text.clone()).collect())
+            .unwrap_or_default();
+        // The box lives one tick past its last line; this is that tick.
+        self.tick();
+        lines
     }
 
     /// Drive a running archive scan to its result the way the event loop
@@ -3291,9 +3404,9 @@ impl App {
         }
     }
 
-    /// Add a line to the progress box, if one is open.
-    fn say_in_scan(&mut self, line: live::ScanLine) {
-        if let Some(overlay) = self.scan_overlay.as_mut() {
+    /// Add a line to `owner`'s progress box, if that is the one open.
+    fn say_in_scan(&mut self, owner: ScanOwner, line: live::ScanLine) {
+        if let Some(overlay) = self.own_scan_overlay(owner) {
             overlay.drain();
             overlay.lines.push(line);
         }
@@ -3308,6 +3421,18 @@ impl App {
     /// pushes no view; during the Slack half it only dismisses the box, and
     /// the search that is already showing folds Slack's answer in as ever.
     fn cancel_scan(&mut self) {
+        // The UNREADS live phase is behind the same box. Abandoning it stops
+        // at the conversation it had reached: every card it had already
+        // replaced holds the messages it fetched, and the rest keep theirs.
+        if let Some(phase) = self.unread_fetch.as_ref() {
+            let replaced = phase.replaced;
+            self.drop_scan();
+            self.status = format!(
+                "unread fetch abandoned; {replaced} card{} filled in from Slack",
+                if replaced == 1 { "" } else { "s" }
+            );
+            return;
+        }
         let live_phase = self.scan_overlay.as_ref().is_some_and(|overlay| overlay.live_pending);
         self.scan_overlay = None;
         if live_phase { return; }
@@ -3478,14 +3603,14 @@ impl App {
                 (true, false) => " (partial answer)".to_string(),
                 (true, true) => String::new(),
             };
-            self.say_in_scan(live::ScanLine::plain(format!(
+            self.say_in_scan(ScanOwner::Search, live::ScanLine::plain(format!(
                 "Slack: {total} hit{} · +{} new{tail}",
                 if total == 1 { "" } else { "s" },
                 counts.added,
             )));
         }
         // Slack was the last half of the search; the box has nothing left.
-        self.close_scan_overlay();
+        self.close_scan_overlay(ScanOwner::Search);
     }
 
     fn refresh_conversations(&mut self) {
@@ -3980,12 +4105,27 @@ impl App {
             _ => Vec::new(),
         };
         let mut cards: Vec<(Msg, render::Card)> = Vec::new();
+        let mut fallbacks: Vec<live::UnreadTarget> = Vec::new();
         for index in targets {
             let skip = Self::deleted_in(&deleted, &self.corpus.convs[index].id);
-            cards.push(
-                self.refill_unread_card(index, &skip)
-                    .unwrap_or_else(|| self.stale_unread_card(index, &skip)),
-            );
+            cards.push(match self.refill_unread_card(index, &skip) {
+                Some(card) => card,
+                None => {
+                    let conv = &self.corpus.convs[index];
+                    // A read marker Slack has never reported is nothing to
+                    // fetch from: there is no `oldest` to ask from, and the
+                    // card stays on whatever the archive holds.
+                    if conv.last_read > 0 {
+                        fallbacks.push(live::UnreadTarget {
+                            cid: conv.id.clone(),
+                            name: conv.name.clone(),
+                            oldest: conv.last_read,
+                            unread_count: conv.unread_count,
+                        });
+                    }
+                    self.stale_unread_card(index, &skip)
+                }
+            });
         }
         // Newest unread message first, and for a card whose unread messages
         // the archive does not hold, the newest message Slack says the
@@ -4002,14 +4142,155 @@ impl App {
         let n = cards.len();
         let list = MsgList::with_cards(cards);
         match self.stack.last_mut() {
-            Some(View::Unreads { list: open, .. }) => *open = list,
-            _ => self.stack.push(View::Unreads { list, deleted }),
+            // A refresh runs both phases again, so what the last one fetched
+            // is stale the moment the archive pass rebuilds the cards.
+            Some(View::Unreads { list: open, fetched, .. }) => {
+                *open = list;
+                fetched.clear();
+            }
+            _ => self.stack.push(View::Unreads { list, deleted, fetched: HashMap::new() }),
         }
         self.focus = Focus::Msgs;
         self.status = format!(
             "{n} {} with unread messages, newest unread first",
             if n == 1 { "conversation" } else { "conversations" }
         );
+        self.start_unread_fetch(fallbacks);
+    }
+
+    /// The live half of UNREADS: ask Slack for the unread messages of every
+    /// card the archive could not fill, one conversation at a time, behind
+    /// the progress box `/find` uses. Only when signed in; nothing fetched
+    /// here reaches an archive, and a rerun of the view runs the phase again.
+    fn start_unread_fetch(&mut self, targets: Vec<live::UnreadTarget>) {
+        self.unread_fetch = None;
+        let Some(client) = self.api.clone().filter(|_| self.live) else { return };
+        // The one scan slot is the archive search's while it holds it, and
+        // taking it from under a running `/find` would strand its view.
+        if targets.is_empty() || self.scan.is_some() || self.pending_search.is_some() {
+            return;
+        }
+        let (sender, progress) = std::sync::mpsc::channel();
+        self.scan_overlay = Some(ScanOverlay {
+            owner: ScanOwner::UnreadFetch,
+            nav_generation: self.nav_generation,
+            label: "UNREADS".to_string(),
+            lines: Vec::new(),
+            started: Instant::now(),
+            live_pending: false,
+            finished: false,
+            progress,
+        });
+        let asked = targets.len();
+        self.unread_fetch = Some(UnreadFetch {
+            queue: targets.into(),
+            nav_generation: self.nav_generation,
+            progress: sender,
+            replaced: 0,
+            asked,
+        });
+        self.next_unread_fetch(&client);
+    }
+
+    /// Send the next conversation's call, or close the phase when the queue
+    /// is empty.
+    fn next_unread_fetch(&mut self, client: &Arc<Client>) {
+        let Some(phase) = self.unread_fetch.as_mut() else { return };
+        let Some(target) = phase.queue.pop_front() else {
+            let (replaced, asked) = (phase.replaced, phase.asked);
+            self.unread_fetch = None;
+            self.status = format!(
+                "{replaced} of {asked} card{} filled in from Slack",
+                if asked == 1 { "" } else { "s" }
+            );
+            let said = self.status.clone();
+            self.say_in_scan(ScanOwner::UnreadFetch, live::ScanLine::dim(said));
+            self.close_scan_overlay(ScanOwner::UnreadFetch);
+            return;
+        };
+        let progress = phase.progress.clone();
+        self.scan = Some(live::api_unread_history(client.clone(), target, progress));
+    }
+
+    /// One conversation's unread messages arrived: its fallback card becomes
+    /// an ordinary one — the oldest message fetched leading, the newest three
+    /// as the tail, the rest elided — and the next conversation goes out.
+    ///
+    /// `complete` says the walk reached the read marker. Only then is the
+    /// lead the conversation's first unread message and the fetched count the
+    /// whole unread run; a walk the page cap stopped short holds a window of
+    /// the newest unread messages, and the header says so rather than
+    /// presenting the oldest of that window as the first unread one.
+    ///
+    /// The messages live on the card and nowhere else. Nothing here writes to
+    /// an archive: slackdump is its only writer, and the fetch exists exactly
+    /// because the archive does not hold these messages.
+    fn apply_unread_history(&mut self, cid: &str, msgs: Vec<Msg>, complete: bool) {
+        let Some(phase) = self.unread_fetch.as_ref() else { return };
+        // The reader left UNREADS while this was out. Every navigation
+        // primitive bumps the generation, which is what makes the check
+        // complete where a list of keys to intercept could not be.
+        if phase.nav_generation != self.nav_generation {
+            self.unread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        }
+        let Some(client) = self.api.clone() else {
+            self.unread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        };
+        let named = self.corpus.conv_by_channel(cid).map(|index| {
+            let conv = &self.corpus.convs[index];
+            (conv.name.clone(), conv.last_id, conv.unread_count)
+        });
+        if let Some((name, last_id, claimed)) = named {
+            let run = UnreadRun { msgs, complete, claimed };
+            // A message deleted from Slack while the call was out: the view's
+            // ledger has it, and Slack answered from before the delete.
+            // Without this it is drawn and counted a second time, the ledger
+            // being the only record that it went.
+            let skip = match self.stack.last() {
+                Some(View::Unreads { deleted, .. }) => Self::deleted_in(deleted, cid),
+                _ => Vec::new(),
+            };
+            let built = Self::fetched_unread_card(name, &run, &skip, last_id);
+            if let Some(View::Unreads { list, fetched, .. }) = self.stack.last_mut() {
+                // The whole run is kept whatever the card draws of it: four
+                // messages are drawn, and a delete that takes those off comes
+                // back here for the next one.
+                fetched.insert(cid.to_string(), run);
+                if let Some((lead, card)) = built {
+                    if let Some(at) = list.msgs.iter().position(|message| message.channel_id == cid) {
+                        list.replace_card(at, lead, card);
+                        if let Some(phase) = self.unread_fetch.as_mut() {
+                            phase.replaced += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.next_unread_fetch(&client);
+    }
+
+    /// A call failed — a rate-limit reply is the one this is written for — so
+    /// the phase stops where it stands. The conversation it was asking about
+    /// and every one behind it keep the fallback cards they already have.
+    fn stop_unread_fetch(&mut self, error: String) {
+        let Some(phase) = self.unread_fetch.take() else {
+            self.status = error;
+            return;
+        };
+        let left = phase.queue.len() + 1;
+        self.status = format!(
+            "Slack: {error}; {left} card{} left as {} {}",
+            if left == 1 { "" } else { "s" },
+            if left == 1 { "it" } else { "they" },
+            if left == 1 { "was" } else { "were" },
+        );
+        let said = self.status.clone();
+        self.say_in_scan(ScanOwner::UnreadFetch, live::ScanLine::plain(said));
+        self.close_scan_overlay(ScanOwner::UnreadFetch);
     }
 
     /// The ids of `deleted` that belong to one conversation.
@@ -4034,28 +4315,89 @@ impl App {
     fn refill_unread_card(&self, index: usize, skip: &[i64]) -> Option<(Msg, render::Card)> {
         let conv = &self.corpus.convs[index];
         let archive = self.corpus.conv_archive(conv).filter(|_| conv.last_read > 0)?;
-        let (total, mut msgs) = archive
+        let (total, msgs) = archive
             .unread_page(&conv.id, conv.last_read, Self::UNREAD_CARD_TAIL, skip)
             .ok()?;
         if msgs.is_empty() {
             return None;
         }
+        Some(Self::unread_card(conv.name.clone(), Self::unread_label(total), total, msgs, conv.last_id))
+    }
+
+    /// An UNREADS card over the messages it draws, oldest first: the first
+    /// unread message leads, the rest are its tail, and the `total - drawn`
+    /// messages between them are elided. `last_id` stands in for the upper
+    /// bound of what the card counts when it draws nothing past its lead.
+    ///
+    /// One function for both halves of the view, so a card the archive filled
+    /// and a card Slack filled carry the same header, the same bounds and the
+    /// same elision, and a deleted message is taken off either the same way.
+    /// `msgs` is never empty: a card with no message to lead with is no card.
+    fn unread_card(
+        conversation: String,
+        header: String,
+        total: i64,
+        mut msgs: Vec<Msg>,
+        last_id: i64,
+    ) -> (Msg, render::Card) {
         for message in &mut msgs {
             // The card's header names the conversation; a message header
             // would say it again under it.
             message.channel_name = None;
         }
         let card = render::Card {
-            conversation: conv.name.clone(),
-            participants: Self::unread_label(total),
+            conversation,
+            participants: header,
             hidden: (total - msgs.len() as i64).max(0),
             counted_from: msgs[0].id,
-            counted_through: msgs.last().map_or(conv.last_id, |m| m.id),
+            counted_through: msgs.last().map_or(last_id, |m| m.id),
             tail: Vec::new(),
             elision: render::Elision::Messages,
         };
         let lead = msgs.remove(0);
-        Some((lead, render::Card { tail: msgs, ..card }))
+        (lead, render::Card { tail: msgs, ..card })
+    }
+
+    /// The card for a fetched unread run, minus whatever the delete ledger
+    /// says is gone. None when nothing is left to lead with, which is the
+    /// only case where the card has stopped standing for anything.
+    ///
+    /// The header depends on how the fetch ended, not on how many messages
+    /// survive: a walk that reached the marker knows the run exactly, and one
+    /// the page cap stopped short holds a window of it and says so.
+    fn fetched_unread_card(
+        conversation: String,
+        run: &UnreadRun,
+        skip: &[i64],
+        last_id: i64,
+    ) -> Option<(Msg, render::Card)> {
+        let msgs: Vec<Msg> = run
+            .msgs
+            .iter()
+            .filter(|message| !skip.contains(&message.id))
+            .cloned()
+            .collect();
+        if msgs.is_empty() {
+            return None;
+        }
+        let fetched = msgs.len() as i64;
+        // Never below what the card holds: `hidden` is the difference between
+        // the total and the messages drawn, so a total under the fetched
+        // count would draw an elision line that lies.
+        let total = if run.complete { fetched } else { run.claimed.unwrap_or(fetched).max(fetched) };
+        let header = if run.complete {
+            Self::unread_label(total)
+        } else {
+            Self::unread_window_label(total, fetched)
+        };
+        let drawn = if msgs.len() > Self::UNREAD_CARD_TAIL + 1 {
+            let mut drawn = vec![msgs[0].clone()];
+            drawn.extend_from_slice(&msgs[msgs.len() - Self::UNREAD_CARD_TAIL..]);
+            drawn
+        } else {
+            msgs
+        };
+        Some(Self::unread_card(conversation, header, total, drawn, last_id))
     }
 
     /// The card for a conversation Slack calls unread and the archive has no
@@ -4105,6 +4447,24 @@ impl App {
     /// string it already carries.
     fn unread_label(total: i64) -> String {
         format!("{total} unread")
+    }
+
+    /// The header of a card whose fetch stopped short of the read marker: the
+    /// count, and how many of them the card holds. Every such card says so,
+    /// whatever the two numbers are — the message it leads with is not the
+    /// conversation's first unread one, and only the clause says that.
+    ///
+    /// `400 unread · newest 300 fetched` where Slack's count is the larger.
+    /// `100+ unread · newest 100 fetched` where the fetch covered that count
+    /// and stopped on it: the count was reached, the marker was not, so the
+    /// run is at least that long and the `+` is the only honest form.
+    ///
+    /// Deliberately not the plain `unread_label` form, so that
+    /// `drop_from_unreads`, which renumbers a header only where it still
+    /// reads as the count that card was built with, leaves this one alone.
+    fn unread_window_label(total: i64, fetched: i64) -> String {
+        let more = if total > fetched { "" } else { "+" };
+        format!("{total}{more} unread · newest {fetched} fetched")
     }
 
     /// The one line an UNREADS card draws for a conversation no archive holds
@@ -4663,18 +5023,22 @@ impl App {
         let job_before_scan = self.job.is_some();
         if let Some(outcome) = self.scan.as_ref().and_then(|job| job.poll()) {
             let job = self.scan.take().expect("polled");
-            match outcome {
-                Ok(Done::ArchiveHits { hits, capped, users }) => {
-                    if let JobKind::ArchiveScan { query } = job.kind {
-                        self.adopt_scan_users(users);
-                        self.finish_archive_search(&query, hits, capped);
-                    }
+            match (job.kind, outcome) {
+                (JobKind::ArchiveScan { query }, Ok(Done::ArchiveHits { hits, capped, users })) => {
+                    self.adopt_scan_users(users);
+                    self.finish_archive_search(&query, hits, capped);
                 }
-                Ok(_) => {}
-                Err(error) => {
+                // The UNREADS live phase shares the slot and the box: one
+                // conversation's messages land, and the next call goes out.
+                (JobKind::UnreadHistory { cid }, Ok(Done::UnreadHistory { msgs, complete })) => {
+                    self.apply_unread_history(&cid, msgs, complete);
+                }
+                (JobKind::UnreadHistory { .. }, Err(error)) => self.stop_unread_fetch(error),
+                (_, Ok(_)) => {}
+                (_, Err(error)) => {
                     self.pending_search = None;
-                    self.say_in_scan(live::ScanLine::plain(error.clone()));
-                    self.close_scan_overlay();
+                    self.say_in_scan(ScanOwner::Search, live::ScanLine::plain(error.clone()));
+                    self.close_scan_overlay(ScanOwner::Search);
                     self.status = error;
                 }
             }
@@ -4757,8 +5121,8 @@ impl App {
                 Err(e) => {
                     if matches!(job.kind, JobKind::ArchiveScan { .. }) {
                         self.pending_search = None;
-                        self.say_in_scan(live::ScanLine::plain(e.clone()));
-                        self.close_scan_overlay();
+                        self.say_in_scan(ScanOwner::Search, live::ScanLine::plain(e.clone()));
+                        self.close_scan_overlay(ScanOwner::Search);
                     }
                     self.status = match job.kind {
                         JobKind::Auth => format!("not signed in: {e}"),
@@ -4905,8 +5269,8 @@ impl App {
                 if matches!(job.kind, JobKind::Search { .. } | JobKind::ArchiveScan { .. }) {
                     if matches!(job.kind, JobKind::ArchiveScan { .. }) { self.pending_search = None; }
                     let said = self.status.clone();
-                    self.say_in_scan(live::ScanLine::plain(said));
-                    self.close_scan_overlay();
+                    self.say_in_scan(ScanOwner::Search, live::ScanLine::plain(said));
+                    self.close_scan_overlay(ScanOwner::Search);
                 }
                 return;
             }
@@ -8742,6 +9106,780 @@ pub(crate) mod tests {
         app.on_msg_key(Some(Action::Open));
         assert_eq!(app.status, "not signed in, and this conversation is not cached");
         assert_eq!(app.corpus.convs[app.open.as_ref().unwrap().conv].id, "C5");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A Slack that answers `conversations.history` from the messages each
+    /// channel holds, the way Slack documents the call: `oldest` and `latest`
+    /// bound the window and are exclusive unless `inclusive` says otherwise,
+    /// `limit` caps the page, the newest messages come back first, and
+    /// `has_more` says the window reaches past the page. Deriving the answer
+    /// from the bounds is what makes an inclusive-boundary or paging
+    /// regression fail here rather than pass on a canned page.
+    ///
+    /// Every call is recorded as `(channel, oldest, latest)`. From call
+    /// `gate_from` on the stub blocks until the returned sender is used, so a
+    /// test can look at a phase while a call is out; `usize::MAX` never
+    /// blocks. Every other method gets the quiet answer the background jobs
+    /// need.
+    #[allow(clippy::type_complexity)]
+    fn unread_slack(
+        history: Vec<(&str, &str, Vec<i64>)>,
+        gate_from: usize,
+    ) -> (
+        Arc<Client>,
+        std::sync::mpsc::Receiver<(String, String, String)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let held: HashMap<String, (String, Vec<i64>)> = history
+            .into_iter()
+            .map(|(cid, text, seconds)| (cid.to_string(), (text.to_string(), seconds)))
+            .collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (asked, seen) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let client = Client::for_test(move |method, params| {
+            if method != "conversations.history" {
+                return Ok(quiet_slack());
+            }
+            let field = |key: &str| {
+                params.iter().find(|(k, _)| *k == key).map(|(_, value)| (*value).to_string())
+            };
+            let channel = field("channel").expect("a channel");
+            let oldest = field("oldest");
+            let latest = field("latest");
+            asked
+                .send((
+                    channel.clone(),
+                    oldest.clone().unwrap_or_default(),
+                    latest.clone().unwrap_or_default(),
+                ))
+                .expect("the test reads the calls");
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= gate_from {
+                let _ = gate.lock().expect("gate").recv();
+            }
+            let inclusive = field("inclusive").as_deref() == Some("true");
+            let limit: usize = field("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
+            let bound = |value: &Option<String>| value.as_ref().and_then(|v| v.parse::<f64>().ok());
+            let (low, high) = (bound(&oldest), bound(&latest));
+            let (text, seconds) = held.get(&channel).cloned().unwrap_or_default();
+            let mut window: Vec<i64> = seconds
+                .into_iter()
+                .filter(|second| {
+                    let second = *second as f64;
+                    low.is_none_or(|low| if inclusive { second >= low } else { second > low })
+                        && high.is_none_or(|high| if inclusive { second <= high } else { second < high })
+                })
+                .collect();
+            window.sort_unstable();
+            let more = window.len() > limit;
+            let page: Vec<serde_json::Value> = window
+                .iter()
+                .rev()
+                .take(limit)
+                .map(|second| json!({"ts": format!("{second}.000000"), "user": "U2",
+                                     "text": format!("{text} {second}")}))
+                .collect();
+            Ok(json!({"ok": true, "messages": page, "has_more": more}))
+        });
+        (Arc::new(client), seen, release)
+    }
+
+    /// The UNREADS view as it stands: one row per card, `(name, header, lead
+    /// id, elided, tail ids)`.
+    fn unread_cards(app: &App) -> Vec<(String, String, i64, i64, Vec<i64>)> {
+        match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list
+                .msgs
+                .iter()
+                .zip(&list.cards)
+                .map(|(message, card)| {
+                    (
+                        card.conversation.clone(),
+                        card.participants.clone(),
+                        message.id,
+                        card.hidden,
+                        card.tail.iter().map(|m| m.id).collect(),
+                    )
+                })
+                .collect(),
+            _ => panic!("not the UNREADS view"),
+        }
+    }
+
+    /// Open UNREADS from the conversation list, the way the fifth top row does.
+    fn open_unreads_row(app: &mut App) {
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 {
+            app.on_conv_key(Some(Action::Down));
+        }
+        app.on_conv_key(Some(Action::Open));
+    }
+
+    fn screen_of(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A signed-in session fetches the unread messages of every fallback card
+    /// from Slack and puts them on the card: the first unread message leads,
+    /// the newest three are the tail, the rest are elided. The cards the
+    /// archive filled are not touched, and nothing fetched reaches an archive.
+    #[test]
+    fn unreads_fills_its_fallback_cards_from_slack() {
+        let dir = crate::archive::test_dir("unreads-live");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        // Each channel holds the message its read marker names as well, which
+        // an exclusive `oldest` must leave out.
+        let (client, calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=45).collect()), ("C6", "six live", (5..=7).collect())],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        // The archive pass first: #six, #five and #four have fallback cards,
+        // and the phase is out for the two of them that have a read marker.
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| (c.0.clone(), c.1.clone())).collect::<Vec<_>>(),
+            vec![
+                ("#six".to_string(), "unread · not in the archive".to_string()),
+                ("#five".to_string(), "unread · not in the archive".to_string()),
+                ("#four".to_string(), "unread · not in the archive".to_string()),
+                ("#two".to_string(), "2 unread".to_string()),
+                ("#one".to_string(), "6 unread".to_string()),
+            ]
+        );
+        // The phase runs behind the progress box `/find` draws, which is
+        // modal over the view it is filling in.
+        assert!(app.scan_running(), "no progress box");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::UnreadFetch));
+        let before = screen_of(&mut app, 100, 44);
+        assert!(before.contains("Esc"), "the box is not drawn:\n{before}");
+        assert!(!before.contains("four live 41"), "{before}");
+        let lines = app.finish_unread_fetch_for_test();
+        // Two fallback cards became ordinary ones on the fetched messages;
+        // the archive's cards and the marker-less one are as they were.
+        let filled = vec![
+            ("#six".to_string(), "2 unread".to_string(), 6_000_000, 0, vec![7_000_000]),
+            ("#five".to_string(), "unread · not in the archive".to_string(), 50_000_000, 0, vec![]),
+            ("#four".to_string(), "5 unread".to_string(), 41_000_000, 1,
+                vec![43_000_000, 44_000_000, 45_000_000]),
+            ("#two".to_string(), "2 unread".to_string(), 21_000_000, 0, vec![22_000_000]),
+            ("#one".to_string(), "6 unread".to_string(), 11_000_000, 2,
+                vec![14_000_000, 15_000_000, 16_000_000]),
+        ];
+        assert_eq!(unread_cards(&app), filled);
+        // One log line per API call, and one call per conversation here.
+        assert!(lines.contains(&"conversations.history #four oldest=40.000000 → 5 messages".to_string()),
+            "{lines:#?}");
+        assert!(lines.contains(&"conversations.history #six oldest=5.000000 → 2 messages".to_string()),
+            "{lines:#?}");
+        let asked: Vec<(String, String, String)> = calls.try_iter().collect();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked.iter().all(|(_, _, latest)| latest.is_empty()), "{asked:?}");
+        // The fetched messages are drawn, the elided one is not, and the read
+        // message the marker names was never asked for.
+        let after = screen_of(&mut app, 100, 44);
+        for drawn in ["four live 41", "four live 43", "four live 45", "six live 6", "six live 7"] {
+            assert!(after.contains(drawn), "{drawn:?} is not on screen:\n{after}");
+        }
+        assert!(!after.contains("four live 42"), "the elided message was drawn:\n{after}");
+        assert!(!after.contains("four live 40"), "the message at the marker was fetched:\n{after}");
+        assert!(after.contains("#four  5 unread"), "{after}");
+        assert!(app.status.contains("2 of 2 cards filled in from Slack"), "{}", app.status);
+        // Nothing was written to the archive: it still stops where it did.
+        let archive = &app.corpus.archives[0];
+        assert_eq!(archive.timeline_count("C4").unwrap(), 1);
+        assert_eq!(archive.timeline_count("C6").unwrap(), 1);
+        // `r` runs both phases again: the view is rebuilt from the archive,
+        // which puts the fallback cards back, and Slack is asked afresh.
+        app.on_msg_key(Some(Action::Refresh));
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+            ["unread · not in the archive", "unread · not in the archive",
+             "unread · not in the archive", "2 unread", "6 unread"]
+        );
+        app.finish_unread_fetch_for_test();
+        assert_eq!(unread_cards(&app), filled);
+        assert_eq!(calls.try_iter().count(), 2, "the rerun asked a different number of times");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A conversation whose read marker Slack has never reported has no
+    /// `oldest` to fetch from, so the phase leaves it alone and its card
+    /// stands as the archive built it.
+    #[test]
+    fn a_conversation_with_no_read_marker_is_not_fetched() {
+        let dir = crate::archive::test_dir("unreads-live-no-marker");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let five = app.corpus.convs.iter().position(|c| c.id == "C5").unwrap();
+        assert_eq!(app.corpus.convs[five].last_read, 0, "the fixture gave #five a marker");
+        let (client, calls, _release) = unread_slack(
+            vec![
+                ("C4", "four live", (41..=42).collect()),
+                ("C5", "five live", (51..=52).collect()),
+                ("C6", "six live", (6..=7).collect()),
+            ],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        app.finish_unread_fetch_for_test();
+        let asked: Vec<String> = calls.try_iter().map(|(channel, _, _)| channel).collect();
+        assert_eq!(asked, ["C6", "C4"], "the marker-less conversation was fetched");
+        let cards = unread_cards(&app);
+        assert_eq!(cards[1].0, "#five");
+        assert_eq!(cards[1].1, "unread · not in the archive");
+        assert_eq!(cards[1].2, 50_000_000, "the placeholder was replaced");
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(!screen.contains("five live"), "{screen}");
+        assert!(screen.contains("not cached; open the conversation to load it from Slack"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Paging follows `has_more`, not a page coming back full, and each page
+    /// walks `latest` back while `oldest` stays at the marker. The walk that
+    /// reaches the marker has the whole unread run, so the header is a plain
+    /// count and the lead is the conversation's first unread message.
+    #[test]
+    fn the_unread_fetch_pages_until_slack_says_there_is_no_more() {
+        let dir = crate::archive::test_dir("unreads-live-pages");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let four = app.corpus.convs.iter().position(|c| c.id == "C4").unwrap();
+        app.corpus.convs[four].unread_count = Some(150);
+        let (client, calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=240).collect()), ("C6", "six live", vec![6])],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        let lines = app.finish_unread_fetch_for_test();
+        assert_eq!(
+            calls.try_iter().collect::<Vec<_>>(),
+            vec![
+                ("C6".to_string(), "5.000000".to_string(), String::new()),
+                ("C4".to_string(), "40.000000".to_string(), String::new()),
+                // The second page walks back from the oldest of the first;
+                // the marker it counts from does not move.
+                ("C4".to_string(), "40.000000".to_string(), "141.000000".to_string()),
+            ],
+            "the paging is wrong"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("#four")).collect::<Vec<_>>(),
+            [
+                "conversations.history #four oldest=40.000000 → 100 messages",
+                "conversations.history #four oldest=40.000000 → 100 messages",
+            ]
+        );
+        // Both pages are on one card: the oldest message leads and the newest
+        // three are the tail, whichever page each came from. Slack's count of
+        // 150 is stale and the walk reached the marker, so what came back is
+        // what the header says.
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "200 unread".to_string(), 41_000_000, 196,
+                vec![238_000_000, 239_000_000, 240_000_000])
+        );
+        // A single short page is a whole answer when Slack says so.
+        assert_eq!(unread_cards(&app)[0].1, "1 unread");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Slack is free to answer with fewer rows than the limit and still have
+    /// more behind them — it applies the limit before dropping the rows the
+    /// call does not return. A fetch that read a short page as the end of the
+    /// run would report those few messages as the whole unread run, so the
+    /// walk goes on while `has_more` says to, whatever the page's size.
+    #[test]
+    fn a_short_page_with_has_more_is_not_the_whole_unread_run() {
+        let dir = crate::archive::test_dir("unreads-live-short-page");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let four = app.corpus.convs.iter().position(|c| c.id == "C4").unwrap();
+        app.corpus.convs[four].unread_count = Some(150);
+        // What Slack answers for #four, call after call: a short page that
+        // says there is more, then a shorter one that says there is not.
+        let script = std::sync::Mutex::new(vec![
+            (191..=240, true),
+            (151..=190, false),
+        ]);
+        let (asked, calls) = std::sync::mpsc::channel();
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            if method != "conversations.history" {
+                return Ok(quiet_slack());
+            }
+            let field = |key: &str| {
+                params.iter().find(|(k, _)| *k == key).map_or(String::new(), |(_, v)| (*v).to_string())
+            };
+            let channel = field("channel");
+            asked.send((channel.clone(), field("oldest"), field("latest"))).expect("read");
+            if channel != "C4" {
+                return Ok(json!({"ok": true, "has_more": false, "messages": []}));
+            }
+            let mut script = script.lock().expect("script");
+            if script.is_empty() {
+                panic!("#four was asked a third time");
+            }
+            let (seconds, more) = script.remove(0);
+            let messages: Vec<serde_json::Value> = seconds
+                .rev()
+                .map(|second| json!({"ts": format!("{second}.000000"), "user": "U2",
+                                     "text": format!("four live {second}")}))
+                .collect();
+            Ok(json!({"ok": true, "has_more": more, "messages": messages}))
+        })));
+        open_unreads_row(&mut app);
+        let lines = app.finish_unread_fetch_for_test();
+        assert_eq!(
+            calls.try_iter().filter(|(channel, _, _)| channel == "C4").collect::<Vec<_>>(),
+            vec![
+                ("C4".to_string(), "40.000000".to_string(), String::new()),
+                ("C4".to_string(), "40.000000".to_string(), "191.000000".to_string()),
+            ],
+            "a short page ended the walk"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("#four")).collect::<Vec<_>>(),
+            [
+                "conversations.history #four oldest=40.000000 → 50 messages",
+                "conversations.history #four oldest=40.000000 → 40 messages",
+            ]
+        );
+        // Both pages on one card, and the walk reached the marker, so the
+        // header is the count of what came back rather than Slack's stale 150.
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "90 unread".to_string(), 151_000_000, 86,
+                vec![238_000_000, 239_000_000, 240_000_000])
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The page cap stops a very long unread run short of the marker. What
+    /// came back is then a window of the newest unread messages, not the run:
+    /// the header carries Slack's count and says how many of them the card
+    /// holds, so the message it leads with is not read as the first unread.
+    #[test]
+    fn a_run_longer_than_the_page_cap_says_how_much_of_it_was_fetched() {
+        let dir = crate::archive::test_dir("unreads-live-truncated");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let four = app.corpus.convs.iter().position(|c| c.id == "C4").unwrap();
+        app.corpus.convs[four].unread_count = Some(400);
+        let (client, calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=440).collect()), ("C6", "six live", vec![6])],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        let lines = app.finish_unread_fetch_for_test();
+        // Three pages of a hundred and no fourth: the cap, not the marker.
+        let asked: Vec<(String, String, String)> = calls.try_iter().collect();
+        assert_eq!(
+            asked.iter().filter(|(channel, _, _)| channel == "C4").collect::<Vec<_>>(),
+            vec![
+                &("C4".to_string(), "40.000000".to_string(), String::new()),
+                &("C4".to_string(), "40.000000".to_string(), "341.000000".to_string()),
+                &("C4".to_string(), "40.000000".to_string(), "241.000000".to_string()),
+            ]
+        );
+        assert_eq!(lines.iter().filter(|line| line.contains("#four")).count(), 3, "{lines:#?}");
+        // The header is Slack's count with the fetched share beside it, and
+        // the lead is the oldest of the window — 141, not the first unread
+        // message at 41, which the fetch never reached.
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "400 unread · newest 300 fetched".to_string(), 141_000_000, 396,
+                vec![438_000_000, 439_000_000, 440_000_000])
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("#four  400 unread · newest 300 fetched"), "{screen}");
+        assert!(!screen.contains("four live 41 "), "the unreached first unread was drawn:\n{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The page cap can also stop the walk on Slack's own count, with as many
+    /// messages fetched as it claims are unread. The marker was still not
+    /// reached, so the card holds a window and says so: the count is a floor,
+    /// not a total, and the `+` is what says it.
+    #[test]
+    fn a_walk_stopped_on_slacks_count_says_the_count_is_a_floor() {
+        let dir = crate::archive::test_dir("unreads-live-floor");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let four = app.corpus.convs.iter().position(|c| c.id == "C4").unwrap();
+        // Slack says a hundred; the conversation really holds two hundred.
+        app.corpus.convs[four].unread_count = Some(100);
+        let (client, calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=240).collect()), ("C6", "six live", vec![6])],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        app.finish_unread_fetch_for_test();
+        // One page covered the count, so no second went out — and the walk
+        // never reached the marker.
+        assert_eq!(
+            calls.try_iter().filter(|(channel, _, _)| channel == "C4").count(),
+            1,
+            "the count stop did not hold"
+        );
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "100+ unread · newest 100 fetched".to_string(), 141_000_000, 96,
+                vec![238_000_000, 239_000_000, 240_000_000])
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("#four  100+ unread · newest 100 fetched"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card draws four of the messages fetched for it and counts the rest,
+    /// so deleting the drawn ones has to reach the ones it only counted. The
+    /// archive cannot supply them — it never held them, which is why they
+    /// were fetched — so the view keeps the whole run and rebuilds from that.
+    #[test]
+    fn deleting_a_fetched_cards_drawn_messages_rebuilds_it_from_the_fetched_run() {
+        let dir = crate::archive::test_dir("unreads-live-refill");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        // The archive stops at 40; everything past it comes from Slack.
+        let (client, _calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=45).collect()), ("C6", "six live", vec![6])],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        app.finish_unread_fetch_for_test();
+        let four = |app: &App| {
+            unread_cards(app).into_iter().find(|card| card.0 == "#four")
+                .map(|(_, header, lead, hidden, tail)| (header, lead, hidden, tail))
+        };
+        // 41 leads, 42 is only counted, 43/44/45 are the tail.
+        assert_eq!(
+            four(&app),
+            Some(("5 unread".to_string(), 41_000_000, 1, vec![43_000_000, 44_000_000, 45_000_000]))
+        );
+        let delete = |app: &mut App, id: i64| {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C4".into(), root: None },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        };
+        // Each drawn message in turn; the next one the card drew leads.
+        delete(&mut app, 41_000_000);
+        assert_eq!(
+            four(&app),
+            Some(("4 unread".to_string(), 43_000_000, 1, vec![44_000_000, 45_000_000]))
+        );
+        delete(&mut app, 43_000_000);
+        assert_eq!(four(&app), Some(("3 unread".to_string(), 44_000_000, 1, vec![45_000_000])));
+        delete(&mut app, 44_000_000);
+        assert_eq!(four(&app), Some(("2 unread".to_string(), 45_000_000, 1, vec![])));
+        // Nothing drawn is left, and 42 is still unread: the card is rebuilt
+        // on it rather than dropped, which is what the archive would force.
+        delete(&mut app, 45_000_000);
+        assert_eq!(four(&app), Some(("1 unread".to_string(), 42_000_000, 0, vec![])));
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("four live 42"), "{screen}");
+        assert!(!screen.contains("four live 41"), "a deleted message came back:\n{screen}");
+        // Only when the last one goes does the card, the conversation having
+        // nothing unread left to stand for.
+        delete(&mut app, 42_000_000);
+        assert_eq!(four(&app), None, "the emptied card stayed");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The three-page cap is a cap on requests, not on pages that carried
+    /// something. Slack can answer with an empty page and a fresh cursor
+    /// indefinitely; reading through those inside one call would put a
+    /// hundred requests between two chances to give up, and Esc reaches the
+    /// phase only between them.
+    #[test]
+    fn empty_pages_with_fresh_cursors_cost_three_requests_and_no_more() {
+        let dir = crate::archive::test_dir("unreads-live-cursors");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (asked, seen) = std::sync::mpsc::channel();
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            if method != "conversations.history" {
+                return Ok(quiet_slack());
+            }
+            let nth = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let channel = params.iter().find(|(k, _)| *k == "channel").expect("a channel").1;
+            asked.send(channel.to_string()).expect("the test reads the calls");
+            // Nothing in this answer says stop.
+            Ok(json!({"ok": true, "has_more": true, "messages": [],
+                      "response_metadata": {"next_cursor": format!("cursor-{nth}")}}))
+        })));
+        open_unreads_row(&mut app);
+        let lines = app.finish_unread_fetch_for_test();
+        let mut per_channel: HashMap<String, usize> = HashMap::new();
+        for channel in seen.try_iter() {
+            *per_channel.entry(channel).or_default() += 1;
+        }
+        assert_eq!(per_channel.get("C4"), Some(&3), "{per_channel:?}");
+        assert_eq!(per_channel.get("C6"), Some(&3), "{per_channel:?}");
+        // One narration per request, which is where a cancel is noticed.
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("#four oldest=40.000000 → 0 messages")).count(),
+            3,
+            "{lines:#?}"
+        );
+        // Nothing came back, so every fallback card stands as it was.
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+            ["unread · not in the archive", "unread · not in the archive",
+             "unread · not in the archive", "2 unread", "6 unread"]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A message deleted from Slack while the call was out comes back in the
+    /// answer, Slack having replied from before the delete. The view's ledger
+    /// is the only record that it went, so the fetched messages are filtered
+    /// against it before they reach the card.
+    #[test]
+    fn a_message_deleted_while_the_call_was_out_stays_off_the_card() {
+        let dir = crate::archive::test_dir("unreads-live-deleted");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        // #six is asked first and answers; #four's call is the one held open.
+        let (client, _calls, release) = unread_slack(
+            vec![("C4", "four live", (40..=45).collect()), ("C6", "six live", (5..=7).collect())],
+            2,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.unread_fetch.as_ref().is_some_and(|phase| phase.replaced == 0)
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.unread_fetch.as_ref().map(|phase| phase.replaced), Some(1));
+        // One of the messages the held call is about is deleted meanwhile.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 43_000_000, cid: "C4".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        release.send(()).unwrap();
+        app.finish_unread_fetch_for_test();
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "4 unread".to_string(), 41_000_000, 0,
+                vec![42_000_000, 44_000_000, 45_000_000])
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(!screen.contains("four live 43"), "the deleted message came back:\n{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The two phases share one progress box and one job slot, so a job that
+    /// lands after its own box is gone must not touch the box a later phase
+    /// opened: closing it drops the channel the running worker narrates
+    /// through, and the phase stops mid-call.
+    #[test]
+    fn a_late_search_does_not_close_the_unread_fetch_box() {
+        let dir = crate::archive::test_dir("unreads-live-overlay");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let (release_search, search_gate) = std::sync::mpsc::channel::<()>();
+        let (release_history, history_gate) = std::sync::mpsc::channel::<()>();
+        let search_gate = std::sync::Mutex::new(search_gate);
+        let history_gate = std::sync::Mutex::new(history_gate);
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            match method {
+                "search.messages" => {
+                    let _ = search_gate.lock().expect("gate").recv();
+                    Ok(json!({"messages": {"matches": []}}))
+                }
+                "conversations.history" => {
+                    let _ = history_gate.lock().expect("gate").recv();
+                    let channel = params.iter().find(|(k, _)| *k == "channel").expect("a channel").1;
+                    Ok(json!({"ok": true, "has_more": false, "messages": [
+                        {"ts": "99.000000", "user": "U2", "text": format!("{channel} live")}]}))
+                }
+                _ => Ok(quiet_slack()),
+            }
+        })));
+        // The archive half of a `/find` lands and the Slack half goes out.
+        app.run_command("/find message: unread", "");
+        app.finish_archive_scan_for_test();
+        assert!(app.job.is_some(), "the Slack half never started");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::Search));
+        // Esc dismisses the box; the search itself is still out.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.scan_overlay.is_none() && app.job.is_some());
+        // UNREADS opens over the search view and takes the box for itself.
+        app.focus = Focus::Convs;
+        open_unreads_row(&mut app);
+        assert!(app.unread_fetch.is_some() && app.scan.is_some());
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::UnreadFetch));
+        // Now the abandoned search finishes.
+        release_search.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.job.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.job.is_none(), "the search never landed");
+        assert!(app.scan_running(), "the search closed the unread fetch's box");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::UnreadFetch));
+        assert!(app.unread_fetch.is_some(), "the search stopped the unread fetch");
+        // And the phase runs on to its end.
+        for _ in 0..4 {
+            let _ = release_history.send(());
+        }
+        app.finish_unread_fetch_for_test();
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+            ["1 unread", "unread · not in the archive", "1 unread", "2 unread", "6 unread"]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The navigation-generation rule: a page that lands after the reader has
+    /// left the view lands nowhere. The stack it would have written to is not
+    /// there any more, and nothing is pushed in its place.
+    #[test]
+    fn leaving_unreads_before_the_fetch_lands_leaves_the_stack_alone() {
+        let dir = crate::archive::test_dir("unreads-live-abandoned");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let (client, _calls, release) = unread_slack(
+            vec![("C4", "four live", (41..=42).collect()), ("C6", "six live", (6..=7).collect())],
+            1,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        assert!(app.unread_fetch.is_some() && app.scan.is_some(), "the phase never started");
+        // Gone home while the first call is out.
+        app.go_home();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.unread_fetch.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.unread_fetch.is_none(), "the phase outlived the view");
+        assert!(app.stack.is_empty(), "the fetch pushed a view over the home screen");
+        assert!(app.open.is_none());
+        assert!(app.scan_overlay.is_none(), "the box outlived the view");
+        let screen = screen_of(&mut app, 100, 30);
+        assert!(!screen.contains("four live"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Esc abandons the phase where it stands: the cards it had already
+    /// replaced keep the messages it fetched, and the conversations it had
+    /// not reached keep their fallback cards.
+    #[test]
+    fn esc_during_the_unread_fetch_keeps_the_cards_already_replaced() {
+        let dir = crate::archive::test_dir("unreads-live-esc");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        // The second call blocks, so exactly one conversation is answered.
+        let (client, _calls, _release) = unread_slack(
+            vec![("C4", "four live", (41..=42).collect()), ("C6", "six live", (6..=7).collect())],
+            2,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.unread_fetch.as_ref().is_some_and(|phase| phase.replaced == 0)
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.unread_fetch.as_ref().map(|phase| phase.replaced), Some(1),
+            "the first conversation never landed");
+        // The box is modal: Esc is the one key that reaches the phase.
+        assert!(app.scan_running());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.unread_fetch.is_none() && app.scan.is_none() && app.scan_overlay.is_none());
+        assert!(app.status.contains("unread fetch abandoned; 1 card filled in"), "{}", app.status);
+        // The view is still there, with the one replaced card and the rest
+        // exactly as the archive pass drew them.
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| (c.0.clone(), c.1.clone())).collect::<Vec<_>>(),
+            vec![
+                ("#six".to_string(), "2 unread".to_string()),
+                ("#five".to_string(), "unread · not in the archive".to_string()),
+                ("#four".to_string(), "unread · not in the archive".to_string()),
+                ("#two".to_string(), "2 unread".to_string()),
+                ("#one".to_string(), "6 unread".to_string()),
+            ]
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("six live 6") && screen.contains("six live 7"), "{screen}");
+        assert!(screen.contains("#four  unread · not in the archive"), "{screen}");
+        assert!(!screen.contains("four live"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A rate-limit reply stops the phase with a status line, and every
+    /// conversation it had not reached keeps the card the archive drew.
+    #[test]
+    fn a_rate_limited_reply_stops_the_unread_fetch() {
+        let dir = crate::archive::test_dir("unreads-live-ratelimit");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        app.api = Some(Arc::new(Client::for_test(|method, _| {
+            if method != "conversations.history" {
+                return Ok(quiet_slack());
+            }
+            Err("conversations.history: ratelimited".to_string())
+        })));
+        open_unreads_row(&mut app);
+        app.finish_unread_fetch_for_test();
+        assert!(app.status.contains("ratelimited"), "{}", app.status);
+        assert!(app.status.contains("2 cards left"), "{}", app.status);
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+            [
+                "unread · not in the archive",
+                "unread · not in the archive",
+                "unread · not in the archive",
+                "2 unread",
+                "6 unread",
+            ]
+        );
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
     }
