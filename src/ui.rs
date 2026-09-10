@@ -265,11 +265,13 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     // The cursor's row is rewritten with the palette's selection colors rather
     // than styled through `highlight_style`: a span's own color would win.
     //
-    // Both kinds of line a conversation can carry above it go inside its own
+    // Both kinds of line a conversation can carry go inside its own
     // `ListItem`, the way the starred boundary already did: a divider is then
     // not a row of the list at all, so `j`/`k` cannot land on one, the cursor
     // arithmetic below stays a count of conversations, and the line scrolls
-    // with the conversation it introduces.
+    // with the conversation it belongs to. The starred boundary leads its
+    // item; an age divider closes its group, so it trails the item of the last
+    // conversation in that group — rows are boundary, name, divider.
     //
     // One clock for the whole pane, and the age dividers only under `Recent`
     // with no filter typed. No other sort puts the list in age order, and a
@@ -282,9 +284,10 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     let now = app.now_secs();
     let age_dividers = app.sort == Sort::Recent && app.filter.trim().is_empty();
     // Starred conversations, above, and muted ones, below, are not part of the
-    // age-ordered run and have no group.
+    // age-ordered run and have no group; neither has a row past the end of the
+    // list, which is what makes the last eligible conversation close its group.
     let group = |k: usize| -> Option<crate::conv_age::AgeGroup> {
-        let c = app.conv(app.filtered[k]);
+        let c = app.conv(*app.filtered.get(k)?);
         (!c.muted && !app.starred.contains(&c.id))
             .then(|| crate::conv_age::AgeGroup::of(c.last_id, now))
     };
@@ -299,25 +302,24 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             if boundary {
                 rows.push(Line::from(Span::styled("─".repeat(width), dim)));
             }
+            rows.push(line);
             if age_dividers {
                 if let Some(g) = group(k) {
-                    // A run of age-ordered conversations starts at the first
-                    // one of the list, after the starred block, and — with `U`
-                    // on — at the unread/read boundary, since each of those two
-                    // runs is in recency order on its own. Inside a run a line
-                    // goes wherever the group changes, so a group with no
-                    // conversations draws none.
-                    let restart = k == 0
-                        || group(k - 1).is_none()
-                        || (app.unreads_first
-                            && app.conv(app.filtered[k - 1]).unread
-                                != app.conv(app.filtered[k]).unread);
-                    if restart || group(k - 1) != Some(g) {
+                    // The whole eligible run is one sequence: a line goes under
+                    // row `k` when the row after it leaves the run — the end of
+                    // the list, or the muted block — or belongs to a different
+                    // group. So a group with no conversations draws none, and
+                    // two conversations of the same age share the one line
+                    // under the older of them. The unread/read boundary is not
+                    // a restart: with `U` on, unread and read conversations of
+                    // the same age share a line, and an unread conversation
+                    // older than the read ones above the boundary closes its
+                    // own group where it sits.
+                    if group(k + 1) != Some(g) {
                         rows.push(crate::render::divider(g.label(), width));
                     }
                 }
             }
-            rows.push(line);
             ListItem::new(rows)
         })
         .collect();
@@ -2156,7 +2158,7 @@ mod conv_age_tests {
     }
 
     /// The four groups, one conversation each, in order, every conversation
-    /// directly under the line that names its group.
+    /// directly above the line that names its group.
     #[test]
     fn four_ages_draw_the_four_lines_in_order() {
         let mut app = aged_test_app(
@@ -2172,12 +2174,13 @@ mod conv_age_tests {
         assert_eq!(age_lines(&rows), LABELS);
         for (label, name) in LABELS.into_iter().zip(["#alpha", "#beta", "#gamma", "#delta"]) {
             let at = line_at(&rows, label);
-            assert!(rows[at + 1].contains(name), "{label}: {:?}", rows[at + 1]);
+            assert!(rows[at - 1].contains(name), "{label}: {:?}", rows[at - 1]);
         }
     }
 
     /// Each boundary belongs to the older group, and the second before it to
-    /// the younger one, on the drawn buffer as in `conv_age`.
+    /// the younger one, on the drawn buffer as in `conv_age`. The younger
+    /// group ends at `#under`, the older one at `#over`.
     #[test]
     fn the_boundaries_land_where_the_groups_say() {
         for (boundary, younger, older) in
@@ -2193,9 +2196,9 @@ mod conv_age_tests {
             );
             let rows = rows(&mut app, 60, 20);
             assert_eq!(age_lines(&rows), [younger, older], "{boundary} seconds");
-            assert!(rows[line_at(&rows, younger) + 1].contains("#under"));
-            assert!(rows[line_at(&rows, older) + 1].contains("#at"));
-            assert!(rows[line_at(&rows, older) + 2].contains("#over"));
+            assert!(rows[line_at(&rows, younger) - 1].contains("#under"));
+            assert!(rows[line_at(&rows, older) - 2].contains("#at"));
+            assert!(rows[line_at(&rows, older) - 1].contains("#over"));
         }
     }
 
@@ -2226,7 +2229,8 @@ mod conv_age_tests {
     }
 
     /// A starred conversation is above the age-ordered run, so it sits above
-    /// the first line however new its newest message is.
+    /// the first line however new its newest message is: the `today` line
+    /// closes the group under `#alpha`, not under the star.
     #[test]
     fn a_starred_conversation_sits_above_the_today_line() {
         let mut app = aged_test_app(NOW, &[("alpha", Some(HOUR)), ("pinned", Some(2 * HOUR))]);
@@ -2237,11 +2241,12 @@ mod conv_age_tests {
         let starred = rows.iter().position(|row| row.contains("#pinned")).unwrap();
         let today = line_at(&rows, "today");
         assert!(starred < today, "{rows:#?}");
-        assert!(rows[today + 1].contains("#alpha"));
+        assert!(rows[today - 1].contains("#alpha"));
     }
 
     /// A muted conversation is below the run and gets no line, even when it is
-    /// the newest thing in the list.
+    /// the newest thing in the list: the last grouped conversation closes its
+    /// group because the row under it is the muted block.
     #[test]
     fn a_muted_conversation_sits_below_the_list_with_no_line() {
         let mut app = aged_test_app(NOW, &[("gamma", Some(3 * DAY)), ("quiet", Some(HOUR))]);
@@ -2249,28 +2254,53 @@ mod conv_age_tests {
         app.apply_filter();
         let rows = rows(&mut app, 60, 20);
         assert_eq!(age_lines(&rows), ["this week"]);
+        let gamma = rows.iter().position(|row| row.contains("#gamma")).unwrap();
         let muted = rows.iter().position(|row| row.contains("#quiet")).unwrap();
-        assert!(muted > rows.iter().position(|row| row.contains("#gamma")).unwrap());
-        assert!(rows[muted - 1].contains("#gamma"), "{rows:#?}");
+        assert!(muted > gamma);
+        assert_eq!(line_at(&rows, "this week"), gamma + 1, "{rows:#?}");
+        assert_eq!(muted, gamma + 2, "{rows:#?}");
     }
 
-    /// With `U` on the unread run and the read run are each in recency order,
-    /// so the grouping restarts at the boundary between them.
+    /// The whole eligible run is one sequence, whatever `U` does to its order.
+    /// An unread and a read conversation of the same age therefore share the
+    /// one line that closes their group; and an unread conversation older than
+    /// the read ones below it closes its own group where `U` put it, which is
+    /// how the same label can be drawn twice.
     #[test]
-    fn unread_first_gives_each_run_its_own_dividers() {
-        let mut app = aged_test_app(NOW, &[("gamma", Some(3 * DAY)), ("alpha", Some(HOUR))]);
+    fn unread_first_does_not_restart_the_grouping() {
+        // `#alpha` is unread and `#beta` is read, both today: one line, under
+        // the lower of the two.
+        let mut app = aged_test_app(NOW, &[("alpha", Some(HOUR)), ("beta", Some(2 * HOUR))]);
         assert!(app.unreads_first);
         app.corpus.convs[0].unread = true;
         app.apply_filter();
+        let shared = rows(&mut app, 60, 20);
+        assert_eq!(age_lines(&shared), ["today"]);
+        let today = line_at(&shared, "today");
+        assert!(shared[today - 2].contains("#alpha"), "{shared:#?}");
+        assert!(shared[today - 1].contains("#beta"), "{shared:#?}");
+
+        // An unread 3-day-old conversation is lifted above the read today one,
+        // so `this week` closes its group before the today block starts.
+        let mut app = aged_test_app(
+            NOW,
+            &[("alpha", Some(HOUR)), ("beta", Some(2 * HOUR)), ("gamma", Some(3 * DAY))],
+        );
+        app.corpus.convs[0].unread = true;
+        app.corpus.convs[2].unread = true;
+        app.apply_filter();
         let rows = rows(&mut app, 60, 20);
-        assert_eq!(age_lines(&rows), ["this week", "today"]);
-        assert!(rows[line_at(&rows, "this week") + 1].contains("gamma"));
-        assert!(rows[line_at(&rows, "today") + 1].contains("#alpha"));
-        assert!(line_at(&rows, "this week") < line_at(&rows, "today"));
+        assert_eq!(age_lines(&rows), ["today", "this week", "today"], "{rows:#?}");
+        let week = line_at(&rows, "this week");
+        assert!(rows[week - 1].contains("#gamma"), "{rows:#?}");
+        assert!(rows[week - 2].contains(" today "), "{rows:#?}");
+        assert!(rows[week - 3].contains("#alpha"), "{rows:#?}");
+        assert!(rows[week + 1].contains("#beta"), "{rows:#?}");
+        assert!(rows[week + 2].contains(" today "), "{rows:#?}");
     }
 
-    /// Two conversations of the same age share one line; the groups between
-    /// them, with nobody in them, draw none.
+    /// Two conversations of the same age share one line, under the lower of
+    /// them; the groups between them, with nobody in them, draw none.
     #[test]
     fn a_group_with_no_members_draws_no_line() {
         let mut app = aged_test_app(
@@ -2279,9 +2309,9 @@ mod conv_age_tests {
         );
         let rows = rows(&mut app, 60, 20);
         assert_eq!(age_lines(&rows), ["today", "earlier"]);
-        assert!(rows[line_at(&rows, "today") + 1].contains("#alpha"));
-        assert!(rows[line_at(&rows, "today") + 2].contains("#beta"));
-        assert!(rows[line_at(&rows, "earlier") + 1].contains("#delta"));
+        assert!(rows[line_at(&rows, "today") - 2].contains("#alpha"));
+        assert!(rows[line_at(&rows, "today") - 1].contains("#beta"));
+        assert!(rows[line_at(&rows, "earlier") - 1].contains("#delta"));
     }
 
     /// A `/find` needle re-sorts the list by how closely each name matches it,
@@ -2304,8 +2334,8 @@ mod conv_age_tests {
         assert_eq!(age_lines(&rows(&mut app, 60, 20)), ["today", "earlier"]);
     }
 
-    /// A divider is not a row of the list: `j` from the conversation above one
-    /// lands on the conversation below it.
+    /// A divider is not a row of the list: `j` from a conversation carrying a
+    /// closing line lands on the next conversation, not on the line.
     #[test]
     fn j_steps_over_a_divider_onto_the_next_conversation() {
         let mut app = aged_test_app(NOW, &[("alpha", Some(HOUR)), ("gamma", Some(3 * DAY))]);
@@ -2313,10 +2343,36 @@ mod conv_age_tests {
         app.conv_cursor = 0;
         let rows = rows(&mut app, 60, 20);
         let alpha = rows.iter().position(|row| row.contains("#alpha")).unwrap();
-        assert!(rows[alpha + 1].contains(" this week "), "{rows:#?}");
+        assert!(rows[alpha + 1].contains(" today "), "{rows:#?}");
         assert!(rows[alpha + 2].contains("#gamma"));
+        assert!(rows[alpha + 3].contains(" this week "), "{rows:#?}");
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(app.conv_cursor, 1);
         assert_eq!(app.conv(app.filtered[app.conv_cursor]).name, "#gamma");
+    }
+
+    /// The line rides in the same `ListItem` as the conversation it closes, so
+    /// the last conversation of a run is two rows tall. A pane too short for
+    /// the whole list still shows the cursor's name row when the cursor is on
+    /// it, top and bottom alike.
+    #[test]
+    fn the_selected_row_stays_visible_under_a_two_row_item() {
+        let ages = [HOUR, 2 * HOUR, 3 * HOUR, 30 * HOUR, 3 * DAY, 10 * DAY];
+        let names = ["a1", "a2", "a3", "b1", "c1", "d1"];
+        let convs: Vec<(&str, Option<i64>)> =
+            names.iter().zip(ages).map(|(n, age)| (*n, Some(age))).collect();
+        let mut app = aged_test_app(NOW, &convs);
+        app.focus = Focus::Convs;
+        // Every conversation that closes a group is two rows tall here.
+        assert_eq!(age_lines(&rows(&mut app, 40, 30)), LABELS);
+        for cursor in 0..names.len() {
+            app.conv_cursor = cursor;
+            let rows = rows(&mut app, 40, 8);
+            let name = format!("#{}", names[cursor]);
+            assert!(
+                rows.iter().any(|row| row.contains(&name)),
+                "cursor {cursor} on {name}: {rows:#?}"
+            );
+        }
     }
 }

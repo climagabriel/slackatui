@@ -299,17 +299,20 @@ by reading it back. They require sign-in; failures do not create a local mute.
 Old muted.json overrides are ignored. Muted conversations sort last;
 Slack preference refreshes follow unread-count polling.
 Under the recent sort (s cycles sorts; recent is the default) the list carries
-age dividers -- today, yesterday, this week, earlier -- above the conversations
-whose newest message is under 24, 48 and 168 hours old and above the rest.
+age dividers -- today, yesterday, this week, earlier -- each closing its group
+from below: the line sits under the last conversation whose newest message is
+under 24, 48 and 168 hours old, and under the last of the rest.
 The age is elapsed time, not a calendar date, so no timezone applies; a
 conversation with no cached message, or one dated ahead of now, falls under
 earlier. Only unstarred, unmuted conversations are grouped: starred ones sit
-above the first divider and muted ones below the list. A group with nobody in
-it draws no line, no other sort draws one, and none is drawn while a /find
-filter is typed: the needle re-sorts the list by how closely each name matches
-it, which is no longer age order. With unread first on, the unread
-run and the read run are each in recency order and each carries its own
-dividers. A divider is not a conversation: j and k step over it.
+above the first grouped conversation and muted ones below the last divider. A
+group with nobody in it draws no line, no other sort draws one, and none is
+drawn while a /find filter is typed: the needle re-sorts the list by how
+closely each name matches it, which is no longer age order. The grouped
+conversations are one sequence, so with unread first on an unread and a read
+conversation of the same age share one line; an unread conversation older than
+the read ones below it closes its own group where it sits. A divider is not a
+conversation: j and k step over it.
 /conversations-pane selects visible categories and individual conversations.
 Ctrl-Shift-P opens the same menu and /keys can rebind it. Terminals must report
 the Shift modifier separately; otherwise use the command or rebind the action.

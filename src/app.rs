@@ -6296,17 +6296,17 @@ pub(crate) mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         // Row 0 is the border, 1..=4 the top sections, 5 their divider, 6 the
-        // age divider this conversation falls under — it has no newest message,
-        // so `earlier` — and the first conversation lands on 7.
+        // first conversation, and 7 the age divider closing its group from
+        // below — it has no newest message, so `earlier`.
         assert!(
             (1..29)
-                .map(|x| terminal.backend().buffer()[(x, 6)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 7)].symbol())
                 .collect::<String>()
                 .contains(" earlier ")
         );
         let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
             (1..29)
-                .map(|x| terminal.backend().buffer()[(x, 7)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 6)].symbol())
                 .collect::<String>()
         };
         assert!(row(&terminal).ends_with("123"));

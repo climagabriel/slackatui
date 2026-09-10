@@ -1,5 +1,5 @@
 //! How old a conversation's newest message is, as one of four groups, and the
-//! line the conversations pane draws above each group under the `Recent` sort.
+//! line the conversations pane draws under each group under the `Recent` sort.
 //!
 //! Age here is elapsed time, not a calendar date: no timezone is involved and
 //! the boundaries are 24 h, 48 h and 168 h before one `now` captured per
@@ -7,9 +7,9 @@
 //! `Yesterday`, not `Today` — so every age lands in exactly one group and the
 //! boundaries do not overlap.
 //!
-//! The pane draws a line only where the group changes, so a group with no
-//! conversations draws nothing, and only under `Recent`: that is the one sort
-//! whose order is the order these groups are in.
+//! The pane draws a line under the last conversation of each group, so a group
+//! with no conversations draws nothing, and only under `Recent`: that is the
+//! one sort whose order is the order these groups are in.
 
 pub const DAY: i64 = 24 * 60 * 60;
 
@@ -43,8 +43,8 @@ impl AgeGroup {
     ///
     /// A conversation with no newest message, and one whose newest message is
     /// dated in the future, are both `Earlier`: neither has an age this can
-    /// place, and the last group is the one that needs no promise about what
-    /// sits under it.
+    /// place, and the last group is the one that promises least about the age
+    /// of what it holds.
     ///
     /// The arithmetic is done in `i128`: `now_secs` comes from a clock a test
     /// can pin, so a value whose microsecond count overflows an `i64` has to
