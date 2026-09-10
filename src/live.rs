@@ -102,6 +102,15 @@ pub enum JobKind {
     UnreadHistory {
         cid: String,
     },
+    /// The owner's recent threads, as `search.messages` names them: the
+    /// search half of the THREADS live phase.
+    ThreadSearch,
+    /// One thread's root and newest reply, for a THREADS card the archive
+    /// does not hold.
+    ThreadCard {
+        cid: String,
+        root: i64,
+    },
     /// The channels muted in Slack itself.
     MutedChannels {
         gen: u64,
@@ -128,6 +137,7 @@ impl JobKind {
             Self::File {..} => "file", Self::Mark {..} => "mark", Self::Send {..} => "send", Self::Upload {..} => "upload",
             Self::Delete {..} => "delete", Self::Leave {..} => "leave",
             Self::UnreadHistory {..} => "unread_history",
+            Self::ThreadSearch => "thread_search", Self::ThreadCard {..} => "thread_card",
             Self::MutedChannels {..} => "muted_channels", Self::SetMuted => "set_muted",
             Self::StarredChannels {..} => "starred_channels", Self::SetStarred => "set_starred",
         }
@@ -167,6 +177,17 @@ pub enum Done {
         /// message fetched is then only the oldest of a window, and the card
         /// must not present it as the first unread message.
         complete: bool,
+    },
+    /// The threads `search.messages` named, newest match first, deduplicated.
+    /// What the archive already holds is filtered out on this side, where the
+    /// view's own cards say what that is.
+    ThreadCandidates(Vec<ThreadTarget>),
+    /// One thread from Slack: its root, and the newest reply under it. `root`
+    /// is None for a thread Slack no longer has — the phase skips it rather
+    /// than stopping. Which thread it is travels on the job's `ThreadCard`.
+    ThreadCard {
+        root: Option<Box<Msg>>,
+        last: Option<Msg>,
     },
     Archived(PathBuf),
     Auth(Arc<Client>, String),
@@ -641,6 +662,343 @@ pub fn api_unread_history(
         }
         collected.dedup_by_key(|message| message.id);
         Ok(Done::UnreadHistory { msgs: collected, complete })
+    })
+}
+
+// ---------------------------------------------------------- thread fetch
+
+/// One thread the THREADS live phase asks Slack about. All that is known of
+/// it before the first call is where it lives and what its root is: the
+/// search answers with a reply, not with the thread.
+#[derive(Clone)]
+pub struct ThreadTarget {
+    pub cid: String,
+    /// The conversation as the search named it, for the card's header and
+    /// the progress line; the channel id where Slack sent no name.
+    pub name: String,
+    /// The thread root, as a message id.
+    pub root: i64,
+    /// The newest match that named this thread, across both queries. The
+    /// per-run cap orders by it: the queries are asked one after the other,
+    /// so collection order is `from:me`'s week and then the mentions' week,
+    /// and a cap taken in that order would drop today's mention for a
+    /// six-day-old message of the owner's.
+    pub newest: i64,
+}
+
+/// Matches per `search.messages` page.
+const THREAD_SEARCH_PAGE: usize = 100;
+/// Pages per query. Five pages of a hundred is five hundred of the owner's
+/// own messages in a week, which no week has; the window is what normally
+/// ends the walk, and this ends it when Slack answers with something else.
+const THREAD_SEARCH_PAGES: usize = 5;
+
+/// The thread ids the owner's recent messages and mentions name, newest
+/// first: `search.messages` for `from:me` and then for the literal `<@ME>`,
+/// paged while the matches stay inside the window.
+///
+/// A match names its thread only in its permalink — `?thread_ts=…` — which is
+/// the extraction `slackdump-my-threads` does in jq, and a match
+/// without one is a message in no thread and brings nothing in.
+///
+/// `since` is the window's start in whole seconds. Slack sorts the matches by
+/// timestamp descending, so a page whose last match is older than that is the
+/// page the window ends on: nothing behind it can be inside.
+///
+/// Narrates one line per request into `progress`, and that send is the
+/// cancellation check: the box holds the other end, so Esc stops the walk at
+/// the next request boundary.
+pub fn api_thread_search(
+    client: Arc<Client>,
+    me: String,
+    since: i64,
+    progress: mpsc::Sender<ScanLine>,
+) -> Job {
+    spawn(
+        JobKind::ThreadSearch,
+        "looking for your recent threads".to_string(),
+        move || {
+            let mut out: Vec<ThreadTarget> = Vec::new();
+            let mut seen: std::collections::HashMap<(String, i64), usize> =
+                std::collections::HashMap::new();
+            // The owner's own messages first: a thread they wrote in is a
+            // thread of theirs whether or not anyone named them in it.
+            for query in ["from:me".to_string(), format!("<@{me}>")] {
+                let mut cursor = "*".to_string();
+                let mut visited: std::collections::HashSet<String> =
+                    std::iter::once(cursor.clone()).collect();
+                for page in 0..THREAD_SEARCH_PAGES {
+                    let count = THREAD_SEARCH_PAGE.to_string();
+                    let response = client.call(
+                        "search.messages",
+                        &[
+                            ("query", query.as_str()),
+                            ("count", count.as_str()),
+                            ("sort", "timestamp"),
+                            ("sort_dir", "desc"),
+                            ("cursor", cursor.as_str()),
+                            ("highlight", "false"),
+                        ],
+                    )?;
+                    let matches = response
+                        .pointer("/messages/matches")
+                        .and_then(Value::as_array)
+                        .ok_or("Slack returned no message list")?;
+                    let mut oldest: Option<i64> = None;
+                    let mut found = 0usize;
+                    for value in matches {
+                        let Some(id) = value
+                            .get("ts")
+                            .and_then(Value::as_str)
+                            .and_then(crate::archive::ts_to_id)
+                        else {
+                            continue;
+                        };
+                        let secs = id / 1_000_000;
+                        oldest = Some(oldest.map_or(secs, |old: i64| old.min(secs)));
+                        if secs < since {
+                            continue;
+                        }
+                        let cid = value
+                            .pointer("/channel/id")
+                            .and_then(Value::as_str)
+                            .filter(|cid| !cid.is_empty());
+                        let root = value
+                            .get("permalink")
+                            .and_then(Value::as_str)
+                            .and_then(crate::archive::thread_ts_in_permalink)
+                            .and_then(crate::archive::ts_to_id);
+                        let (Some(cid), Some(root)) = (cid, root) else {
+                            continue;
+                        };
+                        // The same thread named again — by the other query,
+                        // or by an older message of the owner's in it — keeps
+                        // the newest of the matches that named it.
+                        if let Some(&at) = seen.get(&(cid.to_string(), root)) {
+                            out[at].newest = out[at].newest.max(id);
+                            continue;
+                        }
+                        let name = value
+                            .pointer("/channel/name")
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| format!("#{name}"))
+                            .unwrap_or_else(|| cid.to_string());
+                        seen.insert((cid.to_string(), root), out.len());
+                        out.push(ThreadTarget { cid: cid.to_string(), name, root, newest: id });
+                        found += 1;
+                    }
+                    progress
+                        .send(ScanLine::plain(format!(
+                            "search.messages {query:?} page {} → {} match{} · {found} thread{}",
+                            page + 1,
+                            matches.len(),
+                            if matches.len() == 1 { "" } else { "es" },
+                            if found == 1 { "" } else { "s" },
+                        )))
+                        .map_err(|_| "thread fetch cancelled".to_string())?;
+                    // The window ended inside this page, so the next one is
+                    // wholly behind it.
+                    if oldest.is_some_and(|oldest| oldest < since) {
+                        break;
+                    }
+                    let next = response
+                        .pointer("/messages/pagination/next_cursor")
+                        .or_else(|| response.pointer("/messages/paging/next_cursor"))
+                        .and_then(Value::as_str)
+                        .filter(|cursor| !cursor.is_empty())
+                        .map(str::to_string);
+                    // Slack ran out, or repeated a cursor it had already
+                    // given, which would page for ever.
+                    let Some(next) = next.filter(|next| visited.insert(next.clone())) else {
+                        break;
+                    };
+                    cursor = next;
+                }
+            }
+            // Newest match first, across both queries: the per-run cap then
+            // keeps the most recent threads whichever query named them, and a
+            // phase stopped halfway has fetched the ones worth having most.
+            out.sort_by_key(|target| std::cmp::Reverse(target.newest));
+            Ok(Done::ThreadCandidates(out))
+        },
+    )
+}
+
+/// Replies a page of the fallback walk asks for, and pages of it. Five
+/// hundred replies is deeper than a thread a card summarises ever goes; the
+/// walk exists for an answer Slack should not give at all.
+const THREAD_REPLY_PAGE: i64 = 100;
+const THREAD_REPLY_PAGES: usize = 5;
+
+/// The two Slack errors that mean the thread the search named is not there to
+/// be read: it was deleted, or the owner has left the conversation since the
+/// search answered. Neither says anything about the threads behind it, so the
+/// candidate is skipped and the phase goes on; every other error stops it.
+fn thread_is_gone(error: &str) -> bool {
+    error.contains("thread_not_found") || error.contains("channel_not_found")
+}
+
+/// The newest message in a `conversations.replies` answer that is not the
+/// thread's root. Slack prepends the parent to every answer, and a reply
+/// written since the request before can land in a window too.
+fn newest_reply(channel: &str, root: i64, response: &Value) -> Option<Msg> {
+    response
+        .get("messages")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|value| Msg::from_api(channel.to_string(), value.clone()))
+        .filter(|message| message.id != root)
+        .max_by_key(|message| message.id)
+}
+
+/// One thread's card from Slack: the root, and the newest reply under it.
+///
+/// Two requests, because `conversations.replies` pages a thread forward from
+/// its oldest reply: the newest one is reachable only by naming a bound, and
+/// the bound — the root's `latest_reply` — is what the first request is for.
+/// The second names it as `oldest`, inclusive, so the window holds that reply
+/// and nothing before it. `limit` is two rather than one: Slack returns the
+/// parent alongside the window whether or not it counts toward the limit, and
+/// a limit of one would hand back the parent alone wherever it does.
+///
+/// A thread with no reply costs one request: there is no bound to ask from,
+/// and the card is the root by itself. A root that says it has replies and
+/// carries no `latest_reply` costs more: the thread is walked forward, a
+/// hundred replies a request, and the newest of what comes back is the
+/// card's. Nothing else would find that reply, and a card sorted by its root
+/// while every other card sorts by its newest reply is a card in the wrong
+/// place in the view.
+///
+/// A thread Slack no longer has is skipped rather than fetched: `root` comes
+/// back None, and the phase goes on to the next thread. Slack says so with an
+/// error, which would otherwise stop the phase, and with an empty message
+/// list where it answers `ok` for a thread it cannot show.
+pub fn api_thread_card(
+    client: Arc<Client>,
+    target: ThreadTarget,
+    progress: mpsc::Sender<ScanLine>,
+) -> Job {
+    let ThreadTarget { cid, name, root, .. } = target;
+    let label = format!("fetching a thread in {name}");
+    let channel = cid.clone();
+    spawn(JobKind::ThreadCard { cid, root }, label, move || {
+        let ts = id_to_ts(root);
+        let say = |line: String| {
+            progress
+                .send(ScanLine::plain(line))
+                .map_err(|_| "thread fetch cancelled".to_string())
+        };
+        let ask = |params: &[(&str, &str)]| -> Result<Option<Value>, String> {
+            match client.call("conversations.replies", params) {
+                Ok(response) => Ok(Some(response)),
+                Err(error) if thread_is_gone(&error) => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        let gone = |say: &dyn Fn(String) -> Result<(), String>| -> Result<Done, String> {
+            say(format!("conversations.replies {name} ts={ts} → no thread"))?;
+            Ok(Done::ThreadCard { root: None, last: None })
+        };
+        let Some(response) = ask(&[
+            ("channel", channel.as_str()),
+            ("ts", ts.as_str()),
+            ("limit", "1"),
+        ])?
+        else {
+            return gone(&say);
+        };
+        let head = response
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .cloned();
+        let head = head.and_then(|value| Msg::from_api(channel.clone(), value));
+        let Some(head) = head.filter(|message| message.id == root) else {
+            return gone(&say);
+        };
+        say(format!(
+            "conversations.replies {name} ts={ts} → the root · {} repl{}",
+            head.reply_count,
+            if head.reply_count == 1 { "y" } else { "ies" }
+        ))?;
+        let last = match head.latest_reply_id.filter(|latest| *latest > root) {
+            // The bound Slack gave: one request for a window holding that
+            // reply and nothing before it.
+            Some(latest) => {
+                let bound = id_to_ts(latest);
+                let Some(response) = ask(&[
+                    ("channel", channel.as_str()),
+                    ("ts", ts.as_str()),
+                    ("oldest", bound.as_str()),
+                    ("inclusive", "true"),
+                    ("limit", "2"),
+                ])?
+                else {
+                    return gone(&say);
+                };
+                let last = newest_reply(&channel, root, &response);
+                say(format!(
+                    "conversations.replies {name} oldest={bound} → {}",
+                    if last.is_some() { "the newest reply" } else { "no reply" }
+                ))?;
+                last
+            }
+            // Replies, and no bound to ask from. Forward from the oldest is
+            // the only order the call pages in, so the whole thread is read
+            // and the newest kept. The count is what sizes the page and not
+            // what ends the walk: it counts replies Slack will not return,
+            // and the cursor is what says whether more are behind the page.
+            None if head.reply_count > 0 => {
+                let page = (head.reply_count + 1).clamp(1, THREAD_REPLY_PAGE).to_string();
+                let mut newest: Option<Msg> = None;
+                let mut cursor = String::new();
+                for request in 0..THREAD_REPLY_PAGES {
+                    let mut params = vec![
+                        ("channel", channel.as_str()),
+                        ("ts", ts.as_str()),
+                        ("limit", page.as_str()),
+                    ];
+                    if !cursor.is_empty() {
+                        params.push(("cursor", cursor.as_str()));
+                    }
+                    let Some(response) = ask(&params)? else {
+                        return gone(&say);
+                    };
+                    let got = response
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .map_or(0, |messages| messages.len());
+                    let here = newest_reply(&channel, root, &response);
+                    if here.as_ref().map(|reply| reply.id) > newest.as_ref().map(|reply| reply.id) {
+                        newest = here;
+                    }
+                    say(format!(
+                        "conversations.replies {name} ts={ts} page {} → {got} message{}",
+                        request + 1,
+                        if got == 1 { "" } else { "s" }
+                    ))?;
+                    let next = response
+                        .pointer("/response_metadata/next_cursor")
+                        .and_then(Value::as_str)
+                        .filter(|next| !next.is_empty() && *next != cursor)
+                        .map(str::to_string);
+                    let Some(next) = next else { break };
+                    cursor = next;
+                }
+                newest
+            }
+            None => None,
+        };
+        // The root as the archive's own roots come out: knowing its newest
+        // reply, whichever request found it. The view sorts every card by
+        // that reply, so a root that came back without a `latest_reply` and
+        // kept it would sort at its own ts, below cards answered before it.
+        let mut head = head;
+        if last.as_ref().map(|reply| reply.id) > head.latest_reply_id {
+            head.latest_reply_id = last.as_ref().map(|reply| reply.id);
+        }
+        Ok(Done::ThreadCard { root: Some(Box::new(head)), last })
     })
 }
 

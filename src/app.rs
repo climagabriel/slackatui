@@ -308,6 +308,21 @@ impl MsgList {
         self.mark_dirty();
     }
 
+    /// Put a card into the list at `at`, its item with it. The pair keeps
+    /// `msgs` and `cards` aligned, as `with_cards` and `replace_card` do.
+    ///
+    /// The cursor keeps its index rather than the card it was on. The one
+    /// caller inserts under a modal progress box, so the reader has not moved
+    /// it: index 0 is the newest card before the insertion and after it, and
+    /// following the old card down would leave the reader looking at the
+    /// middle of a list whose new cards are all above them.
+    pub fn insert_card(&mut self, at: usize, lead: Msg, card: render::Card) {
+        let at = at.min(self.msgs.len()).min(self.cards.len());
+        self.msgs.insert(at, lead);
+        self.cards.insert(at, card);
+        self.mark_dirty();
+    }
+
     /// Drop item `at`, its card with it, and keep the cursor in range.
     pub fn remove(&mut self, at: usize) {
         self.msgs.remove(at);
@@ -750,6 +765,30 @@ pub struct UnreadFetch {
     asked: usize,
 }
 
+/// The Slack half of THREADS: the owner's recent threads the archive does
+/// not hold, one thread at a time. It starts with the search out and an
+/// empty queue; the search's answer fills the queue.
+pub struct ThreadFetch {
+    /// Threads not asked about yet, newest match first.
+    queue: std::collections::VecDeque<live::ThreadTarget>,
+    /// The thread the call in flight is about: the card's header names the
+    /// conversation, and only the target carries the name the search gave.
+    current: Option<live::ThreadTarget>,
+    /// Where the reader was when the phase started. A different generation
+    /// when an answer lands means they have gone elsewhere, and it lands
+    /// nowhere.
+    nav_generation: u64,
+    /// Cloned into every call's worker, which narrates through it. The box
+    /// holds the other end, so dropping the box ends the call in flight.
+    progress: std::sync::mpsc::Sender<crate::live::ScanLine>,
+    /// Cards added so far, out of the threads asked about.
+    added: usize,
+    asked: usize,
+    /// Threads the search found past the per-run cap, which this run leaves
+    /// for the next one and the status line counts.
+    over_cap: usize,
+}
+
 /// The `/find` progress box: what the archive scan has said so far, and
 /// whether a Slack search for the same query is still out. It is drawn while
 /// it exists and dropped when the last phase lands.
@@ -777,6 +816,8 @@ pub enum ScanOwner {
     Search,
     /// The UNREADS live phase.
     UnreadFetch,
+    /// The THREADS live phase.
+    ThreadFetch,
 }
 
 pub struct ScanOverlay {
@@ -968,6 +1009,8 @@ pub struct App {
     pub scan_overlay: Option<ScanOverlay>,
     /// The UNREADS live phase, while it has conversations left to fetch.
     unread_fetch: Option<UnreadFetch>,
+    /// The THREADS live phase, while it has a search out or threads left.
+    thread_fetch: Option<ThreadFetch>,
     /// The archive scan in flight and what to do with what it finds.
     pending_search: Option<ArchiveSearch>,
     /// Holds the next scan's worker until a test lets it run.
@@ -1134,6 +1177,7 @@ impl App {
             scan: None,
             scan_overlay: None,
             unread_fetch: None,
+            thread_fetch: None,
             pending_search: None,
             #[cfg(test)]
             scan_gate: None,
@@ -2963,6 +3007,7 @@ impl App {
         self.scan_overlay = None;
         self.pending_search = None;
         self.unread_fetch = None;
+        self.thread_fetch = None;
     }
 
     pub fn open_thread_in(&mut self, cid: String, root: i64, focus: i64) {
@@ -3430,6 +3475,17 @@ impl App {
             self.status = format!(
                 "unread fetch abandoned; {replaced} card{} filled in from Slack",
                 if replaced == 1 { "" } else { "s" }
+            );
+            return;
+        }
+        // The THREADS live phase, likewise: the cards it has already added
+        // stay, and the threads behind them are left for the next run.
+        if let Some(phase) = self.thread_fetch.as_ref() {
+            let added = phase.added;
+            self.drop_scan();
+            self.status = format!(
+                "thread fetch abandoned; {added} thread{} added from Slack",
+                if added == 1 { "" } else { "s" }
             );
             return;
         }
@@ -3983,10 +4039,14 @@ impl App {
     }
 
     /// Every thread the owner took part in or was mentioned in, newest reply
-    /// first, from the cache, one card per thread: the conversation and its
-    /// participants, the root, the replies between elided, and the newest
-    /// reply. Archive-wide: it opens no conversation, and the conversation
-    /// cursor stays where it was.
+    /// first, one card per thread: the conversation and its participants, the
+    /// root, the replies between elided, and the newest reply. Archive-wide:
+    /// it opens no conversation, and the conversation cursor stays where it
+    /// was.
+    ///
+    /// Two phases, as UNREADS has: the archive builds every card it can, and
+    /// then a signed-in session asks Slack for the owner's recent threads the
+    /// archive does not hold. `r` runs both again.
     fn open_my_threads(&mut self) {
         // Leaving for THREADS.
         self.nav_generation = self.nav_generation.wrapping_add(1);
@@ -4048,13 +4108,300 @@ impl App {
                 ));
             }
         }
-        cards.sort_by_key(|(root, _)| std::cmp::Reverse(root.latest_reply_id.unwrap_or(root.id)));
+        cards.sort_by_key(|(root, _)| Self::thread_card_order(root));
         let n = cards.len();
-        self.stack.push(View::Threads {
-            list: MsgList::with_cards(cards),
-        });
+        let list = MsgList::with_cards(cards);
+        match self.stack.last_mut() {
+            // A rerun replaces the view in place rather than stacking a
+            // second copy of it over the first.
+            Some(View::Threads { list: open }) => *open = list,
+            _ => self.stack.push(View::Threads { list }),
+        }
         self.focus = Focus::Msgs;
         self.status = format!("{n} threads you took part in or were mentioned in, newest reply first");
+        self.start_thread_fetch();
+    }
+
+    /// Where a THREADS card sorts: by its newest reply, and by the root for a
+    /// thread that has none. One function for both halves of the view, so a
+    /// card the archive built and a card Slack built are ordered by the same
+    /// measure and the merged list is one list.
+    fn thread_card_order(root: &Msg) -> std::cmp::Reverse<i64> {
+        std::cmp::Reverse(root.latest_reply_id.unwrap_or(root.id))
+    }
+
+    /// Threads fetched from Slack in one run of the phase. Fifty threads is
+    /// a hundred `conversations.replies` calls, which is as much of a
+    /// workspace's rate limit as one keystroke should spend; what the search
+    /// found past it is counted in the status line and left for the next run.
+    const THREAD_FETCH_CAP: usize = 50;
+
+    /// How far back the search looks, in seconds. A week of the owner's own
+    /// messages and mentions is what an hourly archive job can be behind by
+    /// after a weekend of failures, and it is the window
+    /// `slackdump-my-threads` walks.
+    const THREAD_FETCH_WINDOW: i64 = 7 * 24 * 60 * 60;
+
+    /// The live half of THREADS: ask Slack which threads the owner has been
+    /// in this week, and fetch the ones the archive does not hold, behind the
+    /// progress box `/find` uses. Only when signed in; nothing fetched here
+    /// reaches an archive, and a rerun of the view runs the phase again.
+    fn start_thread_fetch(&mut self) {
+        // A rerun replaces the phase, and the call in flight belongs to the
+        // generation just left behind: its answer would land nowhere anyway.
+        if self.thread_fetch.take().is_some() {
+            self.scan = None;
+            self.scan_overlay = None;
+        }
+        let Some(client) = self.api.clone().filter(|_| self.live) else { return };
+        let Some(me) = self.corpus.me.clone() else { return };
+        // The one scan slot is the archive search's while it holds it, and
+        // taking it from under a running `/find` would strand its view.
+        if self.scan.is_some() || self.pending_search.is_some() {
+            return;
+        }
+        let (sender, progress) = std::sync::mpsc::channel();
+        self.scan_overlay = Some(ScanOverlay {
+            owner: ScanOwner::ThreadFetch,
+            nav_generation: self.nav_generation,
+            label: "THREADS".to_string(),
+            lines: Vec::new(),
+            started: Instant::now(),
+            live_pending: false,
+            finished: false,
+            progress,
+        });
+        self.thread_fetch = Some(ThreadFetch {
+            queue: std::collections::VecDeque::new(),
+            current: None,
+            nav_generation: self.nav_generation,
+            progress: sender.clone(),
+            added: 0,
+            asked: 0,
+            over_cap: 0,
+        });
+        let since = self.now_secs() - Self::THREAD_FETCH_WINDOW;
+        self.scan = Some(live::api_thread_search(client, me, since, sender));
+    }
+
+    /// The search answered: everything the archive already holds is dropped,
+    /// what is left is capped, and the first of them goes out.
+    ///
+    /// What the archive holds is the view's own cards — the archive pass has
+    /// just built one per thread it has — so a thread already on screen is
+    /// never fetched and nothing is shown twice.
+    fn apply_thread_candidates(&mut self, targets: Vec<live::ThreadTarget>) {
+        let Some(phase) = self.thread_fetch.as_ref() else { return };
+        if phase.nav_generation != self.nav_generation {
+            self.thread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        }
+        let Some(client) = self.api.clone() else {
+            self.thread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        };
+        let held: HashSet<(String, i64)> = match self.stack.last() {
+            Some(View::Threads { list }) => list
+                .msgs
+                .iter()
+                .map(|root| (root.channel_id.clone(), root.id))
+                .collect(),
+            // The reader is not on THREADS any more, generation or no.
+            _ => {
+                self.thread_fetch = None;
+                self.scan_overlay = None;
+                return;
+            }
+        };
+        let found = targets.len();
+        let mut wanted: Vec<live::ThreadTarget> = targets
+            .into_iter()
+            .filter(|target| !held.contains(&(target.cid.clone(), target.root)))
+            .collect();
+        let over_cap = wanted.len().saturating_sub(Self::THREAD_FETCH_CAP);
+        wanted.truncate(Self::THREAD_FETCH_CAP);
+        let said = format!(
+            "{found} thread{} in the last week · {} the archive does not hold{}",
+            if found == 1 { "" } else { "s" },
+            wanted.len(),
+            if over_cap > 0 {
+                format!(" · {over_cap} older not fetched (cap {})", Self::THREAD_FETCH_CAP)
+            } else {
+                String::new()
+            },
+        );
+        self.say_in_scan(ScanOwner::ThreadFetch, live::ScanLine::dim(said));
+        if let Some(phase) = self.thread_fetch.as_mut() {
+            phase.asked = wanted.len();
+            phase.over_cap = over_cap;
+            phase.queue = wanted.into();
+        }
+        self.next_thread_fetch(&client);
+    }
+
+    /// Send the next thread's calls, or close the phase when the queue is
+    /// empty.
+    fn next_thread_fetch(&mut self, client: &Arc<Client>) {
+        let Some(phase) = self.thread_fetch.as_mut() else { return };
+        let Some(target) = phase.queue.pop_front() else {
+            let (added, asked, over_cap) = (phase.added, phase.asked, phase.over_cap);
+            self.thread_fetch = None;
+            self.status = if asked == 0 {
+                "Slack has no thread of yours this week the archive does not hold".to_string()
+            } else {
+                format!(
+                    "{added} of {asked} thread{} fetched from Slack{}",
+                    if asked == 1 { "" } else { "s" },
+                    // Not "left for the next run": every run searches the same
+                    // week and caps the same way, so a rerun fetches these
+                    // fifty again and never reaches the ones behind them.
+                    if over_cap > 0 {
+                        format!(
+                            "; {over_cap} older thread{} not fetched (cap {})",
+                            if over_cap == 1 { "" } else { "s" },
+                            Self::THREAD_FETCH_CAP,
+                        )
+                    } else {
+                        String::new()
+                    },
+                )
+            };
+            let said = self.status.clone();
+            self.say_in_scan(ScanOwner::ThreadFetch, live::ScanLine::dim(said));
+            self.close_scan_overlay(ScanOwner::ThreadFetch);
+            return;
+        };
+        let progress = phase.progress.clone();
+        // The target goes to the worker; the copy is what the answer's card
+        // takes the conversation's name from.
+        phase.current = Some(target.clone());
+        self.scan = Some(live::api_thread_card(client.clone(), target, progress));
+    }
+
+    /// One thread arrived: its card goes into the list in reply order, among
+    /// the archive's own, and the next thread goes out.
+    ///
+    /// The card is built the way the archive pass builds one — conversation,
+    /// participants, root, the replies between elided, the newest reply — so
+    /// a live card and an archived card are one kind of card. Nothing here
+    /// writes to an archive: slackdump is its only writer, and the fetch
+    /// exists exactly because the archive does not hold these threads.
+    fn apply_thread_card(&mut self, cid: &str, root_id: i64, root: Option<Msg>, last: Option<Msg>) {
+        let Some(phase) = self.thread_fetch.as_ref() else { return };
+        // The reader left THREADS while this was out. Every navigation
+        // primitive bumps the generation, which is what makes the check
+        // complete where a list of keys to intercept could not be.
+        if phase.nav_generation != self.nav_generation {
+            self.thread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        }
+        let Some(client) = self.api.clone() else {
+            self.thread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        };
+        let searched = phase
+            .current
+            .as_ref()
+            .filter(|target| target.cid == cid && target.root == root_id)
+            .map(|target| target.name.clone());
+        if let Some(mut root) = root {
+            // The conversation as this session names it, and the name the
+            // search gave where the session has none: a thread in a channel
+            // no archive holds is the case the phase is for.
+            let conversation = self
+                .corpus
+                .conv_by_channel(cid)
+                .map(|index| self.corpus.convs[index].name.clone())
+                .or_else(|| self.corpus.channel_names.get(cid).map(|name| format!("#{name}")))
+                .or(searched)
+                .unwrap_or_else(|| cid.to_string());
+            let ctx = Ctx {
+                archive: None,
+                corpus: &self.corpus,
+                tz: self.tz,
+                image_font: None,
+                last_read: None,
+                palette: &self.palette,
+            };
+            let participants = render::participants(&root, &ctx);
+            let mut last = last;
+            // The card's header names the conversation; a message header
+            // would say it again under it.
+            root.channel_name = None;
+            if let Some(last) = last.as_mut() {
+                last.channel_name = None;
+            }
+            let total = root.reply_count.max(i64::from(last.is_some()));
+            let hidden = (total - i64::from(last.is_some())).max(0);
+            let counted_from = root.id;
+            let counted_through = last.as_ref().map_or(root.id, |last| last.id);
+            let card = render::Card {
+                conversation,
+                participants,
+                hidden,
+                counted_from,
+                counted_through,
+                tail: last.into_iter().collect(),
+                elision: render::Elision::Replies,
+            };
+            if let Some(View::Threads { list }) = self.stack.last_mut() {
+                let order = Self::thread_card_order(&root);
+                let at = list
+                    .msgs
+                    .iter()
+                    .position(|other| Self::thread_card_order(other) > order)
+                    .unwrap_or(list.msgs.len());
+                list.insert_card(at, root, card);
+                if let Some(phase) = self.thread_fetch.as_mut() {
+                    phase.added += 1;
+                }
+            }
+        }
+        self.next_thread_fetch(&client);
+    }
+
+    /// A call failed — a rate-limit reply is the one this is written for — so
+    /// the phase stops where it stands. The cards it has added stay; the
+    /// threads it had not reached are left for the next run.
+    fn stop_thread_fetch(&mut self, error: String) {
+        let Some(phase) = self.thread_fetch.take() else {
+            self.status = error;
+            return;
+        };
+        let left = phase.queue.len() + usize::from(phase.current.is_some()) + phase.over_cap;
+        self.status = format!(
+            "Slack: {error}; {left} thread{} left unfetched",
+            if left == 1 { "" } else { "s" }
+        );
+        let said = self.status.clone();
+        self.say_in_scan(ScanOwner::ThreadFetch, live::ScanLine::plain(said));
+        self.close_scan_overlay(ScanOwner::ThreadFetch);
+    }
+
+    /// Drive the THREADS live phase to its end the way the event loop does,
+    /// and hand back what the progress box said while it ran.
+    #[cfg(test)]
+    pub(crate) fn finish_thread_fetch_for_test(&mut self) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.thread_fetch.is_some() && Instant::now() < deadline {
+            self.tick();
+            if self.thread_fetch.is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(self.thread_fetch.is_none(), "the thread fetch never finished");
+        let lines = self
+            .scan_overlay
+            .as_ref()
+            .map(|overlay| overlay.lines.iter().map(|line| line.text.clone()).collect())
+            .unwrap_or_default();
+        // The box lives one tick past its last line; this is that tick.
+        self.tick();
+        lines
     }
 
     /// The messages an UNREADS card draws under its first one: at most this
@@ -5034,6 +5381,17 @@ impl App {
                     self.apply_unread_history(&cid, msgs, complete);
                 }
                 (JobKind::UnreadHistory { .. }, Err(error)) => self.stop_unread_fetch(error),
+                // The THREADS live phase shares them too: the search
+                // answers, and then one thread at a time.
+                (JobKind::ThreadSearch, Ok(Done::ThreadCandidates(targets))) => {
+                    self.apply_thread_candidates(targets);
+                }
+                (JobKind::ThreadCard { cid, root }, Ok(Done::ThreadCard { root: head, last })) => {
+                    self.apply_thread_card(&cid, root, head.map(|head| *head), last);
+                }
+                (JobKind::ThreadSearch | JobKind::ThreadCard { .. }, Err(error)) => {
+                    self.stop_thread_fetch(error)
+                }
                 (_, Ok(_)) => {}
                 (_, Err(error)) => {
                     self.pending_search = None;
@@ -6374,6 +6732,9 @@ impl App {
                 };
             }
             Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Unreads { .. })) => self.open_unreads(),
+            // Both halves again: the archive rebuilds every card it can, and
+            // Slack is asked afresh for the threads it does not hold.
+            Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Threads { .. })) => self.open_my_threads(),
             Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Feed { .. })) => self.fetch_sent(false),
             Some(Action::Reload) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
             Some(Action::Refresh) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
@@ -10241,6 +10602,892 @@ pub(crate) mod tests {
         assert!(matches!(app.stack.last(), Some(View::Threads { .. })));
         assert_eq!(app.active_list().unwrap().cursor, 1);
         assert_eq!(app.selected().unwrap().id, 40_000_000);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An app whose archive holds two of the owner's threads in #one: one
+    /// answered twice and one answered once, the second the more recently.
+    /// The clock is pinned, so the phase's seven-day window is a fixed range
+    /// of fixture timestamps rather than one that moves with the suite: every
+    /// second past 200 is inside it.
+    fn threads_test_app(dir: &std::path::Path) -> App {
+        crate::archive::channel_database(
+            dir,
+            &[("C1", "one", Kind::Channel)],
+            &[
+                ("C1", 300, 300, "U1", "archived root one"),
+                ("C1", 310, 300, "U2", "archived reply one"),
+                ("C1", 380, 300, "U2", "archived reply two"),
+                ("C1", 500, 500, "U1", "archived root two"),
+                ("C1", 520, 500, "U2", "archived reply three"),
+            ],
+        );
+        crate::archive::set_message_data(dir, 300, json!({"reply_count": 2}));
+        crate::archive::set_message_data(dir, 500, json!({"reply_count": 1}));
+        let mut app = mute_test_app();
+        app.clock = Some(605_000);
+        app.cache_dir = dir.join("cache");
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.corpus.me = Some("U1".into());
+        app.corpus.archives.push(Archive::open("test".into(), dir).unwrap());
+        // The same names the archive's own user table carries, so a card the
+        // archive built and a card Slack built name a person the same way.
+        app.corpus.merge_profiles(vec![
+            json!({"id": "U1", "name": "u1"}),
+            json!({"id": "U2", "name": "u2"}),
+        ]);
+        let one = app.corpus.convs.iter().position(|c| c.id == "C1").expect("#one");
+        app.corpus.convs[one].archive = 0;
+        app.corpus.convs[one].live_only = false;
+        app.live = true;
+        app
+    }
+
+    /// The threads the live phase's stub Slack holds, as `(channel, root,
+    /// root text, replies, whether the root carries `latest_reply`)` in whole
+    /// seconds. Slack sends `latest_reply` on every parent that has replies;
+    /// a root without one is the answer the fallback walk exists for.
+    type StubThread = (&'static str, i64, &'static str, Vec<(i64, &'static str)>, bool);
+
+    /// A stub thread whose root carries `latest_reply`, which is what Slack
+    /// answers with.
+    fn stub_thread(
+        cid: &'static str,
+        root: i64,
+        text: &'static str,
+        replies: Vec<(i64, &'static str)>,
+    ) -> StubThread {
+        (cid, root, text, replies, true)
+    }
+    /// One search match the stub answers with: `(query, channel, thread root,
+    /// the match's own timestamp)`, all in whole seconds.
+    type StubMatch = (&'static str, &'static str, i64, i64);
+
+    /// The two live threads every THREADS live test uses, and the archive's
+    /// own newer thread beside them — held by the stub too, so a phase that
+    /// wrongly asked for it would get an answer and draw a second card for
+    /// it, which is a visible failure rather than a silent one.
+    fn live_threads() -> Vec<StubThread> {
+        vec![
+            stub_thread("C9", 400, "live root A", vec![
+                (420, "live A first"),
+                (440, "live A second"),
+                (600, "live A newest"),
+            ]),
+            stub_thread("C9", 210, "live root B", vec![(250, "live B newest")]),
+            stub_thread("C1", 500, "archived root two", vec![(520, "archived reply three")]),
+        ]
+    }
+
+    /// A Slack that answers the THREADS live phase from what each request
+    /// asks for. `search.messages` takes the matches whose query is the one
+    /// asked, sorts them newest first, pages them by the `count` it is given
+    /// and hands back a cursor while any are left; `conversations.replies`
+    /// answers from the threads, honouring `oldest`, `inclusive` and `limit`
+    /// as Slack documents them, with the parent first and counting toward the
+    /// limit. Deriving the answers from the parameters is what makes a
+    /// paging, window or reply-bound regression fail here rather than pass on
+    /// a canned page.
+    ///
+    /// A match names its thread only in its permalink, as Slack's matches do.
+    ///
+    /// Every call is recorded as `(method, what it asked for)`. From call
+    /// `gate_from` on — counting from one — the stub blocks until the
+    /// returned sender is used, so a test can look at the phase while a call
+    /// is out; `usize::MAX` never blocks. Every other method gets the quiet
+    /// answer the background jobs need.
+    #[allow(clippy::type_complexity)]
+    fn thread_slack(
+        matches: Vec<StubMatch>,
+        threads: Vec<StubThread>,
+        gate_from: usize,
+    ) -> (
+        Arc<Client>,
+        std::sync::mpsc::Receiver<(String, String)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (asked, seen) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let client = Client::for_test(move |method, params| {
+            if method != "search.messages" && method != "conversations.replies" {
+                return Ok(quiet_slack());
+            }
+            let field = |key: &str| {
+                params.iter().find(|(k, _)| *k == key).map_or(String::new(), |(_, v)| (*v).to_string())
+            };
+            let number = |key: &str| field(key).split('.').next().and_then(|s| s.parse::<i64>().ok());
+            if method == "search.messages" {
+                let query = field("query");
+                let count: usize = field("count").parse().unwrap_or(100);
+                let page: usize = field("cursor")
+                    .strip_prefix("page-")
+                    .and_then(|page| page.parse().ok())
+                    .unwrap_or(0);
+                asked.send((method.to_string(), format!("{query} page {page}"))).expect("read");
+                let mut mine: Vec<&StubMatch> =
+                    matches.iter().filter(|(q, _, _, _)| *q == query).collect();
+                mine.sort_by_key(|(_, _, _, ts)| std::cmp::Reverse(*ts));
+                let taken: Vec<&&StubMatch> = mine.iter().skip(page * count).take(count).collect();
+                let values: Vec<serde_json::Value> = taken
+                    .iter()
+                    .map(|(_, cid, root, ts)| {
+                        json!({
+                            "ts": format!("{ts}.000000"),
+                            "user": "U1",
+                            "text": format!("a match in {cid}"),
+                            "channel": {"id": cid, "name": cid.to_lowercase()},
+                            "permalink": format!(
+                                "https://x.slack.com/archives/{cid}/p{ts}000000?thread_ts={root}.000000&cid={cid}"
+                            ),
+                        })
+                    })
+                    .collect();
+                let more = mine.len() > page * count + values.len();
+                let cursor = if more { format!("page-{}", page + 1) } else { String::new() };
+                if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= gate_from {
+                    let _ = gate.lock().expect("gate").recv();
+                }
+                return Ok(json!({"ok": true, "messages": {"matches": values,
+                                 "pagination": {"next_cursor": cursor}}}));
+            }
+            let channel = field("channel");
+            let ts = field("ts");
+            let limit: usize = field("limit").parse().unwrap_or(1000);
+            let oldest = field("oldest");
+            let inclusive = field("inclusive") == "true";
+            asked
+                .send((
+                    method.to_string(),
+                    format!("{channel} ts={ts} oldest={oldest} limit={limit}"),
+                ))
+                .expect("read");
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= gate_from {
+                let _ = gate.lock().expect("gate").recv();
+            }
+            let Some((_, root, text, replies, sends_latest)) = threads
+                .iter()
+                .find(|(cid, root, _, _, _)| *cid == channel && format!("{root}.000000") == ts)
+            else {
+                // What Slack answers for a thread it cannot show, and what it
+                // answers when the conversation itself is out of reach.
+                return Err(format!(
+                    "conversations.replies: {}",
+                    if threads.iter().any(|(cid, _, _, _, _)| *cid == channel) {
+                        "thread_not_found"
+                    } else {
+                        "channel_not_found"
+                    }
+                ));
+            };
+            let mut head = json!({
+                "ts": format!("{root}.000000"), "user": "U1", "text": text,
+                "thread_ts": format!("{root}.000000"),
+                "reply_count": replies.len(), "reply_users": ["U2"], "reply_users_count": 1,
+            });
+            if *sends_latest {
+                if let Some((second, _)) = replies.last() {
+                    head["latest_reply"] = json!(format!("{second}.000000"));
+                }
+            }
+            let floor = number("oldest").filter(|_| !oldest.is_empty());
+            let window: Vec<&(i64, &str)> = replies
+                .iter()
+                .filter(|(second, _)| {
+                    !floor.is_some_and(|floor| *second < floor || (*second == floor && !inclusive))
+                })
+                .collect();
+            // The parent comes back first and counts toward the limit, so a
+            // page holds one fewer reply than the limit asks for; the cursor
+            // says where the next page picks the window up.
+            let from: usize = field("cursor")
+                .strip_prefix("reply-")
+                .and_then(|at| at.parse().ok())
+                .unwrap_or(0);
+            let room = limit.max(1) - 1;
+            let mut out = vec![head];
+            for (second, text) in window.iter().skip(from).take(room) {
+                out.push(json!({"ts": format!("{second}.000000"), "user": "U2", "text": text,
+                                "thread_ts": format!("{root}.000000")}));
+            }
+            let read = from + out.len() - 1;
+            let cursor = if window.len() > read { format!("reply-{read}") } else { String::new() };
+            Ok(json!({"ok": true, "messages": out,
+                      "response_metadata": {"next_cursor": cursor}}))
+        });
+        (Arc::new(client), seen, release)
+    }
+
+    /// The THREADS view as it stands: one row per card, `(conversation,
+    /// participants, root id, elided replies, drawn reply ids)`.
+    fn thread_cards(app: &App) -> Vec<(String, String, i64, i64, Vec<i64>)> {
+        match app.stack.last() {
+            Some(View::Threads { list }) => list
+                .msgs
+                .iter()
+                .zip(&list.cards)
+                .map(|(root, card)| {
+                    (
+                        card.conversation.clone(),
+                        card.participants.clone(),
+                        root.id,
+                        card.hidden,
+                        card.tail.iter().map(|reply| reply.id).collect(),
+                    )
+                })
+                .collect(),
+            _ => panic!("not the THREADS view"),
+        }
+    }
+
+    /// What the stub was asked, in order.
+    fn calls_of(seen: &std::sync::mpsc::Receiver<(String, String)>) -> Vec<String> {
+        seen.try_iter().map(|(method, what)| format!("{method} {what}")).collect()
+    }
+
+    /// A signed-in session asks Slack which threads the owner has been in
+    /// this week and fetches the ones the archive does not hold: the view
+    /// shows the archive's two cards, then four, newest reply first, the live
+    /// ones carrying their root and their newest reply. A thread the archive
+    /// already holds is not fetched, and nothing fetched reaches the archive.
+    #[test]
+    fn threads_fills_in_the_threads_slack_has_and_the_archive_does_not() {
+        let dir = crate::archive::test_dir("threads-live");
+        let mut app = threads_test_app(&dir);
+        let (client, seen, _release) = thread_slack(
+            vec![
+                ("from:me", "C9", 400, 600),
+                // The archive's own newer thread, which it holds already.
+                ("from:me", "C1", 500, 520),
+                ("from:me", "C9", 210, 250),
+                // The same thread again, through the mention query.
+                ("<@U1>", "C9", 400, 590),
+            ],
+            live_threads(),
+            usize::MAX,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // The archive pass first: its two threads, newest reply first.
+        assert_eq!(
+            thread_cards(&app),
+            vec![
+                ("#one".to_string(), "u1".to_string(), 500_000_000, 0, vec![520_000_000]),
+                ("#one".to_string(), "u1".to_string(), 300_000_000, 1, vec![380_000_000]),
+            ]
+        );
+        // The phase runs behind the progress box `/find` draws, which is
+        // modal over the view it is filling in.
+        assert!(app.scan_running(), "no progress box");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::ThreadFetch));
+        let before = screen_of(&mut app, 100, 44);
+        assert!(!before.contains("live root A"), "{before}");
+        let lines = app.finish_thread_fetch_for_test();
+        // Two live cards among the archived ones, ordered by newest reply
+        // whichever half built them.
+        assert_eq!(
+            thread_cards(&app),
+            vec![
+                ("#c9".to_string(), "u2".to_string(), 400_000_000, 2, vec![600_000_000]),
+                ("#one".to_string(), "u1".to_string(), 500_000_000, 0, vec![520_000_000]),
+                ("#one".to_string(), "u1".to_string(), 300_000_000, 1, vec![380_000_000]),
+                ("#c9".to_string(), "u2".to_string(), 210_000_000, 0, vec![250_000_000]),
+            ]
+        );
+        // Two searches, and two calls per thread fetched — never one for the
+        // thread the archive already holds, and never a second one for the
+        // thread the mention query named again.
+        assert_eq!(
+            calls_of(&seen),
+            [
+                "search.messages from:me page 0",
+                "search.messages <@U1> page 0",
+                "conversations.replies C9 ts=400.000000 oldest= limit=1",
+                "conversations.replies C9 ts=400.000000 oldest=600.000000 limit=2",
+                "conversations.replies C9 ts=210.000000 oldest= limit=1",
+                "conversations.replies C9 ts=210.000000 oldest=250.000000 limit=2",
+            ]
+        );
+        // One log line per API call, owner-tagged by the box it is in.
+        for said in [
+            "search.messages \"from:me\" page 1 → 3 matches · 3 threads",
+            "search.messages \"<@U1>\" page 1 → 1 match · 0 threads",
+            "conversations.replies #c9 ts=400.000000 → the root · 3 replies",
+            "conversations.replies #c9 oldest=600.000000 → the newest reply",
+            "conversations.replies #c9 ts=210.000000 → the root · 1 reply",
+        ] {
+            assert!(lines.contains(&said.to_string()), "{said:?} is not in {lines:#?}");
+        }
+        assert!(app.status.contains("2 of 2 threads fetched from Slack"), "{}", app.status);
+        // The root and the newest reply are drawn, the replies between are
+        // counted and not drawn, and the archived cards are as they were.
+        let after = screen_of(&mut app, 100, 44);
+        for drawn in ["live root A", "live A newest", "live root B", "live B newest",
+                      "archived root one", "archived reply two"] {
+            assert!(after.contains(drawn), "{drawn:?} is not on screen:\n{after}");
+        }
+        for hidden in ["live A first", "live A second"] {
+            assert!(!after.contains(hidden), "{hidden:?} should be elided:\n{after}");
+        }
+        assert!(after.contains("… 2 more replies"), "{after}");
+        // Nothing was written to the archive: it holds what it held.
+        let archive = &app.corpus.archives[0];
+        assert_eq!(archive.timeline_count("C1").unwrap(), 2);
+        assert_eq!(archive.timeline_count("C9").unwrap(), 0);
+        // `r` runs both phases again: the archive rebuilds its two cards and
+        // Slack is asked afresh for the rest.
+        app.on_msg_key(Some(Action::Refresh));
+        assert_eq!(thread_cards(&app).len(), 2, "the rerun kept the live cards");
+        app.finish_thread_fetch_for_test();
+        assert_eq!(thread_cards(&app).len(), 4);
+        assert_eq!(calls_of(&seen).len(), 6, "the rerun asked a different number of times");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Enter on a live card opens its thread the way it opens a conversation
+    /// only Slack has: the archive has nothing to open it from, so the thread
+    /// comes from Slack.
+    #[test]
+    fn enter_on_a_live_thread_card_opens_the_thread_from_slack() {
+        let dir = crate::archive::test_dir("threads-live-open");
+        let mut app = threads_test_app(&dir);
+        let (client, _seen, _release) =
+            thread_slack(vec![("from:me", "C9", 400, 600)], live_threads(), usize::MAX);
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.finish_thread_fetch_for_test();
+        // The newest thread is the live one, and the cursor is on it.
+        assert_eq!(app.selected().map(|root| root.id), Some(400_000_000));
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(), Some(View::Thread { root: 400_000_000, .. })),
+            "the live card opened the wrong thread");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.job.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Root and all three replies, which no archive holds.
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [400_000_000, 420_000_000, 440_000_000, 600_000_000]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A page whose oldest match is still inside the window has more behind
+    /// it, so the next one goes out; a page whose oldest match is outside it
+    /// is the page the window ends in, and nothing behind it can be inside.
+    #[test]
+    fn a_search_page_whose_oldest_match_is_inside_the_window_fetches_the_next() {
+        let dir = crate::archive::test_dir("threads-live-paging");
+        let mut app = threads_test_app(&dir);
+        // A hundred matches, every one of them inside the window and every
+        // one naming the same thread, then one page more; the mention query
+        // answers with a single match from before the window.
+        let mut matches: Vec<StubMatch> =
+            (0..100).map(|n| ("from:me", "C9", 400, 600 - n)).collect();
+        matches.push(("from:me", "C9", 210, 250));
+        // A hundred and one matches for the mention query, every one of them
+        // from before the window: a full page with a cursor behind it, which
+        // only the window stops.
+        matches.extend((0..101).map(|n| ("<@U1>", "C9", 210, 99 + n)));
+        let (client, seen, _release) = thread_slack(matches, live_threads(), usize::MAX);
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let lines = app.finish_thread_fetch_for_test();
+        let asked = calls_of(&seen);
+        assert_eq!(
+            asked.iter().filter(|call| call.starts_with("search.messages")).collect::<Vec<_>>(),
+            [
+                "search.messages from:me page 0",
+                "search.messages from:me page 1",
+                // One page only: its oldest match is older than the window.
+                "search.messages <@U1> page 0",
+            ],
+            "the paging is wrong"
+        );
+        // The first page carried a hundred matches for one thread; the second
+        // named the other and ended the walk on its own.
+        assert!(lines.contains(&"search.messages \"from:me\" page 1 → 100 matches · 1 thread".to_string()),
+            "{lines:#?}");
+        assert!(lines.contains(&"search.messages \"from:me\" page 2 → 1 match · 1 thread".to_string()),
+            "{lines:#?}");
+        // The match from before the window brought nothing in with it.
+        assert!(lines.contains(&"search.messages \"<@U1>\" page 1 → 100 matches · 0 threads".to_string()),
+            "{lines:#?}");
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [400_000_000, 500_000_000, 300_000_000, 210_000_000]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every match in the window names a thread the archive already holds, so
+    /// nothing is fetched at all and the status line says so.
+    #[test]
+    fn a_week_of_threads_the_archive_holds_costs_nothing_but_the_search() {
+        let dir = crate::archive::test_dir("threads-live-held");
+        let mut app = threads_test_app(&dir);
+        let (client, seen, _release) = thread_slack(
+            vec![
+                ("from:me", "C1", 500, 520),
+                ("from:me", "C1", 300, 380),
+                // Outside the window, and the archive has it either way.
+                ("<@U1>", "C9", 400, 100),
+            ],
+            live_threads(),
+            usize::MAX,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.finish_thread_fetch_for_test();
+        assert_eq!(
+            calls_of(&seen),
+            ["search.messages from:me page 0", "search.messages <@U1> page 0"],
+            "a thread the archive holds was fetched"
+        );
+        assert_eq!(thread_cards(&app).len(), 2, "a card was added twice");
+        assert!(app.status.contains("no thread of yours this week"), "{}", app.status);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A thread Slack no longer has answers `thread_not_found`, which is an
+    /// error and would otherwise stop the phase. It is a skipped candidate
+    /// instead: the search names a week of threads and one of them being
+    /// deleted, or its conversation left since, says nothing about the rest.
+    /// `channel_not_found` is the same case; every other error still stops.
+    #[test]
+    fn a_thread_slack_no_longer_has_is_skipped_and_the_phase_goes_on() {
+        let dir = crate::archive::test_dir("threads-live-gone");
+        let mut app = threads_test_app(&dir);
+        let (client, seen, _release) = thread_slack(
+            vec![
+                // Both newer than the thread that is still there, so they are
+                // asked for first and the phase has to survive them: a thread
+                // the stub's channel does not hold, and a channel it does not
+                // hold at all.
+                ("from:me", "C9", 700, 800),
+                ("from:me", "C7", 690, 790),
+                ("from:me", "C9", 210, 250),
+            ],
+            live_threads(),
+            usize::MAX,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let lines = app.finish_thread_fetch_for_test();
+        // One call for each thread that is gone — there is nothing to bound a
+        // second one with — and two for the one that is not.
+        assert_eq!(
+            calls_of(&seen).iter().filter(|call| call.starts_with("conversations.replies")).count(),
+            4
+        );
+        for said in [
+            "conversations.replies #c9 ts=700.000000 → no thread",
+            "conversations.replies #c7 ts=690.000000 → no thread",
+        ] {
+            assert!(lines.contains(&said.to_string()), "{said:?} is not in {lines:#?}");
+        }
+        // The error did not become the phase's status line.
+        assert!(!app.status.contains("thread_not_found"), "{}", app.status);
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [500_000_000, 300_000_000, 210_000_000]
+        );
+        assert!(app.status.contains("1 of 3 threads fetched from Slack"), "{}", app.status);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Slack sends `latest_reply` on every parent that has replies, but a
+    /// root that says it has replies and carries none leaves no bound to ask
+    /// the newest one from. The thread is walked forward instead — the only
+    /// order the call pages in — and the newest of what comes back is the
+    /// card's, so the card draws a reply and sorts by it rather than by its
+    /// root. The walk follows the cursor: the count sizes the page, and only
+    /// the cursor says whether more replies are behind it.
+    #[test]
+    fn a_root_without_latest_reply_is_walked_for_its_newest_reply() {
+        let dir = crate::archive::test_dir("threads-live-walk");
+        let mut app = threads_test_app(&dir);
+        // A hundred and one replies: more than one page of the walk holds.
+        let deep: Vec<(i64, &'static str)> =
+            (0..101).map(|n| (710 + n, "a deep reply")).collect();
+        let (client, seen, _release) = thread_slack(
+            vec![("from:me", "C9", 700, 810), ("from:me", "C9", 400, 600)],
+            vec![
+                ("C9", 700, "deep root", deep, false),
+                ("C9", 400, "live root A", vec![
+                    (420, "live A first"),
+                    (440, "live A second"),
+                    (600, "live A newest"),
+                ], false),
+            ],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let lines = app.finish_thread_fetch_for_test();
+        let asked = calls_of(&seen);
+        // The root, and then the walk: two pages of it for the deep thread
+        // and one for the shallow one, whose count fits a page and whose page
+        // came back without a cursor. The page is the count plus the parent,
+        // capped at a hundred.
+        assert_eq!(
+            asked.iter().filter(|call| call.contains("ts=700.000000")).collect::<Vec<_>>(),
+            [
+                "conversations.replies C9 ts=700.000000 oldest= limit=1",
+                "conversations.replies C9 ts=700.000000 oldest= limit=100",
+                "conversations.replies C9 ts=700.000000 oldest= limit=100",
+            ]
+        );
+        assert_eq!(
+            asked.iter().filter(|call| call.contains("ts=400.000000")).collect::<Vec<_>>(),
+            [
+                "conversations.replies C9 ts=400.000000 oldest= limit=1",
+                "conversations.replies C9 ts=400.000000 oldest= limit=4",
+            ]
+        );
+        assert!(lines.contains(&"conversations.replies #c9 ts=700.000000 page 2 → 3 messages".to_string()),
+            "{lines:#?}");
+        // Both cards carry the newest reply of their thread, and both sort by
+        // it: the deep one's 810 above the shallow one's 600, and the archive
+        // pass's cards below them.
+        assert_eq!(
+            thread_cards(&app),
+            vec![
+                ("#c9".to_string(), "u2".to_string(), 700_000_000, 100, vec![810_000_000]),
+                ("#c9".to_string(), "u2".to_string(), 400_000_000, 2, vec![600_000_000]),
+                ("#one".to_string(), "u1".to_string(), 500_000_000, 0, vec![520_000_000]),
+                ("#one".to_string(), "u1".to_string(), 300_000_000, 1, vec![380_000_000]),
+            ]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The two queries are asked one after the other, so a cap taken in the
+    /// order the candidates were collected keeps a week of the owner's own
+    /// messages and drops a mention from today. The cap orders by the newest
+    /// match that named each thread, whichever query that was — including a
+    /// thread both queries named, which sorts by the newer of the two and not
+    /// by the one that happened to be seen first.
+    #[test]
+    fn the_cap_keeps_the_newest_threads_across_both_queries() {
+        let dir = crate::archive::test_dir("threads-live-cap-order");
+        let mut app = threads_test_app(&dir);
+        // Fifty threads the owner wrote in, all of them older than the one
+        // mention, and the mention answering the second query.
+        let roots: Vec<i64> = (0..50).map(|n| 210 + n * 2).collect();
+        let mut matches: Vec<StubMatch> =
+            roots.iter().map(|root| ("from:me", "C9", *root, *root + 1)).collect();
+        matches.push(("<@U1>", "C8", 600, 601));
+        // The oldest of the fifty, named again today by the other query: the
+        // newer match is what it sorts by, so it survives the cap and the
+        // next-oldest is the one left out.
+        matches.push(("<@U1>", "C9", 210, 602));
+        let mut threads: Vec<StubThread> = roots
+            .iter()
+            .map(|root| {
+                // The oldest thread carries today's mention as its own newest
+                // reply, which is the message the second query matched.
+                let replies = if *root == 210 {
+                    vec![(211, "an older reply"), (602, "the mention today")]
+                } else {
+                    vec![(*root + 1, "an older reply")]
+                };
+                stub_thread("C9", *root, "an older root", replies)
+            })
+            .collect();
+        threads.push(stub_thread("C8", 600, "a mention today", vec![(601, "the newest reply")]));
+        let (client, seen, _release) = thread_slack(matches, threads, usize::MAX);
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.finish_thread_fetch_for_test();
+        let asked = calls_of(&seen);
+        assert!(
+            asked.iter().any(|call| call.contains("C8 ts=600.000000")),
+            "the mention from today was capped out"
+        );
+        assert!(
+            asked.iter().any(|call| call.contains("C9 ts=210.000000")),
+            "the thread the second query named again today was capped out"
+        );
+        assert!(
+            !asked.iter().any(|call| call.contains("C9 ts=212.000000")),
+            "the oldest thread was fetched over the newer mentions"
+        );
+        // The mention leads the view, above the fifty-first card the cap left
+        // out and above every thread the other query named.
+        let cards = thread_cards(&app);
+        assert_eq!(cards[0].0, "#c9", "{cards:#?}");
+        assert_eq!(cards[0].2, 210_000_000, "{cards:#?}");
+        assert_eq!(cards[1].0, "#c8", "{cards:#?}");
+        assert_eq!(cards.len(), 52, "50 live cards and the archive's 2");
+        assert!(app.status.contains("1 older thread not fetched (cap 50)"), "{}", app.status);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Fifty threads a run: the fifty-first is not fetched and the status
+    /// line counts it.
+    #[test]
+    fn the_fifty_first_thread_is_not_fetched_and_the_status_line_says_so() {
+        let dir = crate::archive::test_dir("threads-live-cap");
+        let mut app = threads_test_app(&dir);
+        // Fifty-one threads, newest first, each with one reply.
+        let roots: Vec<i64> = (0..51).map(|n| 250 + n * 2).collect();
+        let matches: Vec<StubMatch> =
+            roots.iter().map(|root| ("from:me", "C9", *root, *root + 1)).collect();
+        let threads: Vec<StubThread> = roots
+            .iter()
+            .map(|root| stub_thread("C9", *root, "a live root", vec![(*root + 1, "a live reply")]))
+            .collect();
+        let (client, seen, _release) = thread_slack(matches, threads, usize::MAX);
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let lines = app.finish_thread_fetch_for_test();
+        let asked = calls_of(&seen);
+        // Two searches and two calls for each of fifty threads, no more.
+        assert_eq!(asked.len(), 2 + 100, "the cap did not hold");
+        // The oldest thread the search found is the one left behind.
+        let oldest = format!("conversations.replies C9 ts={}.000000 oldest= limit=1", roots[0]);
+        assert!(!asked.contains(&oldest), "the fifty-first thread was fetched");
+        assert_eq!(thread_cards(&app).len(), 52, "50 live cards and the archive's 2");
+        assert!(app.status.contains("50 of 50 threads fetched from Slack"), "{}", app.status);
+        // The remainder is counted, and nothing is promised of it: every run
+        // searches the same week and caps the same way, so the next one
+        // fetches these fifty again rather than the ones behind them.
+        assert!(app.status.contains("1 older thread not fetched (cap 50)"), "{}", app.status);
+        assert!(!app.status.contains("next run"), "{}", app.status);
+        assert!(lines.iter().any(|line| line.contains("51 threads in the last week")
+            && line.contains("1 older not fetched (cap 50)")), "{lines:#?}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The navigation-generation rule: an answer that lands after the reader
+    /// has left the view lands nowhere. The stack it would have written to is
+    /// not there any more, and nothing is pushed in its place.
+    #[test]
+    fn leaving_threads_before_the_phase_lands_leaves_the_stack_alone() {
+        let dir = crate::archive::test_dir("threads-live-abandoned");
+        let mut app = threads_test_app(&dir);
+        // The first thread's first call is the one held open.
+        let (client, _seen, release) = thread_slack(
+            vec![("from:me", "C9", 400, 600), ("from:me", "C9", 210, 250)],
+            live_threads(),
+            3,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.thread_fetch.is_some() && app.scan.is_some(), "the phase never started");
+        // Gone home while a call is out.
+        app.go_home();
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.thread_fetch.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.thread_fetch.is_none(), "the phase outlived the view");
+        assert!(app.stack.is_empty(), "the fetch pushed a view over the home screen");
+        assert!(app.open.is_none());
+        assert!(app.scan_overlay.is_none(), "the box outlived the view");
+        let screen = screen_of(&mut app, 100, 30);
+        assert!(!screen.contains("live root"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The navigation-generation rule on its own. Leaving THREADS altogether
+    /// is caught by the view the answer would be written to no longer being
+    /// there; the generation is what catches a reader who left and came back,
+    /// where the view on the stack is a THREADS view either way but not the
+    /// one the phase was started under. Bumping the generation is what every
+    /// navigation primitive does, and it is all that separates the two.
+    #[test]
+    fn an_answer_from_before_a_navigation_lands_nowhere() {
+        let dir = crate::archive::test_dir("threads-live-generation");
+        let mut app = threads_test_app(&dir);
+        // The two searches answer; the first thread's first call is held.
+        let (client, seen, release) = thread_slack(
+            vec![("from:me", "C9", 400, 600), ("from:me", "C9", 210, 250)],
+            live_threads(),
+            3,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.thread_fetch.is_some(), "the phase never started");
+        // Wait for the search to land and the first thread's call to be out.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut asked: Vec<String> = Vec::new();
+        while asked.len() < 3 && Instant::now() < deadline {
+            app.tick();
+            asked.extend(calls_of(&seen));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(asked.len(), 3, "the first thread's call never went out");
+        app.nav_generation = app.nav_generation.wrapping_add(1);
+        // Both of the thread's own calls; the next thread's would be a third.
+        for _ in 0..2 {
+            release.send(()).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.thread_fetch.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.thread_fetch.is_none(), "the phase outlived the navigation");
+        assert!(app.scan_overlay.is_none(), "the box outlived the navigation");
+        // No card was added, and the next thread was never asked for.
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [500_000_000, 300_000_000]
+        );
+        asked.extend(calls_of(&seen));
+        assert!(
+            !asked.iter().any(|call| call.contains("ts=210")),
+            "the phase went on past the navigation: {asked:#?}"
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Esc abandons the phase where it stands: the cards it has already added
+    /// stay, and the threads it had not reached are left for the next run.
+    #[test]
+    fn esc_during_the_thread_fetch_keeps_the_cards_already_added() {
+        let dir = crate::archive::test_dir("threads-live-esc");
+        let mut app = threads_test_app(&dir);
+        // Two searches and the first thread's two calls answer; the second
+        // thread's first call blocks.
+        let (client, _seen, _release) = thread_slack(
+            vec![("from:me", "C9", 400, 600), ("from:me", "C9", 210, 250)],
+            live_threads(),
+            5,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.thread_fetch.as_ref().is_some_and(|phase| phase.added == 0)
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.thread_fetch.as_ref().map(|phase| phase.added), Some(1),
+            "the first thread never landed");
+        // The box is modal: Esc is the one key that reaches the phase.
+        assert!(app.scan_running());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.thread_fetch.is_none() && app.scan.is_none() && app.scan_overlay.is_none());
+        assert!(app.status.contains("thread fetch abandoned; 1 thread added"), "{}", app.status);
+        // The view is still there: the one live card, and the archive's two.
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [400_000_000, 500_000_000, 300_000_000]
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("live root A") && screen.contains("live A newest"), "{screen}");
+        assert!(!screen.contains("live root B"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A rate-limit reply stops the phase with a status line, and every
+    /// thread it had not reached is left for the next run.
+    #[test]
+    fn a_rate_limited_reply_stops_the_thread_fetch() {
+        let dir = crate::archive::test_dir("threads-live-ratelimit");
+        let mut app = threads_test_app(&dir);
+        let matches: Vec<StubMatch> = vec![("from:me", "C9", 400, 600), ("from:me", "C9", 210, 250)];
+        let (client, _seen, _release) = thread_slack(matches, live_threads(), usize::MAX);
+        // The searches answer; the thread calls are rate-limited.
+        let limited = Arc::new(Client::for_test(move |method, params| {
+            if method == "conversations.replies" {
+                return Err("conversations.replies: ratelimited".to_string());
+            }
+            client.call(method, params)
+        }));
+        app.api = Some(limited);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.finish_thread_fetch_for_test();
+        assert!(app.status.contains("ratelimited"), "{}", app.status);
+        assert!(app.status.contains("2 threads left unfetched"), "{}", app.status);
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [500_000_000, 300_000_000],
+            "a card was added after the phase stopped"
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The two phases share one progress box and one job slot, so a job that
+    /// lands after its own box is gone must not touch the box a later phase
+    /// opened: closing it drops the channel the running worker narrates
+    /// through, and the phase stops mid-call.
+    #[test]
+    fn a_late_search_does_not_close_the_thread_fetch_box() {
+        let dir = crate::archive::test_dir("threads-live-overlay");
+        let mut app = threads_test_app(&dir);
+        let (stub, _seen, release_threads) = thread_slack(
+            vec![("from:me", "C9", 400, 600)],
+            live_threads(),
+            // Every call the phase makes waits to be let through.
+            1,
+        );
+        let (release_search, search_gate) = std::sync::mpsc::channel::<()>();
+        let search_gate = std::sync::Mutex::new(search_gate);
+        // `/find`'s Slack half is the search of a needle; the phase's is a
+        // search of its own, and the two are told apart by the query.
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            let query = params.iter().find(|(k, _)| *k == "query").map_or("", |(_, v)| v);
+            if method == "search.messages" && query.contains("archived") {
+                let _ = search_gate.lock().expect("gate").recv();
+                return Ok(json!({"messages": {"matches": []}}));
+            }
+            stub.call(method, params)
+        })));
+        // The archive half of a `/find` lands and the Slack half goes out.
+        app.run_command("/find message: archived", "");
+        app.finish_archive_scan_for_test();
+        assert!(app.job.is_some(), "the Slack half never started");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::Search));
+        // Esc dismisses the box; the search itself is still out.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.scan_overlay.is_none() && app.job.is_some());
+        // THREADS opens over the search view and takes the box for itself.
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.thread_fetch.is_some() && app.scan.is_some());
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::ThreadFetch));
+        // Now the abandoned search finishes.
+        release_search.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.job.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.job.is_none(), "the search never landed");
+        assert!(app.scan_running(), "the search closed the thread fetch's box");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::ThreadFetch));
+        assert!(app.thread_fetch.is_some(), "the search stopped the thread fetch");
+        // And the phase runs on to its end.
+        for _ in 0..8 {
+            let _ = release_threads.send(());
+        }
+        app.finish_thread_fetch_for_test();
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [400_000_000, 500_000_000, 300_000_000]
+        );
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
     }

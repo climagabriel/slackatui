@@ -411,6 +411,18 @@ fn open_ro(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// The thread a message link belongs to: the `thread_ts=` query parameter of
+/// a Slack permalink, and None for a link to a message in no thread. It is
+/// the whole of what a search match says about its thread — the match itself
+/// carries no `thread_ts` field — and the extraction
+/// `slackdump-my-threads` does in jq.
+pub(crate) fn thread_ts_in_permalink(permalink: &str) -> Option<&str> {
+    permalink
+        .split_once("thread_ts=")
+        .map(|(_, rest)| rest.split('&').next().unwrap_or(""))
+        .filter(|ts| !ts.is_empty())
+}
+
 pub(crate) fn ts_to_id(ts: &str) -> Option<i64> {
     let (secs, frac) = ts.split_once('.')?;
     let secs: i64 = secs.parse().ok()?;
@@ -1844,9 +1856,8 @@ impl Msg {
             thread_ts = data
                 .get("permalink")
                 .and_then(Value::as_str)
-                .and_then(|p| p.split_once("thread_ts="))
-                .map(|(_, r)| r.split('&').next().unwrap_or("").to_string())
-                .filter(|s| !s.is_empty());
+                .and_then(thread_ts_in_permalink)
+                .map(str::to_string);
         }
         let parent_id = thread_ts.as_deref().and_then(ts_to_id).filter(|p| *p != id);
         let reply_count = data.get("reply_count").and_then(Value::as_i64).unwrap_or(0);

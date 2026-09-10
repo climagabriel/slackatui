@@ -142,6 +142,25 @@ its room and the names beside it are cut. Deleting the reply a card draws
 folds it into the count; deleting one the count already stood for takes the
 count down.
 
+A signed-in session then asks Slack for the threads of yours the archive does
+not hold: search.messages for from:me and for your own mention over the last
+seven days, a hundred matches a page, sorted by timestamp, stopping at the
+page the window ends in or after five pages. A match names its thread in its
+permalink, and a thread the archive already holds is not fetched, so nothing
+is shown twice. Each remaining thread costs two conversations.replies calls,
+one for the root and one for the newest reply; a root that says it has replies
+and carries no latest_reply costs a walk of the thread instead, a hundred
+replies a call and five calls at most. At most fifty threads are fetched a
+run, the newest first whichever query named them, and the older ones the cap
+leaves out are counted in the status line rather than deferred -- the next run
+searches the same week and keeps the same fifty. A thread Slack no longer has
+is skipped and the rest go on. The cards land among the archived ones, newest
+reply first, and Enter opens one the way it opens a conversation only Slack
+has. It all runs behind the progress box /find draws, a line per API call; Esc
+abandons the phase and keeps the cards already added, a rate-limit reply stops
+it and says so, and nothing fetched reaches an archive -- slackdump remains the
+only writer of one. r runs both phases again.
+
 UNREADS below THREADS opens one card per conversation with unread messages,
 newest unread message first. A card heads with the conversation name and its
 unread count, then draws the first unread message, a dim count of the ones it
