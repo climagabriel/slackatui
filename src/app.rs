@@ -10158,6 +10158,19 @@ pub(crate) mod tests {
             &[("C9", 1, 1, "U2", "the root"), ("C9", 9, 0, "U3", "unrelated line")],
         );
         crate::archive::add_members(&written, &[("C9", "U1"), ("C9", "U2"), ("C9", "U3")]);
+
+        // What Slack told this session about the conversation is in no
+        // archive, so rebuilding the Conv from the new primary has to carry it.
+        app.muted.insert("C9".to_string());
+        {
+            let conv = &mut app.corpus.convs[index];
+            conv.last_read = 1_500_000;
+            conv.unread = true;
+            conv.unread_count = Some(4);
+            conv.unread_snapshot = Some("1.500000".to_string());
+            conv.muted = true;
+            conv.mentions = 2;
+        }
         app.finish_archive(&written, "#deploys", false);
         assert!(app.status.starts_with("archived deploys"), "{}", app.status);
 
@@ -10177,6 +10190,11 @@ pub(crate) mod tests {
             Ok(Counterpart::Ambiguous(3))
         );
         assert_eq!((conv.name.as_str(), conv.kind, conv.msgs, conv.mine), ("#deploys", Kind::Channel, 5, 2));
+        assert_eq!(
+            (conv.last_read, conv.unread, conv.unread_count, conv.unread_snapshot.as_deref(), conv.muted, conv.mentions),
+            (1_500_000, true, Some(4), Some("1.500000"), true, 2),
+            "the swap kept what only Slack knows"
+        );
         assert_eq!(
             archive.thread("C9", 1_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
             [1_000_000, 2_000_000]

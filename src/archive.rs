@@ -572,7 +572,10 @@ impl Corpus {
                     if let Some(mut fresh) = updated.into_iter().find(|c| c.id == conv.id) {
                         // The name, kind and stats are the new primary's; what
                         // Slack told this session about the conversation is not
-                        // in any archive and has to survive the swap.
+                        // in any archive and has to survive the swap. `muted`
+                        // is copied for the window before the next
+                        // `sync_muted`, which re-derives it from the confirmed
+                        // snapshot; the rest has no other source.
                         let existing = &self.convs[index];
                         fresh.left = existing.left;
                         fresh.muted = existing.muted;
