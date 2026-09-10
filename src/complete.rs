@@ -51,7 +51,7 @@ pub const COMMANDS: &[Cmd] = &[
     Cmd {
         name: "cache",
         args: "start|stop|wipe [#name], highlight on|off",
-        help: "the hourly archive refresh, or the color cached conversations take",
+        help: "the hourly archive refresh, or the color cached channels take",
     },
     Cmd {
         name: "upload",
@@ -86,12 +86,12 @@ const CACHE_OPS: &[(&str, &str)] = &[
     ("wipe", "delete the archive from disk"),
     (
         "highlight",
-        "color the cached conversations, on or off, whichever list is shown",
+        "color the cached channels, on or off, whichever list is shown",
     ),
 ];
 
 const HIGHLIGHT_ARGS: &[(&str, &str)] = &[
-    ("on", "cached conversations in the palette's cached color"),
+    ("on", "cached channels in the palette's cached color"),
     ("off", "no color of their own"),
 ];
 

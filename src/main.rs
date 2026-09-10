@@ -282,7 +282,7 @@ e shows read-only reaction details from the selected message payload, including
 missing-user counts for partial lists; j/k scroll, h returns, Esc goes home.
 /cache start archives a conversation; /cache stop pauses its hourly refresh;
 /cache wipe deletes its archive; /cache highlight on|off colors the cached
-conversations in the list; /colorpalette vintage opens the editor over the
+channels in the list; /colorpalette vintage opens the editor over the
 vintage palette (terracotta, amber, sand, olive and slate, over whichever
 background the terminal already draws), and
 /colorpalette default over the terminal's own sixteen colors; /keys rebinds

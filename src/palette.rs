@@ -58,7 +58,7 @@ impl Role {
             Role::OwnUsername => "my username",
             Role::OtherUsername => "other usernames",
             Role::Unread => "unread",
-            Role::Cached => "cached conversations",
+            Role::Cached => "cached channels",
             Role::Mention => "mentions",
             Role::Link => "links",
             Role::Code => "code",

@@ -9,6 +9,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, ImageState, Mode, PromptKind, Sort, View};
+use crate::archive::Kind;
 use crate::complete;
 use crate::keys::{Action, DEFAULTS};
 use crate::palette::{Palette, Role, ROLES};
@@ -233,7 +234,15 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::new()
                     .fg(app.palette.get(Role::Unread))
                     .add_modifier(Modifier::BOLD)
-            } else if app.highlight_cached && !c.live_only {
+            } else if app.highlight_cached
+                && !c.live_only
+                && matches!(c.kind, Kind::Channel | Kind::Private)
+            {
+                // Channels only. The highlight is read to audit what the
+                // refresh carries, so that a channel filling with bot output
+                // can be dropped from it; direct and group messages are
+                // archived as a class by `dms/`, so a color that is always on
+                // for them says nothing.
                 Style::new().fg(app.palette.get(Role::Cached))
             } else if c.live_only || c.left {
                 Style::new().add_modifier(Modifier::DIM)
@@ -1285,7 +1294,7 @@ const HELP: &[HelpRow] = &[
     ),
     HelpRow::Bound(
         Action::Command,
-        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; upload [path] sends a file with the next message, the clipboard's image when no path is given; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation, and a search across conversations runs behind a progress box that Esc abandons; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached conversations; version shows the version in the corner",
+        "a command, Tab completes it and its argument: keys rebinds what the keys in this guide do; upload [path] sends a file with the next message, the clipboard's image when no path is given; colorpalette [name] edits UI colors, from the vintage or default palette when named (h/l cycles, e types a name, #rrggbb or terminal, d and D reset, Enter saves); find|search TEXT filters the list or searches the open conversation, and a search across conversations runs behind a progress box that Esc abandons; leave, mute|unmute and cache start|stop|wipe take an optional #name; cache highlight on|off colors the cached channels; version shows the version in the corner",
     ),
     HelpRow::Bound(Action::Keys, "rebind these keys (also /keys)"),
     HelpRow::Bound(
@@ -2007,6 +2016,96 @@ mod compose_tests {
     }
 }
 
+
+#[cfg(test)]
+mod cache_highlight_tests {
+    use super::*;
+    use crate::app::tests::kind_test_app;
+    use crate::app::TopSection;
+    use ratatui::buffer::Buffer;
+
+    /// One cached conversation of every kind, plus a channel that only Slack
+    /// has.
+    const CONVS: &[(&str, Kind, bool)] = &[
+        ("public", Kind::Channel, true),
+        ("private", Kind::Private, true),
+        ("alice", Kind::Im, true),
+        ("group", Kind::Mpim, true),
+        ("live", Kind::Channel, false),
+    ];
+
+    /// The pane drawn over the whole terminal, with the cursor parked on a top
+    /// section so that no conversation row is rewritten in the selection's
+    /// colors and every name carries the style `draw_convs` gave it.
+    fn pane(app: &mut App, highlight: bool) -> Buffer {
+        app.highlight_cached = highlight;
+        app.top_section = Some(TopSection::ALL[0]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 16)).unwrap();
+        terminal.draw(|frame| draw_convs(frame, app, frame.area())).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The row carrying `name`, as its text and one style per cell.
+    fn cells(buffer: &Buffer, name: &str) -> (String, Vec<Style>) {
+        let area = buffer.area;
+        (area.top()..area.bottom())
+            .map(|y| {
+                (
+                    (area.left()..area.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>(),
+                    (area.left()..area.right())
+                        .map(|x| buffer[(x, y)].style())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .find(|(text, _)| text.contains(name))
+            .unwrap_or_else(|| panic!("no row for {name} in {buffer:#?}"))
+    }
+
+    /// That row as one comparable string: the text, then the styles as column
+    /// runs rather than one description per cell, so a difference reads as the
+    /// column it starts at instead of forty repetitions.
+    fn row(buffer: &Buffer, name: &str) -> String {
+        let (text, styles) = cells(buffer, name);
+        let mut runs: Vec<String> = Vec::new();
+        let mut previous: Option<&Style> = None;
+        for (x, style) in styles.iter().enumerate() {
+            if previous != Some(style) {
+                runs.push(format!("{x}:{style:?}"));
+                previous = Some(style);
+            }
+        }
+        format!("{text}\n{}", runs.join(" "))
+    }
+
+    /// The color the name itself is drawn in.
+    fn name_color(buffer: &Buffer, name: &str) -> Option<Color> {
+        let (text, styles) = cells(buffer, name);
+        styles[text.find(name).expect("the name's column")].fg
+    }
+
+    /// The highlight is an audit of what the refresh carries, so it colors the
+    /// channels it could be told to drop: a public and a private one take the
+    /// cached color, and the rows it says nothing about — a direct message, a
+    /// group message, and a channel with no archive at all — are drawn exactly
+    /// as they are with the highlight off.
+    #[test]
+    fn the_highlight_colors_cached_channels_and_no_other_row() {
+        let mut app = kind_test_app(CONVS);
+        let off = pane(&mut app, false);
+        let on = pane(&mut app, true);
+        let cached = app.palette.get(Role::Cached);
+        for name in ["#public", "#private"] {
+            assert_eq!(name_color(&on, name), Some(cached), "{name} with the highlight on");
+            assert_ne!(name_color(&off, name), Some(cached), "{name} with it off");
+        }
+        for name in ["@alice", "@group", "#live"] {
+            assert_eq!(row(&on, name), row(&off, name), "{name}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod conv_age_tests {

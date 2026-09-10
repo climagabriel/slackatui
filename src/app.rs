@@ -894,8 +894,8 @@ pub struct App {
     /// Encoded inline thumbnails, by file id, with the cell size they were made for.
     pub inline: HashMap<String, (u16, u16, Protocol)>,
     pub file_job: Option<Job>,
-    /// `/cache highlight on|off`: cached conversations in the palette's
-    /// cached color.
+    /// `/cache highlight on|off`: cached public and private channels in
+    /// the palette's cached color.
     pub highlight_cached: bool,
     /// `/version`: the version in the status line's right corner.
     pub show_version: bool,
@@ -1706,9 +1706,9 @@ impl App {
                 }
             };
             self.status = if self.highlight_cached {
-                "cached conversations in the palette's cached color".to_string()
+                "cached channels in the palette's cached color".to_string()
             } else {
-                "cached conversations no longer colored".to_string()
+                "cached channels no longer colored".to_string()
             };
             return;
         }
@@ -9084,6 +9084,49 @@ pub(crate) mod tests {
             json!({"id":"C1","name":"one","is_member":true}),
             json!({"id":"D1","user":"U1","is_im":true}),
         ]);
+        app
+    }
+
+    /// An app whose conversations are the named ones, each of the kind given
+    /// and either cached — held by the archive — or live-only. The names come
+    /// out the way the pane draws them: `#name` for a public or private
+    /// channel, `@name` for a direct or group message.
+    pub(crate) fn kind_test_app(convs: &[(&str, Kind, bool)]) -> App {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        );
+        app.merge_conversations(
+            convs
+                .iter()
+                .enumerate()
+                .map(|(i, (name, kind, _))| {
+                    let id = format!("C{}", i + 1);
+                    match kind {
+                        Kind::Channel => json!({"id":id,"name":name,"is_member":true}),
+                        Kind::Private => {
+                            json!({"id":id,"name":name,"is_private":true,"is_member":true})
+                        }
+                        // The name a group message carries on Slack, which the
+                        // merge strips back to the handles.
+                        Kind::Mpim => json!({"id":id,"name":format!("mpdm-{name}-1"),"is_mpim":true}),
+                        Kind::Im => json!({"id":id,"user":name,"is_im":true}),
+                    }
+                })
+                .collect(),
+        );
+        for (i, (_, _, cached)) in convs.iter().enumerate() {
+            app.corpus.convs[i].live_only = !cached;
+        }
+        app.apply_filter();
         app
     }
     /// An app on a pinned clock whose conversations are the named ones, each
