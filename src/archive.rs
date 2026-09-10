@@ -12,8 +12,11 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde_json::Value;
 
-/// Archive sets under the root, in listing order.
-pub const ARCHIVE_SETS: [&str; 2] = ["full", "dms"];
+/// Archive sets under the root, in listing order. `threads/` holds archives
+/// of individual threads from channels `full/` does not cache; the order
+/// matters, because the first archive holding a conversation is the one the
+/// others are unioned into.
+pub const ARCHIVE_SETS: [&str; 3] = ["full", "dms", "threads"];
 /// Messages fetched per timeline page.
 pub const PAGE: usize = 200;
 /// Cap on search candidates fetched from SQL.
@@ -1766,6 +1769,96 @@ pub(crate) fn thread_database(dir: &Path, messages: &[(i64, i64, &str, &str)]) {
                 text,
                 data
             ],
+        )
+        .unwrap();
+    }
+}
+
+/// A slackdump archive holding several channels, for the tests of the
+/// `threads/` set. `channels` are `(id, name, kind)` and get the `CHANNEL`
+/// row a real archive carries, flags included; `messages` are
+/// `(channel, id, root, user, text)` in `thread_database`'s shape. `S_USER`
+/// gets one row per author, named after the id in lower case. No
+/// `CHANNEL_USER` rows are written: that is what a `threads/` archive looks
+/// like, and `add_members` puts a membership in where a test wants one.
+#[cfg(test)]
+pub(crate) fn channel_database(
+    dir: &Path,
+    channels: &[(&str, &str, Kind)],
+    messages: &[(&str, i64, i64, &str, &str)],
+) {
+    std::fs::create_dir_all(dir).unwrap();
+    let conn = Connection::open(dir.join("slackdump.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE CHUNK(ID INTEGER, UNIX_TS INTEGER);
+         CREATE TABLE CHANNEL(ID TEXT, NAME TEXT, DATA BLOB, CHUNK_ID INTEGER);
+         CREATE TABLE CHANNEL_USER(CHANNEL_ID TEXT, USER_ID TEXT);
+         CREATE TABLE S_USER(ID TEXT, USERNAME TEXT, DATA BLOB);
+         CREATE TABLE MESSAGE(ID INTEGER, CHUNK_ID INTEGER, CHANNEL_ID TEXT, TS TEXT,
+             PARENT_ID INTEGER, THREAD_TS TEXT, IS_PARENT INTEGER, LATEST_REPLY TEXT, TXT TEXT, DATA BLOB);
+         INSERT INTO CHUNK VALUES(1,100);",
+    )
+    .unwrap();
+    for &(id, name, kind) in channels {
+        let data = serde_json::json!({
+            "id": id,
+            "name": name,
+            "is_im": kind == Kind::Im,
+            "is_mpim": kind == Kind::Mpim,
+            "is_private": matches!(kind, Kind::Private | Kind::Mpim),
+            "is_archived": false,
+        })
+        .to_string()
+        .into_bytes();
+        conn.execute(
+            "INSERT INTO CHANNEL VALUES(?1,?2,?3,1)",
+            params![id, name, data],
+        )
+        .unwrap();
+    }
+    let mut authors: Vec<&str> = messages.iter().map(|&(_, _, _, user, _)| user).collect();
+    authors.sort_unstable();
+    authors.dedup();
+    for user in authors {
+        let data = serde_json::json!({"id": user, "name": user.to_lowercase()})
+            .to_string()
+            .into_bytes();
+        conn.execute(
+            "INSERT INTO S_USER VALUES(?1,?2,?3)",
+            params![user, user.to_lowercase(), data],
+        )
+        .unwrap();
+    }
+    for &(channel, id, root, user, text) in messages {
+        let ts = format!("{id}.000000");
+        let data = serde_json::json!({"text":text,"ts":ts,"user":user})
+            .to_string()
+            .into_bytes();
+        conn.execute(
+            "INSERT INTO MESSAGE VALUES(?1,1,?2,?3,?4,?5,?6,NULL,?7,?8)",
+            params![
+                id * 1_000_000,
+                channel,
+                ts,
+                (root != 0).then_some(root * 1_000_000),
+                (root != 0).then(|| format!("{root}.000000")),
+                i64::from(root == id),
+                text,
+                data
+            ],
+        )
+        .unwrap();
+    }
+}
+
+/// `CHANNEL_USER` rows for a fixture archive, as `(channel, user)`.
+#[cfg(test)]
+pub(crate) fn add_members(dir: &Path, rows: &[(&str, &str)]) {
+    let conn = Connection::open(dir.join("slackdump.sqlite")).unwrap();
+    for &(channel, user) in rows {
+        conn.execute(
+            "INSERT INTO CHANNEL_USER VALUES(?1,?2)",
+            params![channel, user],
         )
         .unwrap();
     }

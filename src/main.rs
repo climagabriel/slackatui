@@ -60,10 +60,13 @@ usage: slack-tui [--root DIR] [--channel NAME] [--local]
        slack-tui --dump NAME [--limit N] [--width W] [--root DIR] [--local]
        slack-tui --help
 
-Opens every slackdump.sqlite under <root>/full/ and <root>/dms/ read-only
-(a resume writing the same database at the same time is fine) and shows
-the conversations on the left, the messages of the selected one on the
-right. Enter on a message opens its thread; Esc returns home.
+Opens every slackdump.sqlite under <root>/full/, <root>/dms/ and
+<root>/threads/ read-only (a resume writing the same database at the same
+time is fine) and shows the conversations on the left, the messages of the
+selected one on the right. A threads/ archive holds single threads out of
+channels full/ does not cache: its channel joins the conversation list under
+the name the archive carries, and where full/ holds the same channel the two
+are read as one. Enter on a message opens its thread; Esc returns home.
 l or Right opens the selected message's thread from the conversation.
 On a message without a thread, or inside a thread, it opens raw JSON unless
 the message is collapsed to its first line, a hidden-line count and its last line. Collapsed

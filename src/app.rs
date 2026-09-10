@@ -9765,4 +9765,278 @@ pub(crate) mod tests {
         assert!(screen(&terminal).contains("keep nginx builds moving"));
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    // --------------------------------------------- the threads/ archive set
+
+    /// Build an App over a real archive root, through `Corpus::open`.
+    fn corpus_app(root: &Path) -> App {
+        App::new(
+            Corpus::open(root, 30.0, None).unwrap(),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        )
+    }
+
+    /// A `dms/` archive that settles the owner: two direct messages, `me` the
+    /// only user in both, which is what `self_user` counts.
+    fn dm_archive(dir: &Path, me: &str) {
+        crate::archive::channel_database(
+            dir,
+            &[("D1", "", Kind::Im), ("D2", "", Kind::Im)],
+            &[("D1", 100, 0, me, "hello"), ("D2", 101, 0, "U7", "hi")],
+        );
+        crate::archive::add_members(dir, &[("D1", me), ("D1", "U5"), ("D2", me), ("D2", "U7")]);
+    }
+
+    fn drawn(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn open_named(app: &mut App, name: &str) {
+        let idx = app.corpus.conv_by_name(name).unwrap_or_else(|| {
+            panic!("{name} is not in the conversation list: {:?}",
+                app.corpus.convs.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+        });
+        app.conv_cursor = app.filtered.iter().position(|&i| i == idx).unwrap();
+        assert!(app.open_conv(idx));
+    }
+
+    /// A `threads/` archive is the only cache of its channel: the `CHANNEL`
+    /// row names the conversation, the thread opens out of it, and THREADS
+    /// finds it. Nothing here has a `CHANNEL_USER` row.
+    #[test]
+    fn a_thread_only_archive_lists_its_channel_and_opens_the_thread() {
+        let root = crate::archive::test_dir("threads-set-alone");
+        dm_archive(&root.join("dms/self"), "U1");
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C9", "deploys", Kind::Channel)],
+            &[
+                ("C9", 1, 1, "U2", "the root"),
+                ("C9", 2, 1, "U1", "my reply"),
+                ("C9", 3, 1, "U2", "their answer"),
+            ],
+        );
+        let mut app = corpus_app(&root);
+        assert_eq!(app.corpus.me.as_deref(), Some("U1"));
+        let conv = &app.corpus.convs[app.corpus.conv_by_channel("C9").unwrap()];
+        // Everything `Conv` needs is there without a membership: the name and
+        // the kind off the CHANNEL row, the counts off MESSAGE. The score is
+        // vanishingly small only because the fixture's timestamps are 1970.
+        assert_eq!((conv.name.as_str(), conv.kind), ("#deploys", Kind::Channel));
+        assert_eq!((conv.msgs, conv.mine, conv.first_id, conv.last_id), (3, 1, 1_000_000, 3_000_000));
+        assert!(conv.score > 0.0 && !conv.live_only && !conv.archived);
+        assert_eq!(
+            app.corpus.archives[conv.archive].im_counterpart("C9", Some("U1")),
+            Ok(crate::archive::Counterpart::Ambiguous(0))
+        );
+
+        // The conversation holds the root; the replies are one level in.
+        open_named(&mut app, "#deploys");
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("#deploys") && screen.contains("the root"), "{screen}");
+        app.on_msg_key(Some(Action::Open));
+        assert!(matches!(app.stack.last(), Some(View::Thread { root: 1_000_000, .. })));
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("my reply") && screen.contains("their answer"), "{screen}");
+
+        // THREADS: the owner replied in it, so the card is there.
+        app.escape_home();
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(matches!(app.stack.last(), Some(View::Threads { .. })));
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000]
+        );
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("#deploys") && screen.contains("the root"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `threads/` archive of a channel `full/` already caches unions into
+    /// it: one conversation, the full archive's membership untouched, the
+    /// replies reachable, and one THREADS card rather than two.
+    #[test]
+    fn a_thread_archive_unions_into_the_full_archive_of_the_same_channel() {
+        let root = crate::archive::test_dir("threads-set-union");
+        dm_archive(&root.join("dms/self"), "U1");
+        let full = root.join("full/y");
+        crate::archive::channel_database(
+            &full,
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 1, 1, "U2", "the root"), ("C9", 9, 0, "U3", "unrelated line")],
+        );
+        crate::archive::add_members(&full, &[("C9", "U1"), ("C9", "U2"), ("C9", "U3")]);
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C9", "deploys", Kind::Channel)],
+            &[
+                ("C9", 1, 1, "U2", "the root"),
+                ("C9", 2, 1, "U1", "my reply"),
+                ("C9", 3, 1, "U2", "their answer"),
+            ],
+        );
+        let mut app = corpus_app(&root);
+        assert_eq!(app.corpus.convs.iter().filter(|c| c.id == "C9").count(), 1);
+        let index = app.corpus.conv_by_channel("C9").unwrap();
+        let conv = &app.corpus.convs[index];
+        assert_eq!((conv.name.as_str(), conv.msgs, conv.mine), ("#deploys", 4, 1));
+        let archive = app.corpus.conv_archive(conv).unwrap();
+        // The union folds in MESSAGE rows only; the full archive keeps the
+        // three members the thread archive has none of.
+        assert_eq!(archive.rel, "full/y");
+        assert_eq!(
+            archive.im_counterpart("C9", Some("U1")),
+            Ok(crate::archive::Counterpart::Ambiguous(3))
+        );
+        // The root arrives from both archives and is one message, not two.
+        assert_eq!(
+            archive.thread("C9", 1_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000, 2_000_000, 3_000_000]
+        );
+        assert_eq!(archive.timeline_count("C9").unwrap(), 2);
+
+        open_named(&mut app, "#deploys");
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("the root") && screen.contains("unrelated line"), "{screen}");
+        app.on_msg_key(Some(Action::Up));
+        app.on_msg_key(Some(Action::Open));
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("my reply") && screen.contains("their answer"), "{screen}");
+
+        app.escape_home();
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000],
+            "the same thread out of two archives is one card"
+        );
+        let screen = drawn(&mut app, 120, 30);
+        assert_eq!(screen.matches("their answer").count(), 1, "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One `threads/` archive can hold threads from several channels; each
+    /// becomes its own conversation.
+    #[test]
+    fn threads_from_two_channels_in_one_archive_make_two_conversations() {
+        let root = crate::archive::test_dir("threads-set-two");
+        dm_archive(&root.join("dms/self"), "U1");
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C8", "alerts", Kind::Channel), ("C9", "deploys", Kind::Channel)],
+            &[
+                ("C8", 1, 1, "U2", "alert root"),
+                ("C8", 2, 1, "U1", "alert reply"),
+                ("C9", 3, 3, "U2", "deploy root"),
+                ("C9", 4, 3, "U1", "deploy reply"),
+            ],
+        );
+        let mut app = corpus_app(&root);
+        let mut named: Vec<&str> = app
+            .corpus
+            .convs
+            .iter()
+            .filter(|c| c.id.starts_with('C'))
+            .map(|c| c.name.as_str())
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, ["#alerts", "#deploys"]);
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("#alerts") && screen.contains("#deploys"), "{screen}");
+        open_named(&mut app, "#alerts");
+        assert!(drawn(&mut app, 120, 30).contains("alert root"));
+        open_named(&mut app, "#deploys");
+        assert!(drawn(&mut app, 120, 30).contains("deploy root"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A hidden directory is an archive still being written, in the new set as
+    /// in the old ones.
+    #[test]
+    fn a_hidden_directory_in_the_threads_set_is_skipped() {
+        let root = crate::archive::test_dir("threads-set-hidden");
+        dm_archive(&root.join("dms/self"), "U1");
+        crate::archive::channel_database(
+            &root.join("threads/.tmp"),
+            &[("C7", "half-written", Kind::Channel)],
+            &[("C7", 1, 1, "U2", "not ready yet")],
+        );
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 2, 2, "U2", "ready")],
+        );
+        let mut app = corpus_app(&root);
+        assert!(app.corpus.conv_by_channel("C7").is_none());
+        assert!(app.corpus.conv_by_channel("C9").is_some());
+        let screen = drawn(&mut app, 120, 30);
+        assert!(!screen.contains("half-written"), "{screen}");
+        assert!(screen.contains("#deploys"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `me` still comes from `dms/`. A `threads/` archive can carry direct
+    /// messages of its own; asking it first would name the wrong owner, which
+    /// is what listing `threads` ahead of `dms` would do.
+    #[test]
+    fn the_owner_is_read_from_the_dm_archive_not_a_thread_archive() {
+        let root = crate::archive::test_dir("threads-set-me");
+        dm_archive(&root.join("dms/self"), "U1");
+        let threads = root.join("threads/x");
+        crate::archive::channel_database(
+            &threads,
+            &[
+                ("D8", "", Kind::Im),
+                ("D9", "", Kind::Im),
+                ("C9", "deploys", Kind::Channel),
+            ],
+            &[
+                ("D8", 200, 0, "U9", "one"),
+                ("D9", 201, 0, "U9", "two"),
+                ("C9", 1, 1, "U2", "the root"),
+                ("C9", 2, 1, "U1", "my reply"),
+            ],
+        );
+        crate::archive::add_members(
+            &threads,
+            &[("D8", "U9"), ("D8", "U4"), ("D9", "U9"), ("D9", "U6")],
+        );
+        let mut app = corpus_app(&root);
+        assert_eq!(app.corpus.me.as_deref(), Some("U1"));
+        // The owner is what the recency score counts, so it lands in the list.
+        assert_eq!(app.corpus.convs[app.corpus.conv_by_channel("C9").unwrap()].mine, 1);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000]
+        );
+        assert!(drawn(&mut app, 120, 30).contains("the root"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

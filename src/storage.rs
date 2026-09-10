@@ -34,7 +34,7 @@ pub fn resolve_root(requested: &Path) -> Result<PathBuf, String> {
     for entry in std::fs::read_dir(&root).map_err(|error| failure(&root, true, error))? {
         entry.map_err(|error| failure(&root, true, error))?;
     }
-    for set in ["full", "dms"] {
+    for set in crate::archive::ARCHIVE_SETS {
         let directory = root.join(set);
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
