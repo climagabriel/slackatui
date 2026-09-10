@@ -235,6 +235,7 @@ fn raw_json() -> App {
     app.stack.push(View::Raw {
         title: "raw".to_string(),
         browser: crate::raw::Browser::new(&json!({ "ts": "1000.000000", "text": "hi" })),
+        entry_focus: Focus::Msgs,
     });
     app
 }

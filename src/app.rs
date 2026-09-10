@@ -12,7 +12,7 @@ use ratatui::text::Line;
 use serde_json::Value;
 
 use crate::api::Client;
-use crate::archive::{ts_to_id, Archive, Conv, Corpus, Kind, Msg, PAGE, SEARCH_CAP};
+use crate::archive::{ts_to_id, Archive, Conv, Corpus, Counterpart, Kind, Msg, PAGE, SEARCH_CAP};
 use crate::complete;
 use crate::edit::Editor;
 use crate::keys::{Action, Chord, Keymap, DEFAULTS};
@@ -744,7 +744,15 @@ pub enum View {
         live_hits: Option<LiveHits>,
         live_pending: bool,
     },
-    Raw { title: String, browser: crate::raw::Browser },
+    Raw {
+        title: String,
+        browser: crate::raw::Browser,
+        /// The pane the view was opened from, restored when it is popped.
+        /// `h` out of a raw view opened on a conversation row returns to
+        /// the list even when a different conversation is open behind it,
+        /// and a link followed out of the view does not change that.
+        entry_focus: Focus,
+    },
     Reactions { title: String, lines: Vec<String>, scroll: usize },
     /// Roots of the threads the owner wrote in or was mentioned in, across
     /// every archive.
@@ -4671,7 +4679,11 @@ impl App {
         let place = self.corpus.channel_names.get(&m.channel_id).map(|name| format!("#{name}"))
             .unwrap_or_else(|| m.channel_id.clone());
         let title = format!("raw · {} · {place}", m.ts);
-        self.stack.push(View::Raw { title, browser: crate::raw::Browser::new(&m.data) });
+        self.stack.push(View::Raw {
+            title,
+            browser: crate::raw::Browser::new(&m.data),
+            entry_focus: Focus::Msgs,
+        });
     }
 
     /// `v` on a conversation row: the raw JSON of what the row stands for —
@@ -4695,16 +4707,30 @@ impl App {
             None => Err(format!("{name} is in Slack only; no archive row to show")),
             Some(archive) if conv.kind == Kind::Im => {
                 match archive.im_counterpart(&conv.id, me.as_deref()) {
-                    None => Err(format!("{name}: this archive names no counterpart")),
-                    Some(uid) => match archive.user_json(&uid) {
-                        Some(user) => Ok((format!("raw · {name} · {uid}"), user)),
-                        None => Err(format!("{name}: {uid} is not in this archive's user table")),
+                    Err(error) => Err(format!("{name}: channel row is not readable JSON: {error}")),
+                    Ok(Counterpart::OwnerUnknown(count)) => Err(format!(
+                        "{name}: cannot tell the counterpart from {count} members with no known owner"
+                    )),
+                    Ok(Counterpart::Ambiguous(count)) => Err(format!(
+                        "{name}: cannot tell the counterpart from {count} members"
+                    )),
+                    Ok(Counterpart::User(uid)) => match archive.user_json(&uid) {
+                        Ok(Some(user)) => Ok((format!("raw · {name} · {uid}"), user)),
+                        Ok(None) => {
+                            Err(format!("{name}: {uid} is not in this archive's user table"))
+                        }
+                        Err(error) => Err(format!(
+                            "{name}: the user row for {uid} is not readable JSON: {error}"
+                        )),
                     },
                 }
             }
             Some(archive) => match archive.channel_json(&conv.id) {
-                Some(channel) => Ok((format!("raw · {name} · {}", conv.id), channel)),
-                None => Err(format!("{name}: this archive holds no channel row for it")),
+                Ok(Some(channel)) => Ok((format!("raw · {name} · {}", conv.id), channel)),
+                Ok(None) => Err(format!("{name}: this archive holds no channel row for it")),
+                Err(error) => Err(format!(
+                    "{name}: this archive's channel row is not readable JSON: {error}"
+                )),
             },
         };
         match found {
@@ -4714,6 +4740,7 @@ impl App {
                 self.stack.push(View::Raw {
                     title,
                     browser: crate::raw::Browser::new(&value),
+                    entry_focus: Focus::Convs,
                 });
             }
             Err(status) => self.status = status,
@@ -5259,11 +5286,11 @@ impl App {
             return;
         }
         if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) && !control {
-            self.stack.pop();
-            // Nothing left behind it: a raw view opened from a conversation
-            // row hands the focus back to the list it came from.
-            if self.stack.is_empty() && self.open.is_none() {
-                self.focus = Focus::Convs;
+            // The pane the view was opened from takes the focus back,
+            // whatever a followed link did to it and whether or not a
+            // conversation is open behind the view.
+            if let Some(View::Raw { entry_focus, .. }) = self.stack.pop() {
+                self.focus = entry_focus;
             }
             return;
         }
@@ -5972,7 +5999,7 @@ pub(crate) mod tests {
         let index = app.filtered[1];
         app.open_conv(index);
         app.stack.push(View::Thread {root:1000000,list:MsgList::new(vec![msg(1,"thread")],true),live:None,place:None});
-        app.stack.push(View::Raw {title:"nested".into(),browser:crate::raw::Browser::new(&json!({}))});
+        app.stack.push(View::Raw {title:"nested".into(),browser:crate::raw::Browser::new(&json!({})),entry_focus:Focus::Msgs});
         app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
         assert!(app.stack.is_empty() && app.open.is_none() && app.focus == Focus::Convs);
         assert_eq!(app.conv_cursor,1);
@@ -6713,7 +6740,7 @@ pub(crate) mod tests {
         app.mode=Mode::Normal;
         let mut browser=crate::raw::Browser::new(&json!({"text":"line\n".repeat(100)}));
         browser.scroll=20;
-        app.stack.push(View::Raw {title:"raw".into(),browser});
+        app.stack.push(View::Raw {title:"raw".into(),browser,entry_focus:Focus::Msgs});
         app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));
         assert!(matches!(app.stack.last(),Some(View::Raw {browser,..}) if browser.scroll==24));
         app.on_key(KeyEvent::new(KeyCode::Char('b'),KeyModifiers::NONE));
@@ -7839,7 +7866,7 @@ pub(crate) mod tests {
     #[test]
     fn browser_completion_preserves_raw_navigation_and_reports_failure() {
         let mut app=mute_test_app();
-        app.stack.push(View::Raw { title:"raw".into(), browser:crate::raw::Browser::new(&json!({"url":"https://example.org/"})) });
+        app.stack.push(View::Raw { title:"raw".into(), browser:crate::raw::Browser::new(&json!({"url":"https://example.org/"})), entry_focus:Focus::Msgs });
         for outcome in [Ok(Done::BrowserOpened),Err("Browser opener failed".into())] {
             let success=outcome.is_ok();
             app.browser_jobs.push(Job::completed_for_test(JobKind::OpenBrowser,outcome));
@@ -8789,6 +8816,7 @@ pub(crate) mod tests {
             app.stack.push(View::Raw {
                 title: "raw".into(),
                 browser: crate::raw::Browser::new(&json!({"text":"test"})),
+                entry_focus: Focus::Msgs,
             });
             app.on_msg_key(Some(action));
             assert!(app.open.is_some());
@@ -9337,9 +9365,19 @@ pub(crate) mod tests {
             channel("D2", 1, json!({"id":"D2","is_im":true,"user":"U2"}));
             channel("D3", 1, json!({"id":"D3","is_im":true,"user":"U9"}));
             // No `user` field: the counterpart comes from CHANNEL_USER.
+            // D4 settles it, D5 has the owner alone, D6 has two others.
             channel("D4", 1, json!({"id":"D4","is_im":true}));
+            channel("D5", 1, json!({"id":"D5","is_im":true}));
+            channel("D6", 1, json!({"id":"D6","is_im":true}));
             conn.execute_batch(
-                "INSERT INTO CHANNEL_USER VALUES ('D4','U1'), ('D4','U2');",
+                "INSERT INTO CHANNEL_USER VALUES ('D4','U1'), ('D4','U2'), ('D5','U1'),
+                 ('D6','U2'), ('D6','U3');",
+            )
+            .unwrap();
+            // C7's row is there and cannot be decoded; C8 has no row at all.
+            conn.execute(
+                "INSERT INTO CHANNEL VALUES ('C7', '', CAST(?1 AS BLOB), 1)",
+                rusqlite::params!["{\"id\":\"C7\", truncated"],
             )
             .unwrap();
             let user = |id: &str, data: Value| {
@@ -9366,13 +9404,17 @@ pub(crate) mod tests {
             json!({"id":"D2","user":"U2","is_im":true}),
             json!({"id":"D3","user":"U9","is_im":true}),
             json!({"id":"D4","is_im":true}),
+            json!({"id":"D5","is_im":true}),
+            json!({"id":"D6","is_im":true}),
+            json!({"id":"C7","name":"unreadable","is_member":true}),
+            json!({"id":"C8","name":"rowless","is_member":true}),
             json!({"id":"C9","name":"live-only","is_member":true}),
         ]);
         app.corpus
             .archives
             .push(Archive::open("full/rows".into(), &dir).unwrap());
         let index = app.corpus.archives.len() - 1;
-        for id in ["C1", "G1", "D2", "D3", "D4"] {
+        for id in ["C1", "G1", "D2", "D3", "D4", "D5", "D6", "C7", "C8"] {
             let conv = app.corpus.conv_by_channel(id).unwrap();
             app.corpus.convs[conv].archive = index;
             app.corpus.convs[conv].live_only = false;
@@ -9574,5 +9616,153 @@ pub(crate) mod tests {
         assert!(drawn.contains("a message of its own"), "{drawn}");
         assert!(drawn.contains("\"ts\": \"1.000000\""), "{drawn}");
         assert!(!drawn.contains("\"purpose\""), "{drawn}");
+    }
+    /// The pane `v` was pressed in gets the focus back, whatever a followed
+    /// link did to it in between and whether or not another conversation is
+    /// open behind the raw view.
+    #[test]
+    fn following_a_link_out_of_a_raw_view_returns_the_focus_it_was_opened_from() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(
+            &mut app,
+            "https://myorg.slack.com/archives/C1/p7000000",
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // From the list, with another conversation open behind it.
+        let other = app.corpus.conv_by_channel("G1").unwrap();
+        app.open_conv(other);
+        select_conversation(&mut app, "C1");
+        let cursor = app.conv_cursor;
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.stack.last(), Some(View::Thread { .. })), "{}", app.status);
+        assert_eq!(app.focus, Focus::Msgs);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("the linked message"));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Convs);
+        assert_eq!(app.conv_cursor, cursor);
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(other));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("select a conversation and press Enter"));
+
+        // The mirror: a message's own raw view keeps the messages pane.
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(
+            vec![msg(1, "see https://myorg.slack.com/archives/C1/p7000000 for it")],
+            false,
+        );
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.stack.last(), Some(View::Thread { .. })), "{}", app.status);
+        app.on_key(key(KeyCode::Char('h')));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Msgs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Without a `user` field on the channel object, the membership answers
+    /// only when it settles the question: a known owner and exactly one
+    /// other member. Anything else names the ambiguity instead of picking.
+    #[test]
+    fn the_direct_message_counterpart_refuses_an_ambiguous_membership() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // One member who is not the owner: that member.
+        select_conversation(&mut app, "D4");
+        app.on_key(key(KeyCode::Char('v')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("Europe/Prague"));
+        app.on_key(key(KeyCode::Char('h')));
+
+        // The owner alone, and two members who are neither of them the owner.
+        for (id, count) in [("D5", "1 members"), ("D6", "2 members")] {
+            select_conversation(&mut app, id);
+            app.status.clear();
+            app.on_key(key(KeyCode::Char('v')));
+            assert!(app.stack.is_empty(), "{id}");
+            assert!(
+                app.status.contains(&format!("cannot tell the counterpart from {count}")),
+                "{id}: {}",
+                app.status
+            );
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            assert!(screen(&terminal).contains("select a conversation and press Enter"), "{id}");
+        }
+
+        // No known owner: no member can be ruled out, so none is picked.
+        app.corpus.me = None;
+        select_conversation(&mut app, "D4");
+        app.status.clear();
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("no known owner"), "{}", app.status);
+        // The channel object's own `user` field still answers without one.
+        select_conversation(&mut app, "D2");
+        app.on_key(key(KeyCode::Char('v')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("Europe/Prague"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A row that is there and cannot be decoded says so, and does not read
+    /// as a row that is not there. A refusal over an open raw view leaves
+    /// the view and the focus alone.
+    #[test]
+    fn an_unreadable_row_is_not_reported_as_a_missing_one() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        select_conversation(&mut app, "C7");
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("channel row is not readable JSON"), "{}", app.status);
+        assert!(!app.status.contains("holds no channel row"), "{}", app.status);
+
+        select_conversation(&mut app, "C8");
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("holds no channel row"), "{}", app.status);
+
+        // A refusal with a raw view already open, and a conversation open
+        // behind it, changes neither the stack nor the focus. `v` itself no
+        // longer reaches the handler there: an open raw view takes the key
+        // first, and answers to none of its own.
+        app.open_conv(app.corpus.conv_by_channel("G1").unwrap());
+        select_conversation(&mut app, "C1");
+        app.on_key(key(KeyCode::Char('v')));
+        let (depth, focus) = (app.stack.len(), app.focus);
+        assert_eq!(depth, 1);
+        app.conv_cursor = app
+            .filtered
+            .iter()
+            .position(|&i| i == app.corpus.conv_by_channel("C9").unwrap())
+            .unwrap();
+        app.status.clear();
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(app.status, "");
+        assert_eq!(app.stack.len(), depth);
+        app.on_conv_key(Some(Action::RawJson));
+        assert!(app.status.contains("in Slack only"), "{}", app.status);
+        assert_eq!(app.stack.len(), depth);
+        assert_eq!(app.focus, focus);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("keep nginx builds moving"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -452,6 +452,7 @@ mod tests {
                 browser.scroll = 3;
                 browser
             },
+            entry_focus: crate::app::Focus::Msgs,
         });
         let snapshot = state(&app);
         let serialized = snapshot.to_string();

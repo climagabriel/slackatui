@@ -38,6 +38,17 @@ impl Kind {
     }
 }
 
+/// What the archive can say about the other side of a direct message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Counterpart {
+    User(String),
+    /// The membership does not settle it: this many members, none of them
+    /// singled out once the owner is removed.
+    Ambiguous(usize),
+    /// The archive owner is unknown, so no member can be ruled out.
+    OwnerUnknown(usize),
+}
+
 #[derive(Clone)]
 pub struct User {
     pub name: String,
@@ -849,20 +860,30 @@ impl Archive {
 
     /// One row's stored Slack object, as JSON. `DATA` is a blob of UTF-8
     /// JSON, so the cast is how every other reader here reaches its text.
-    fn row_json(&self, sql: &str, id: &str) -> Option<Value> {
-        let text: String = self
+    /// `Ok(None)` is a row that is not there; `Err` is a row that is there
+    /// and cannot be decoded. Folding the two together makes a corrupt row
+    /// report as a missing one, and sends `im_counterpart` down its
+    /// fallback as if the channel object carried no `user`.
+    fn row_json(&self, sql: &str, id: &str) -> Result<Option<Value>, String> {
+        let text: Option<String> = self
             .conn
             .query_row(sql, params![id], |r| r.get(0))
             .optional()
-            .ok()
-            .flatten()?;
-        serde_json::from_str(&text).ok().filter(Value::is_object)
+            .map_err(|error| error.to_string())?;
+        let Some(text) = text else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&text) {
+            Ok(value @ Value::Object(_)) => Ok(Some(value)),
+            Ok(_) => Err("stored row is JSON but not an object".to_string()),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// The whole `CHANNEL` row of one conversation, not the handful of
     /// fields `Conv` keeps. A refresh appends a new chunk rather than
     /// rewriting the old one, so the newest chunk answers.
-    pub fn channel_json(&self, cid: &str) -> Option<Value> {
+    pub fn channel_json(&self, cid: &str) -> Result<Option<Value>, String> {
         self.row_json(
             "SELECT CAST(DATA AS TEXT) FROM CHANNEL WHERE ID = ?1 \
              ORDER BY CHUNK_ID DESC, rowid DESC LIMIT 1",
@@ -872,38 +893,45 @@ impl Archive {
 
     /// The whole `S_USER` row of one user. `MAX(rowid)` per id is what
     /// `load_users` takes; for a single id that is the last row.
-    pub fn user_json(&self, uid: &str) -> Option<Value> {
+    pub fn user_json(&self, uid: &str) -> Result<Option<Value>, String> {
         self.row_json(
             "SELECT CAST(DATA AS TEXT) FROM S_USER WHERE ID = ?1 ORDER BY rowid DESC LIMIT 1",
             uid,
         )
     }
 
-    /// The other side of a direct message: the channel object's own `user`
-    /// field, else the one member of `CHANNEL_USER` that is not the owner.
-    /// The two sources `display_name` names an IM row from.
-    pub fn im_counterpart(&self, cid: &str, me: Option<&str>) -> Option<String> {
+    /// The other side of a direct message. The channel object's own `user`
+    /// field answers on its own, self-DMs included. Without one, the
+    /// membership answers only when it settles the question: a known owner
+    /// and exactly one member who is not the owner. An owner-only or
+    /// wider membership, or an unknown owner, names nobody rather than
+    /// picking a member — a group conversation misfiled as an IM would
+    /// otherwise open an arbitrary person's user object.
+    pub fn im_counterpart(&self, cid: &str, me: Option<&str>) -> Result<Counterpart, String> {
         if let Some(user) = self
-            .channel_json(cid)
+            .channel_json(cid)?
             .and_then(|channel| channel["user"].as_str().map(str::to_string))
             .filter(|user| !user.is_empty())
         {
-            return Some(user);
+            return Ok(Counterpart::User(user));
         }
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT USER_ID FROM CHANNEL_USER WHERE CHANNEL_ID = ?1")
-            .ok()?;
+            .map_err(|error| error.to_string())?;
         let members: Vec<String> = stmt
             .query_map(params![cid], |r| r.get::<_, String>(0))
-            .ok()?
+            .map_err(|error| error.to_string())?
             .flatten()
             .collect();
-        members
-            .iter()
-            .find(|user| Some(user.as_str()) != me)
-            .or_else(|| members.first())
-            .cloned()
+        let Some(me) = me else {
+            return Ok(Counterpart::OwnerUnknown(members.len()));
+        };
+        let mut others = members.iter().filter(|user| user.as_str() != me);
+        match (others.next(), others.next()) {
+            (Some(user), None) => Ok(Counterpart::User(user.clone())),
+            _ => Ok(Counterpart::Ambiguous(members.len())),
+        }
     }
 
     pub fn channel_name(&self, cid: &str) -> Option<String> {
