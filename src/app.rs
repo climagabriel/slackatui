@@ -904,6 +904,9 @@ pub struct App {
     pub labels: bool,
     /// `U`: unread conversations at the top of the list.
     pub unreads_first: bool,
+    /// Epoch seconds a drawn-buffer test pins, so what the age dividers say
+    /// does not depend on when the suite runs. `None` is the wall clock.
+    pub clock: Option<i64>,
     /// The target of the open compose prompt.
     pub compose: Option<Compose>,
     /// The file the next send carries, from /upload or the clipboard.
@@ -1047,6 +1050,7 @@ impl App {
             show_version: false,
             labels: false,
             unreads_first: true,
+            clock: None,
             compose: None,
             attachment: None,
             attach_note: None,
@@ -2314,6 +2318,13 @@ impl App {
             Sort::Mine => format!("my activity ({:.0}d half-life)", self.half_life_days),
             other => other.label().to_string(),
         }
+    }
+
+    /// The clock the conversations pane reads once per render, in epoch
+    /// seconds. Pinned by `clock` in a test; the wall clock otherwise.
+    pub fn now_secs(&self) -> i64 {
+        self.clock
+            .unwrap_or_else(|| chrono::Utc::now().timestamp())
     }
 
     pub fn conv(&self, i: usize) -> &Conv {
@@ -6284,11 +6295,18 @@ pub(crate) mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-        // Row 0 is the border, 1..=4 the top sections, 5 their divider; the
-        // first conversation lands on 6.
-        let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        // Row 0 is the border, 1..=4 the top sections, 5 their divider, 6 the
+        // age divider this conversation falls under — it has no newest message,
+        // so `earlier` — and the first conversation lands on 7.
+        assert!(
             (1..29)
                 .map(|x| terminal.backend().buffer()[(x, 6)].symbol())
+                .collect::<String>()
+                .contains(" earlier ")
+        );
+        let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            (1..29)
+                .map(|x| terminal.backend().buffer()[(x, 7)].symbol())
                 .collect::<String>()
         };
         assert!(row(&terminal).ends_with("123"));
@@ -9068,6 +9086,42 @@ pub(crate) mod tests {
         ]);
         app
     }
+    /// An app on a pinned clock whose conversations are the named ones, each
+    /// with its newest message `age` seconds before that clock. A negative age
+    /// dates a conversation in the future; `None` gives it no newest message at
+    /// all. The names are given in no particular order: `apply_filter` puts the
+    /// list in the order the pane draws it.
+    pub(crate) fn aged_test_app(now: i64, convs: &[(&str, Option<i64>)]) -> App {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        );
+        app.clock = Some(now);
+        app.merge_conversations(
+            convs
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| {
+                    json!({"id":format!("C{}", i + 1),"name":name,"is_member":true})
+                })
+                .collect(),
+        );
+        for (i, (_, age)) in convs.iter().enumerate() {
+            app.corpus.convs[i].last_id = age.map_or(0, |age| (now - age) * 1_000_000);
+            app.corpus.convs[i].live_only = false;
+        }
+        app.apply_filter();
+        app
+    }
+
     fn control_b() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
     }

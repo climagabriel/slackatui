@@ -10,12 +10,12 @@
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..8:fg=Reset,bg=Reset,ul=Reset,+BOLD 8..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=Cyan,bg=Reset,ul=Reset 30..31:fg=DarkGray,bg=Reset,ul=Reset,+DIM 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=DarkGray,bg=Reset,ul=Reset,+DIM
   5 |│────────────────────────────││                                                                                        │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..29:fg=Reset,bg=Reset,ul=Reset,+DIM 29..30:fg=Cyan,bg=Reset,ul=Reset 30..31:fg=DarkGray,bg=Reset,ul=Reset,+DIM 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=DarkGray,bg=Reset,ul=Reset,+DIM
-  6 |│#one                       0││                                                                                        │|
+  6 |│───────── earlier ───────── ││                                                                                        │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..28:fg=Reset,bg=Reset,ul=Reset,+DIM 28..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=Cyan,bg=Reset,ul=Reset 30..31:fg=DarkGray,bg=Reset,ul=Reset,+DIM 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  7 |│#one                       0││                                                                                        │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..29:fg=Black,bg=White,ul=Reset 29..30:fg=Cyan,bg=Reset,ul=Reset 30..31:fg=DarkGray,bg=Reset,ul=Reset,+DIM 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=DarkGray,bg=Reset,ul=Reset,+DIM
-  7 |│@U1                        0││                                                                                        │|
+  8 |│@U1                        0││                                                                                        │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..4:fg=Reset,bg=Reset,ul=Reset,+DIM 4..28:fg=Reset,bg=Reset,ul=Reset 28..29:fg=Reset,bg=Reset,ul=Reset,+DIM 29..30:fg=Cyan,bg=Reset,ul=Reset 30..31:fg=DarkGray,bg=Reset,ul=Reset,+DIM 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=DarkGray,bg=Reset,ul=Reset,+DIM
-  8 |│                            ││                                                                                        │|
-    0..1:fg=Cyan,bg=Reset,ul=Reset 1..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=Cyan,bg=Reset,ul=Reset 30..31:fg=DarkGray,bg=Reset,ul=Reset,+DIM 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=DarkGray,bg=Reset,ul=Reset,+DIM
   9 |│                            ││                                                                                        │|
     0..1:fg=Cyan,bg=Reset,ul=Reset 1..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=Cyan,bg=Reset,ul=Reset 30..31:fg=DarkGray,bg=Reset,ul=Reset,+DIM 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=DarkGray,bg=Reset,ul=Reset,+DIM
  10 |│                            ││                                                                                        │|
