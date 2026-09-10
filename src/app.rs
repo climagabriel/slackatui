@@ -804,7 +804,7 @@ pub enum Mode {
         buf: Editor,
         /// What Esc restores or compares against: the list filter in force
         /// before a `/` command, the text `>` prefilled into a compose box,
-        /// and empty everywhere else.
+        /// the archive prompt's own value, and empty everywhere else.
         previous: String,
     },
 }
