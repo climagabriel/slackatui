@@ -171,11 +171,11 @@ pub struct MsgList {
     /// Channel requested for an empty thread, so a failed fetch can be retried.
     pub source_channel: Option<String>,
     pub msgs: Vec<Msg>,
-    /// THREADS only: what each item draws around `msgs[i]` — the header, the
-    /// elided reply count and the last reply. Empty in every other list, and
-    /// index-aligned with `msgs` when it is not: build one with `threads` and
-    /// drop items with `remove`, which is what keeps the two aligned.
-    cards: Vec<render::ThreadCard>,
+    /// THREADS and UNREADS only: what each item draws around `msgs[i]` — the
+    /// header, the elided count and the tail. Empty in every other list, and
+    /// index-aligned with `msgs` when it is not: build one with `with_cards`
+    /// and drop items with `remove`, which is what keeps the two aligned.
+    cards: Vec<render::Card>,
     pub cursor: usize,
     pub scroll: usize,
     /// Read the selected message by screen line, without moving its cursor.
@@ -207,11 +207,12 @@ impl MsgList {
         }
     }
 
-    /// The THREADS list: one card per thread, the root as the item the cursor
-    /// selects. Taking the pairs is what makes a misaligned card impossible to
-    /// build. `in_thread` is set, so the root's rendered footer does not
+    /// A card list: one card per item, and the message the cursor selects —
+    /// a thread root in THREADS, a conversation's first unread message in
+    /// UNREADS. Taking the pairs is what makes a misaligned card impossible
+    /// to build. `in_thread` is set, so the item's rendered footer does not
     /// repeat the reply count the card's own elision line carries.
-    pub fn threads(cards: Vec<(Msg, render::ThreadCard)>) -> MsgList {
+    pub fn with_cards(cards: Vec<(Msg, render::Card)>) -> MsgList {
         let (msgs, cards) = cards.into_iter().unzip();
         MsgList {
             msgs,
@@ -242,7 +243,11 @@ impl MsgList {
     /// A reply the card never counted moves neither. The counts are a
     /// snapshot taken when the view opened, so a reply written since — read
     /// in the thread the card opens, and deleted from there — is past
-    /// `counted_through` and leaves the card alone.
+    /// `counted_through` and leaves the card alone. Nor does anything at or
+    /// below the item the card leads with: a thread's replies are all past
+    /// its root, and an UNREADS card counts only messages past its first
+    /// unread one, so an older message deleted from another view is a message
+    /// this card never stood for.
     pub fn drop_reply(&mut self, cid: &str, root: i64, id: i64) {
         for i in 0..self.cards.len() {
             let Some(parent) = self.msgs.get(i) else { break };
@@ -250,9 +255,9 @@ impl MsgList {
                 continue;
             }
             let card = &mut self.cards[i];
-            if card.last.as_ref().is_some_and(|last| last.id == id) {
-                card.last = None;
-            } else if id <= card.counted_through {
+            if let Some(at) = card.tail.iter().position(|message| message.id == id) {
+                card.tail.remove(at);
+            } else if id > card.counted_from && id <= card.counted_through {
                 // Signed saturation lands at i64::MIN, and a count below
                 // zero would draw as one: clamp it here.
                 card.hidden = (card.hidden - 1).max(0);
@@ -261,6 +266,33 @@ impl MsgList {
             }
             self.dirty = true;
         }
+    }
+
+    /// The lead message of card `at` is gone: hand the lead to the next
+    /// message the card drew and report the card's new total, or `None` when
+    /// the card drew no other. `None` is not "drop the card": a card that
+    /// still counts messages it did not draw is rebuilt from the archive by
+    /// `refill_unread_card`, and only an empty one goes.
+    ///
+    /// An UNREADS card stands for a conversation, not for the one message it
+    /// leads with, so losing that message must not take the conversation out
+    /// of the view while it still has unread messages.
+    ///
+    /// Rebuilt from what the card already holds rather than re-read from the
+    /// archive: the archive deliberately keeps messages Slack no longer has,
+    /// so asking it for the conversation's first unread message hands back
+    /// the one just deleted. `hidden` is untouched — it counts the messages
+    /// the card does not draw, and the promoted one leaves that set exactly
+    /// as the deleted one leaves the drawn set, so the total falls by the one
+    /// message deleted and by no more.
+    pub fn promote_card(&mut self, at: usize) -> Option<i64> {
+        let card = self.cards.get_mut(at)?;
+        if card.tail.is_empty() {
+            return None;
+        }
+        self.msgs[at] = card.tail.remove(0);
+        self.dirty = true;
+        Some(card.hidden + card.tail.len() as i64 + 1)
     }
 
     /// Drop item `at`, its card with it, and keep the cursor in range.
@@ -334,8 +366,8 @@ impl MsgList {
             _ => "—".to_string(),
         };
         let unread_label = format!("new ({count})");
-        // A card stacks two messages under a header, so each gets a third of
-        // the pane where a lone message gets a half.
+        // A card stacks messages under a header, so each gets a third of the
+        // pane where a lone message gets a half.
         let cards = !self.cards.is_empty();
         let budget = self
             .pane_height
@@ -398,14 +430,14 @@ impl MsgList {
                     if fit != CardFit::Root && elided > 0 {
                         self.flat.push(FlatLine {
                             msg: Some(i),
-                            line: render::card_elision(elided),
+                            line: render::card_elision(card.elision, elided),
                             image: None,
                         });
                     }
                     if fit == CardFit::Whole {
-                        if let Some(last) = &card.last {
+                        for message in &card.tail {
                             collapsed |= push_message(
-                                &mut self.flat, i, last, ctx, width, self.in_thread, today, budget,
+                                &mut self.flat, i, message, ctx, width, self.in_thread, today, budget,
                             );
                         }
                     }
@@ -485,8 +517,8 @@ impl MsgList {
                     tags.push("card_elision");
                 }
                 if fit == CardFit::Whole {
-                    if let Some(reply) = &card.last {
-                        tags.extend(message_tags(reply));
+                    for message in &card.tail {
+                        tags.extend(message_tags(message));
                     }
                 }
             }
@@ -622,12 +654,12 @@ pub struct Open {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TopSection { Saved, Sent, Mentions, Threads }
+pub enum TopSection { Saved, Sent, Mentions, Threads, Unreads }
 
 impl TopSection {
-    pub const ALL: [Self; 4] = [Self::Saved, Self::Sent, Self::Mentions, Self::Threads];
-    pub fn label(self) -> &'static str { match self { Self::Saved => "SAVED", Self::Sent => "SENT", Self::Mentions => "MENTIONS", Self::Threads => "THREADS" } }
-    pub fn row(self) -> usize { match self { Self::Saved => 0, Self::Sent => 1, Self::Mentions => 2, Self::Threads => 3 } }
+    pub const ALL: [Self; 5] = [Self::Saved, Self::Sent, Self::Mentions, Self::Threads, Self::Unreads];
+    pub fn label(self) -> &'static str { match self { Self::Saved => "SAVED", Self::Sent => "SENT", Self::Mentions => "MENTIONS", Self::Threads => "THREADS", Self::Unreads => "UNREADS" } }
+    pub fn row(self) -> usize { match self { Self::Saved => 0, Self::Sent => 1, Self::Mentions => 2, Self::Threads => 3, Self::Unreads => 4 } }
 }
 
 /// How a search view's hits divide between Slack and the local archives,
@@ -762,6 +794,15 @@ pub enum View {
     /// Roots of the threads the owner wrote in or was mentioned in, across
     /// every archive.
     Threads { list: MsgList },
+    /// One card per conversation with unread messages, newest unread first.
+    Unreads {
+        list: MsgList,
+        /// `(channel, id)` of every message deleted from Slack while this
+        /// view has been open. The archive is read-only and deliberately
+        /// keeps what Slack no longer has, so a card rebuilt from it would
+        /// hand these back; every rebuild leaves them out.
+        deleted: Vec<(String, i64)>,
+    },
     /// `/colorpalette`: edit semantic UI colors with a live preview.
     ColorPalette {
         highlights: Option<crate::word_highlights::Menu>,
@@ -908,7 +949,6 @@ pub struct App {
     /// A debug mode, off at every start and never written anywhere.
     pub labels: bool,
     /// `U`: unread conversations at the top of the list.
-    pub unreads_first: bool,
     /// Epoch seconds a drawn-buffer test pins, so what the age dividers say
     /// does not depend on when the suite runs. `None` is the wall clock.
     pub clock: Option<i64>,
@@ -1054,7 +1094,6 @@ impl App {
             highlight_cached: false,
             show_version: false,
             labels: false,
-            unreads_first: true,
             clock: None,
             compose: None,
             attachment: None,
@@ -1082,18 +1121,6 @@ impl App {
             ));
         }
         app
-    }
-
-    /// The sort as the title names it.
-    /// `U`: unread conversations on top, or the plain sort order.
-    fn toggle_unreads_first(&mut self) {
-        self.unreads_first = !self.unreads_first;
-        self.apply_filter();
-        self.status = if self.unreads_first {
-            "unread conversations first".to_string()
-        } else {
-            format!("conversations by {}", self.sort_label())
-        };
     }
 
     /// Where `c` writes: the open thread replies in that thread, a search or
@@ -1130,7 +1157,7 @@ impl App {
                     label: format!("reply in this thread in {name}"),
                 })
             }
-            Some(View::Search { .. }) | Some(View::Threads { .. }) | Some(View::Saved { .. }) | Some(View::Feed { .. }) => {
+            Some(View::Search { .. }) | Some(View::Threads { .. }) | Some(View::Unreads { .. }) | Some(View::Saved { .. }) | Some(View::Feed { .. }) => {
                 let m = self.selected().ok_or("no message selected")?;
                 let conv = known(&m.channel_id)?;
                 let name = self.corpus.convs[conv].name.clone();
@@ -1877,7 +1904,7 @@ impl App {
         let mut known = self.saved_messages.clone();
         if let Some(open) = &self.open { known.extend(open.list.msgs.clone()); }
         for view in &self.stack {
-            if let View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } | View::Feed { list, .. } = view { known.extend(list.msgs.clone()); }
+            if let View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Unreads { list, .. } | View::Saved { list } | View::Feed { list, .. } = view { known.extend(list.msgs.clone()); }
         }
         if let Some((message, _)) = &change { known.push(message.clone()); }
         let sources = self.corpus.convs.iter().filter(|conv| !conv.live_only).map(|conv| {
@@ -2049,6 +2076,9 @@ impl App {
     /// THREADS card of the thread it was a reply in. `root` is None for a
     /// message that is not a reply; deleting a thread's root drops that
     /// card whole, through `remove`.
+    ///
+    /// An UNREADS card is the exception: its item is one unread message of a
+    /// conversation that has others, so it is promoted rather than removed.
     fn drop_message(&mut self, cid: &str, root: Option<i64>, id: i64) {
         let mut lists: Vec<&mut MsgList> = Vec::new();
         if let Some(o) = self.open.as_mut() {
@@ -2056,6 +2086,7 @@ impl App {
         }
         for view in self.stack.iter_mut() {
             match view {
+                View::Unreads { .. } => {}
                 View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } | View::Feed { list, .. } => {
                     lists.push(list)
                 }
@@ -2068,10 +2099,89 @@ impl App {
             if let Some(root) = root {
                 list.drop_reply(cid, root, id);
             }
-            let Some(at) = list.msgs.iter().position(|m| m.id == id) else {
+            // Message ids are Slack timestamps, so two conversations can
+            // carry the same one; a cross-conversation list has to match on
+            // both or it drops another conversation's message.
+            let Some(at) = list.msgs.iter().position(|m| m.id == id && m.channel_id == cid) else {
                 continue;
             };
             list.remove(at);
+        }
+        let views: Vec<usize> = self
+            .stack
+            .iter()
+            .enumerate()
+            .filter(|(_, view)| matches!(view, View::Unreads { .. }))
+            .map(|(at, _)| at)
+            .collect();
+        for view in views {
+            self.drop_from_unreads(view, cid, id);
+        }
+    }
+
+    /// The delete, applied to one UNREADS view. A card there stands for a
+    /// conversation rather than for the message it leads with, so the message
+    /// comes off whichever part of the card held it and the card stays: off
+    /// the tail, off the elided count, or — the lead itself — by promotion,
+    /// and by a rebuild from the archive when the card drew nothing else but
+    /// still counts messages it did not draw.
+    fn drop_from_unreads(&mut self, view: usize, cid: &str, id: i64) {
+        let Some(View::Unreads { list, deleted }) = self.stack.get_mut(view) else { return };
+        deleted.push((cid.to_string(), id));
+        let skip = Self::deleted_in(deleted, cid);
+        // What each card stood for before the delete: the header carries that
+        // number, and whichever part of the card held the message, the card
+        // loses one.
+        let before: Vec<(String, i64, i64)> = list
+            .msgs
+            .iter()
+            .zip(&list.cards)
+            .map(|(m, card)| {
+                (m.channel_id.clone(), m.id, card.hidden + card.tail.len() as i64 + 1)
+            })
+            .collect();
+        // Off the tail, or off the count, keyed by each card's own lead. The
+        // channel is part of the key: two conversations can lead with the
+        // same id.
+        for (channel, lead, _) in &before {
+            if channel == cid && *lead != id {
+                list.drop_reply(cid, *lead, id);
+            }
+        }
+        let lost_lead = list.msgs.iter().position(|m| m.id == id && m.channel_id == cid);
+        let mut refill = None;
+        if let Some(at) = lost_lead {
+            if list.promote_card(at).is_none() {
+                // Nothing drawn left to lead with. Messages the card only
+                // counted are still unread, so go back to the archive for
+                // them; a card counting none at all has nothing left to say.
+                refill = Some(at);
+            }
+        }
+        // The header's count is the card's own total, so it is renumbered
+        // only where it still says what that card said. A card whose unread
+        // messages the archive never held says something else and is left
+        // alone. Done while the indices still line up with the snapshot.
+        for (i, (_, _, was)) in before.iter().enumerate() {
+            let Some(card) = list.cards.get_mut(i) else { break };
+            let now = card.hidden + card.tail.len() as i64 + 1;
+            if now != *was && card.participants == Self::unread_label(*was) {
+                card.participants = Self::unread_label(now);
+            }
+        }
+        let Some(at) = refill else { return };
+        let rebuilt = self
+            .corpus
+            .conv_by_channel(cid)
+            .and_then(|index| self.refill_unread_card(index, &skip));
+        let Some(View::Unreads { list, .. }) = self.stack.get_mut(view) else { return };
+        match rebuilt {
+            Some((lead, card)) => {
+                list.msgs[at] = lead;
+                list.cards[at] = card;
+                list.mark_dirty();
+            }
+            None => list.remove(at),
         }
     }
 
@@ -2425,11 +2535,6 @@ impl App {
                     .cmp(&self.conv_type(&convs[b]))
                     .then(convs[b].last_id.cmp(&convs[a].last_id))
             }),
-        }
-        // Unread conversations first, in the same order among themselves;
-        // a typed filter still puts the closer name matches above.
-        if self.unreads_first {
-            idx.sort_by_key(|&i| !convs[i].unread);
         }
         if !needle.is_empty() {
             idx.sort_by_key(|&i| rank(&convs[i].name).unwrap_or(2));
@@ -2984,7 +3089,7 @@ impl App {
     /// Open a message's thread wherever it lives: this conversation, another
     /// archived one (switched to underneath the search view), or Slack.
     fn open_hit(&mut self, cid: String, root: i64, focus: i64) {
-        if matches!(self.stack.last(), Some(View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. })) {
+        if matches!(self.stack.last(), Some(View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. } | View::Unreads { .. })) {
             self.open_thread_in(cid, root, focus);
             return;
         }
@@ -3002,7 +3107,7 @@ impl App {
                 .filter(|&i| !self.corpus.convs[i].live_only)
             {
                 let search = match self.stack.last() {
-                    Some(View::Search { .. }) | Some(View::Threads { .. }) => self.stack.pop(),
+                    Some(View::Search { .. }) | Some(View::Threads { .. }) | Some(View::Unreads { .. }) => self.stack.pop(),
                     _ => None,
                 };
                 self.open_conv(idx);
@@ -3764,7 +3869,7 @@ impl App {
             self.status = "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
             return;
         };
-        let mut cards: Vec<(Msg, render::ThreadCard)> = Vec::new();
+        let mut cards: Vec<(Msg, render::Card)> = Vec::new();
         let mut seen: HashSet<(String, i64)> = HashSet::new();
         for (ai, a) in self.corpus.archives.iter().enumerate() {
             let Ok(msgs) = a.my_threads(&me) else {
@@ -3803,14 +3908,17 @@ impl App {
                 let total = root.reply_count.max(root.archived_replies);
                 let hidden = (total - i64::from(last.is_some())).max(0);
                 let counted_through = last.as_ref().map_or(root.id, |last| last.id);
+                let counted_from = root.id;
                 cards.push((
                     root,
-                    render::ThreadCard {
+                    render::Card {
                         conversation,
                         participants,
                         hidden,
+                        counted_from,
                         counted_through,
-                        last,
+                        tail: last.into_iter().collect(),
+                        elision: render::Elision::Replies,
                     },
                 ));
             }
@@ -3818,10 +3926,240 @@ impl App {
         cards.sort_by_key(|(root, _)| std::cmp::Reverse(root.latest_reply_id.unwrap_or(root.id)));
         let n = cards.len();
         self.stack.push(View::Threads {
-            list: MsgList::threads(cards),
+            list: MsgList::with_cards(cards),
         });
         self.focus = Focus::Msgs;
         self.status = format!("{n} threads you took part in or were mentioned in, newest reply first");
+    }
+
+    /// The messages an UNREADS card draws under its first one: at most this
+    /// many, the newest of the conversation's unread run. Four drawn
+    /// messages a card is what a pane of ordinary height fits without the
+    /// card shedding parts of itself.
+    const UNREAD_CARD_TAIL: usize = 3;
+
+    /// One card per conversation with unread messages, newest unread message
+    /// first: the conversation and its unread count, then the first unread
+    /// message, the ones between elided, and the newest of them.
+    ///
+    /// The conversations are the ones the pane is showing, muted ones aside:
+    /// the visibility settings and a typed `/find` needle apply here too, so
+    /// the view never holds a row the list has been told to hide. Muted
+    /// conversations are left out whatever the settings say — the muted block
+    /// is where the alert channels sit, each with more unread messages than
+    /// everything else put together, and their cards would bury the view.
+    ///
+    /// Where the archive holds no message past the read marker — a
+    /// conversation only Slack has, one whose marker is still unknown, or one
+    /// whose unread messages the last refresh did not reach — the card falls
+    /// back to the newest message the archive does hold and says so beside
+    /// the name, and `Enter` opens the conversation the way the list does:
+    /// the cached page, or a fetch from Slack. A conversation with no
+    /// archived message at all draws a note in place of a message.
+    fn open_unreads(&mut self) {
+        // Leaving for UNREADS. A refresh already out was going to open the
+        // conversation it refreshed when it lands; the reader has gone
+        // elsewhere, so it lands quietly instead — as it does for SAVED and
+        // SENT.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
+        let targets: Vec<usize> = self
+            .filtered
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let conv = &self.corpus.convs[index];
+                conv.unread && !conv.muted
+            })
+            .collect();
+        // Deletes made while the view was open carry over: the archive keeps
+        // what Slack no longer has, so a rebuild that forgot them would put
+        // the deleted messages back on the cards.
+        let deleted = match self.stack.last() {
+            Some(View::Unreads { deleted, .. }) => deleted.clone(),
+            _ => Vec::new(),
+        };
+        let mut cards: Vec<(Msg, render::Card)> = Vec::new();
+        for index in targets {
+            let skip = Self::deleted_in(&deleted, &self.corpus.convs[index].id);
+            cards.push(
+                self.refill_unread_card(index, &skip)
+                    .unwrap_or_else(|| self.stale_unread_card(index, &skip)),
+            );
+        }
+        // Newest unread message first, and for a card whose unread messages
+        // the archive does not hold, the newest message Slack says the
+        // conversation has: `last_id` is what the live snapshot updates, and
+        // the cached message such a card draws can be days behind it.
+        cards.sort_by_key(|(first, card)| {
+            let drawn = card.tail.last().map_or(first.id, |m| m.id);
+            std::cmp::Reverse(drawn.max(
+                self.corpus
+                    .conv_by_channel(&first.channel_id)
+                    .map_or(0, |index| self.corpus.convs[index].last_id),
+            ))
+        });
+        let n = cards.len();
+        let list = MsgList::with_cards(cards);
+        match self.stack.last_mut() {
+            Some(View::Unreads { list: open, .. }) => *open = list,
+            _ => self.stack.push(View::Unreads { list, deleted }),
+        }
+        self.focus = Focus::Msgs;
+        self.status = format!(
+            "{n} {} with unread messages, newest unread first",
+            if n == 1 { "conversation" } else { "conversations" }
+        );
+    }
+
+    /// The ids of `deleted` that belong to one conversation.
+    fn deleted_in(deleted: &[(String, i64)], cid: &str) -> Vec<i64> {
+        deleted
+            .iter()
+            .filter(|(channel, _)| channel == cid)
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    /// An UNREADS card built from the archive: the conversation's first
+    /// unread message, the ones between elided, and the newest of them.
+    /// `skip` are ids deleted from Slack while the view has been open, which
+    /// the read-only archive still holds and would otherwise hand back.
+    ///
+    /// None when the archive has nothing past the read marker — a
+    /// conversation only Slack has, one whose marker is still unknown, one
+    /// the last archive run did not reach, and one whose unread messages have
+    /// all been deleted. The caller draws `stale_unread_card` instead, or
+    /// drops the card.
+    fn refill_unread_card(&self, index: usize, skip: &[i64]) -> Option<(Msg, render::Card)> {
+        let conv = &self.corpus.convs[index];
+        let archive = self.corpus.conv_archive(conv).filter(|_| conv.last_read > 0)?;
+        let (total, mut msgs) = archive
+            .unread_page(&conv.id, conv.last_read, Self::UNREAD_CARD_TAIL, skip)
+            .ok()?;
+        if msgs.is_empty() {
+            return None;
+        }
+        for message in &mut msgs {
+            // The card's header names the conversation; a message header
+            // would say it again under it.
+            message.channel_name = None;
+        }
+        let card = render::Card {
+            conversation: conv.name.clone(),
+            participants: Self::unread_label(total),
+            hidden: (total - msgs.len() as i64).max(0),
+            counted_from: msgs[0].id,
+            counted_through: msgs.last().map_or(conv.last_id, |m| m.id),
+            tail: Vec::new(),
+            elision: render::Elision::Messages,
+        };
+        let lead = msgs.remove(0);
+        Some((lead, render::Card { tail: msgs, ..card }))
+    }
+
+    /// The card for a conversation Slack calls unread and the archive has no
+    /// unread message of: the newest message it does hold, and a header
+    /// saying the unread ones are not there. `skip` keeps a message deleted
+    /// from Slack off the card, the read-only archive still holding it.
+    fn stale_unread_card(&self, index: usize, skip: &[i64]) -> (Msg, render::Card) {
+        let conv = &self.corpus.convs[index];
+        let mut msgs: Vec<Msg> = self
+            .corpus
+            .conv_archive(conv)
+            .and_then(|a| a.timeline_page(&conv.id, None, None, 1 + skip.len()).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| !skip.contains(&m.id))
+            .collect();
+        if msgs.len() > 1 {
+            msgs.drain(..msgs.len() - 1);
+        }
+        if msgs.is_empty() {
+            msgs.push(Self::unread_placeholder(conv));
+        }
+        for message in &mut msgs {
+            message.channel_name = None;
+        }
+        let card = render::Card {
+            conversation: conv.name.clone(),
+            // Slack's count where a snapshot has one; the archive cannot
+            // supply it, having none of the messages it would count.
+            participants: match conv.unread_count {
+                Some(n) => format!("{n} unread · not in the archive"),
+                None => "unread · not in the archive".to_string(),
+            },
+            hidden: 0,
+            counted_from: msgs[0].id,
+            counted_through: msgs.last().map_or(conv.last_id, |m| m.id),
+            tail: Vec::new(),
+            elision: render::Elision::Messages,
+        };
+        let lead = msgs.remove(0);
+        (lead, render::Card { tail: msgs, ..card })
+    }
+
+    /// The count an UNREADS card's header carries for a conversation whose
+    /// unread messages the archive holds. One function so that a card whose
+    /// lead message is deleted can be renumbered without guessing at the
+    /// string it already carries.
+    fn unread_label(total: i64) -> String {
+        format!("{total} unread")
+    }
+
+    /// The one line an UNREADS card draws for a conversation no archive holds
+    /// a message of. A card's item has to be a message, and there is none.
+    fn unread_placeholder(conv: &Conv) -> Msg {
+        let id = if conv.last_id > 0 { conv.last_id } else { 1 };
+        Msg::from_api(
+            conv.id.clone(),
+            serde_json::json!({
+                "ts": format!("{}.{:06}", id / 1_000_000, id % 1_000_000),
+                "username": "slack-tui",
+                "text": "not cached; open the conversation to load it from Slack",
+            }),
+        )
+        .expect("a placeholder message")
+    }
+
+    /// `Enter` on an UNREADS card: open that conversation, at its first
+    /// unread message when the card knows which one that is.
+    fn open_unread_card(&mut self) {
+        let Some(message) = self.selected().cloned() else { return };
+        let Some(index) = self.corpus.conv_by_channel(&message.channel_id) else {
+            self.status = "Conversation is unavailable; refresh the conversation list".into();
+            return;
+        };
+        // The card led with a real unread message only when the archive was
+        // the one that found it: a fallback card leads with a read message or
+        // with the placeholder, and neither is a position to claim.
+        let conv = &self.corpus.convs[index];
+        let unread = !conv.live_only && conv.last_read > 0 && message.id > conv.last_read;
+        self.stack.clear();
+        if !self.open_conv(index) {
+            return;
+        }
+        if let Some(at) = self.filtered.iter().position(|&i| i == index) {
+            self.conv_cursor = at;
+        }
+        if !unread {
+            // Nothing was positioned, so whatever `open_conv` had to say —
+            // that the conversation is not cached and there is no sign-in to
+            // fetch it with, say — is the news, and stands.
+            return;
+        }
+        // `open_conv` already lands on the first message past the marker of
+        // the page it loaded. A longer unread run than that page leaves the
+        // first unread off it, and only then is a jump needed.
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|open| !open.api_only && !open.list.msgs.iter().any(|m| m.id == message.id))
+        {
+            self.jump_to(message.id);
+        }
+        let name = self.corpus.convs[index].name.clone();
+        self.status = format!("{name} at the first unread message · h: back");
     }
 
     pub fn image_font(&self) -> Option<(u16, u16)> {
@@ -3839,7 +4177,7 @@ impl App {
         }
         for v in &mut self.stack {
             match v {
-                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } | View::Feed { list, .. } => {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Unreads { list, .. } | View::Saved { list } | View::Feed { list, .. } => {
                     list.mark_dirty()
                 }
                 _ => {}
@@ -4654,12 +4992,7 @@ impl App {
                 } else {
                     "marked read"
                 };
-                let at = self.conv_cursor;
                 self.apply_filter();
-                if self.focus == Focus::Convs && self.unreads_first {
-                    // Triage from the list: the cursor stays put, on the next unread.
-                    self.conv_cursor = at.min(self.filtered.len().saturating_sub(1));
-                }
                 self.mark_all_dirty();
                 self.status = format!("{name} {what}");
             }
@@ -4836,7 +5169,7 @@ impl App {
         }) {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
-            | Some(View::Threads { list }) | Some(View::Saved { list }) | Some(View::Feed { list, .. }) => Some(list),
+            | Some(View::Threads { list }) | Some(View::Unreads { list, .. }) | Some(View::Saved { list }) | Some(View::Feed { list, .. }) => Some(list),
             _ => self.open.as_ref().map(|o| &o.list),
         }
     }
@@ -4853,7 +5186,7 @@ impl App {
         }) {
             Some(View::Thread { list, .. })
             | Some(View::Search { list, .. })
-            | Some(View::Threads { list }) | Some(View::Saved { list }) | Some(View::Feed { list, .. }) => Some(list),
+            | Some(View::Threads { list }) | Some(View::Unreads { list, .. }) | Some(View::Saved { list }) | Some(View::Feed { list, .. }) => Some(list),
             _ => self.open.as_mut().map(|o| &mut o.list),
         }
     }
@@ -4924,6 +5257,11 @@ impl App {
             Some(View::Threads { list }) => format!(
                 "threads you took part in or were mentioned in · {} · first and last message · newest reply first",
                 list.len()
+            ),
+            Some(View::Unreads { list, .. }) => format!(
+                "UNREADS · {} {} · newest unread first · r: refresh",
+                list.len(),
+                if list.len() == 1 { "conversation" } else { "conversations" }
             ),
             Some(View::Thread {
                 list, live, place, ..
@@ -5479,6 +5817,7 @@ impl App {
                 Some(TopSection::Sent) => { self.open_sent(); return; }
                 Some(TopSection::Mentions) => { self.open_feed(TopSection::Mentions); return; }
                 Some(TopSection::Threads) => { self.open_my_threads(); return; }
+                Some(TopSection::Unreads) => { self.open_unreads(); return; }
                 None => {}
             }
         }
@@ -5504,7 +5843,6 @@ impl App {
             Some(Action::Close) => self.escape_home(),
             Some(Action::Archive) => self.prompt_archive(),
             Some(Action::MyThreads) => self.open_my_threads(),
-            Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
             Some(Action::Compose) => self.compose(),
             // `>` quotes the message under the cursor, and this pane has none.
             Some(Action::QuoteReply) => self.status = "select a message first".to_string(),
@@ -5626,7 +5964,9 @@ impl App {
                 }
             }
             Some(Action::Open) => {
-                if matches!(self.stack.last(), Some(View::Feed { .. }))
+                if matches!(self.stack.last(), Some(View::Unreads { .. })) {
+                    self.open_unread_card();
+                } else if matches!(self.stack.last(), Some(View::Feed { .. }))
                     && self.selected().is_some_and(|message| message.parent_id.is_none() && !message.has_thread()) {
                     self.open_sent_context();
                 } else if matches!(self.stack.last(), Some(View::Thread { .. })) {
@@ -5669,6 +6009,7 @@ impl App {
                     previous: String::new(),
                 };
             }
+            Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Unreads { .. })) => self.open_unreads(),
             Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Feed { .. })) => self.fetch_sent(false),
             Some(Action::Reload) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
             Some(Action::Refresh) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
@@ -5676,7 +6017,6 @@ impl App {
             Some(Action::Refresh) => self.refresh(),
             Some(Action::Archive) => self.prompt_archive(),
             Some(Action::MyThreads) => self.open_my_threads(),
-            Some(Action::UnreadsFirst) => self.toggle_unreads_first(),
             Some(Action::Compose) => self.compose(),
             Some(Action::QuoteReply) => self.quote_reply(),
             Some(Action::React) => self.view_reactions(),
@@ -6333,18 +6673,18 @@ pub(crate) mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-        // Row 0 is the border, 1..=4 the top sections, 5 their divider, 6 the
-        // first conversation, and 7 the age divider closing its group from
+        // Row 0 is the border, 1..=5 the top sections, 6 their divider, 7 the
+        // first conversation, and 8 the age divider closing its group from
         // below — it has no newest message, so `earlier`.
         assert!(
             (1..29)
-                .map(|x| terminal.backend().buffer()[(x, 7)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 8)].symbol())
                 .collect::<String>()
                 .contains(" earlier ")
         );
         let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
             (1..29)
-                .map(|x| terminal.backend().buffer()[(x, 6)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 7)].symbol())
                 .collect::<String>()
         };
         assert!(row(&terminal).ends_with("123"));
@@ -6776,14 +7116,14 @@ pub(crate) mod tests {
 
     #[test]
     fn plain_half_page_keys_preserve_text_input_and_readers() {
-        let mut app=mute_test_app();app.msgs_height=10;
+        let mut app=mute_test_app();app.msgs_height=12;
         app.merge_conversations((0..30).map(|i|json!({"id":format!("CEXTRA{i}"),"name":format!("extra{i}"),"is_member":true})).collect());
         app.top_section=Some(TopSection::Saved);
-        // A half page from the top row lands past the four top sections.
+        // A half page from the top row lands past the five top sections.
         app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,1);
         app.on_key(KeyEvent::new(KeyCode::Char('b'),KeyModifiers::NONE));assert_eq!(app.top_section,Some(TopSection::Saved));
         app.msgs_height=20;
-        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,6);
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,5);
         app.msgs_height=10;
         app.stack.push(View::Reactions {title:"reactions".into(),lines:vec!["reaction".into();100],scroll:0});
         for (key,expected) in [('f',5),('j',6),('k',5),('b',0)] {
@@ -7753,15 +8093,17 @@ pub(crate) mod tests {
         let mut app = quote_test_app();
         app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
         app.focus = Focus::Msgs;
-        let card = crate::render::ThreadCard {
+        let card = crate::render::Card {
             conversation: "#one".to_string(),
             participants: "alice, bob".to_string(),
             hidden: 2,
+            counted_from: 1_000_000,
             counted_through: 3_000_000,
-            last: Some(msg(3000, "the newest reply")),
+            tail: vec![msg(3000, "the newest reply")],
+            elision: crate::render::Elision::Replies,
         };
         app.stack.push(View::Threads {
-            list: MsgList::threads(vec![(msg(1000, "the thread root"), card)]),
+            list: MsgList::with_cards(vec![(msg(1000, "the thread root"), card)]),
         });
         app.on_key(press(KeyCode::Char('>')));
         let target = app.compose.as_ref().expect("the compose target");
@@ -8046,9 +8388,10 @@ pub(crate) mod tests {
         app.on_msg_key(Some(Action::Back));assert!(app.job.is_none());
         app.on_conv_key(Some(Action::Down));assert_eq!(app.top_section,Some(TopSection::Mentions));
         app.on_conv_key(Some(Action::Down));assert_eq!(app.top_section,Some(TopSection::Threads));
+        app.on_conv_key(Some(Action::Down));assert_eq!(app.top_section,Some(TopSection::Unreads));
         app.on_conv_key(Some(Action::Down));assert!(app.top_section.is_none());assert_eq!(app.conv_cursor,0);
         app.api=None;app.corpus.convs.clear();app.filtered.clear();
-        app.on_conv_key(Some(Action::Last));assert_eq!(app.top_section,Some(TopSection::Threads));app.on_conv_key(Some(Action::Open));
+        app.on_conv_key(Some(Action::Last));assert_eq!(app.top_section,Some(TopSection::Unreads));app.on_conv_key(Some(Action::Open));
         terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
         app.escape_home();app.escape_home();assert_eq!(app.top_section,Some(TopSection::Saved));
     }
@@ -8117,6 +8460,519 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Opening UNREADS retires a refresh's pending navigation: the job was
+    /// going to open the conversation it refreshed, and the reader has gone
+    /// somewhere else since. SAVED and SENT retire it the same way.
+    #[test]
+    fn opening_unreads_leaves_a_pending_refresh_with_nowhere_to_navigate() {
+        let dir = crate::archive::test_dir("unreads-refresh");
+        let mut app = unreads_test_app(&dir);
+        let conv = app.corpus.convs.iter().position(|c| c.id == "C3").unwrap();
+        // Without the view, the refresh lands and opens its conversation.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Refresh { conv, before: 0 },
+            Ok(Done::Refreshed),
+        ));
+        app.tick();
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(conv));
+        app.escape_home();
+        // With it, the same job lands quietly and the view survives.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Refresh { conv, before: 0 },
+            Ok(Done::Refreshed),
+        ));
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        app.tick();
+        assert!(matches!(app.stack.last(), Some(View::Unreads { .. })), "the view was replaced");
+        assert!(app.open.is_none(), "the refresh opened a conversation anyway");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card stands for a conversation, not for the one message it leads
+    /// with: deleting that message promotes the next one the card drew and
+    /// takes the header's count down by one. The card goes only when the
+    /// conversation has nothing unread left.
+    #[test]
+    fn deleting_the_message_an_unreads_card_leads_with_promotes_the_next_one() {
+        let dir = crate::archive::test_dir("unreads-delete");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        let card = |app: &App, at: usize| match app.stack.last() {
+            Some(View::Unreads { list, .. }) => (
+                list.cards[at].conversation.clone(),
+                list.cards[at].participants.clone(),
+                list.msgs[at].id,
+                list.cards[at].hidden,
+                list.cards[at].tail.iter().map(|m| m.id).collect::<Vec<_>>(),
+            ),
+            _ => panic!("not the UNREADS view"),
+        };
+        assert_eq!(
+            card(&app, 4),
+            ("#one".into(), "6 unread".into(), 11_000_000, 2,
+                vec![14_000_000, 15_000_000, 16_000_000])
+        );
+        // The lead message goes: the first of the tail leads instead, the
+        // elided count is untouched, and the header counts one fewer.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 11_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(app.active_list().unwrap().len(), 5, "the card was dropped");
+        assert_eq!(
+            card(&app, 4),
+            ("#one".into(), "5 unread".into(), 14_000_000, 2, vec![15_000_000, 16_000_000])
+        );
+        // A message the card only counted comes off the count alone.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 12_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(
+            card(&app, 4),
+            ("#one".into(), "4 unread".into(), 14_000_000, 1, vec![15_000_000, 16_000_000])
+        );
+        // #two draws both of its unread messages: deleting the lead leaves
+        // the other, and deleting that one leaves nothing to stand for.
+        assert_eq!(card(&app, 3), ("#two".into(), "2 unread".into(), 21_000_000, 0, vec![22_000_000]));
+        for id in [21_000_000, 22_000_000] {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C2".into(), root: None },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        }
+        assert_eq!(app.active_list().unwrap().len(), 4, "the emptied card stayed");
+        assert!(match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list.cards.iter().all(|c| c.conversation != "#two"),
+            _ => panic!("not the UNREADS view"),
+        });
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Message ids are Slack timestamps, so two conversations can lead their
+    /// cards with the same one. The delete has to match the channel too, or
+    /// it promotes or drops the wrong card.
+    #[test]
+    fn a_delete_matches_the_channel_as_well_as_the_id() {
+        let dir = crate::archive::test_dir("unreads-collision");
+        crate::archive::channel_database(
+            &dir,
+            &[("C8", "eight", Kind::Channel), ("C9", "nine", Kind::Channel)],
+            &[
+                ("C8", 80, 0, "U1", "eight read"),
+                ("C8", 81, 0, "U2", "eight unread"),
+                ("C9", 80, 0, "U1", "nine read"),
+                ("C9", 81, 0, "U2", "nine unread"),
+            ],
+        );
+        let mut app = mute_test_app();
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        app.merge_conversations(vec![
+            json!({"id":"C8","name":"eight","is_member":true}),
+            json!({"id":"C9","name":"nine","is_member":true}),
+        ]);
+        for conv in app.corpus.convs.iter_mut() {
+            conv.archive = 0;
+            conv.live_only = false;
+        }
+        app.apply_counts(&json!({"channels":[
+            {"id":"C8","has_unreads":true,"last_read":"80.000000","latest":"81.000000"},
+            {"id":"C9","has_unreads":true,"last_read":"80.000000","latest":"81.000000"},
+        ]}));
+        app.apply_filter();
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        // Both cards lead with the same id, in different conversations.
+        let leads = |app: &App| match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list
+                .msgs
+                .iter()
+                .map(|m| (m.channel_id.clone(), m.id))
+                .collect::<Vec<_>>(),
+            _ => panic!("not the UNREADS view"),
+        };
+        assert_eq!(
+            leads(&app),
+            [("C8".to_string(), 81_000_000), ("C9".to_string(), 81_000_000)]
+        );
+        // Deleting #nine's leaves #eight's card exactly as it was.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 81_000_000, cid: "C9".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(leads(&app), [("C8".to_string(), 81_000_000)]);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card counts only the messages between the one it was built to lead
+    /// with and the newest it drew. An older message — already read, deleted
+    /// from the conversation while the view sits in the stack — is one the
+    /// card never stood for, and its count must not move. The lower bound is
+    /// fixed at build: promoting a new lead steps past messages the card is
+    /// still counting.
+    #[test]
+    fn a_message_older_than_a_card_was_built_for_leaves_its_count_alone() {
+        let dir = crate::archive::test_dir("unreads-older");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        let one = |app: &App| match app.stack.last() {
+            Some(View::Unreads { list, .. }) => {
+                (list.msgs[4].id, list.cards[4].hidden, list.cards[4].participants.clone())
+            }
+            _ => panic!("not the UNREADS view"),
+        };
+        assert_eq!(one(&app), (11_000_000, 2, "6 unread".to_string()));
+        // The read message under the card's lead: not one of its unread ones.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 10_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(one(&app), (11_000_000, 2, "6 unread".to_string()));
+        // After a promotion the elided messages are older than the lead, and
+        // deleting one still takes the count down: the bound is the message
+        // the card was built for, not the one it now leads with.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 11_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(one(&app), (14_000_000, 2, "5 unread".to_string()));
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 12_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(one(&app), (14_000_000, 1, "4 unread".to_string()));
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card whose drawn messages are all deleted but which still counts
+    /// messages it did not draw goes back to the archive for them. The
+    /// archive is read-only and deliberately keeps what Slack no longer has,
+    /// so the rebuild leaves out every id deleted since the view opened;
+    /// without that it would hand the deleted messages straight back.
+    #[test]
+    fn a_card_that_still_counts_unread_messages_is_rebuilt_from_the_archive() {
+        let dir = crate::archive::test_dir("unreads-refill");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        let one = |app: &App| match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list.cards.iter().position(|c| c.conversation == "#one")
+                .map(|at| (
+                    list.msgs[at].id,
+                    list.cards[at].hidden,
+                    list.cards[at].tail.iter().map(|m| m.id).collect::<Vec<_>>(),
+                    list.cards[at].participants.clone(),
+                )),
+            _ => panic!("not the UNREADS view"),
+        };
+        // Delete every message the card draws: 11 leads, 14/15/16 are drawn,
+        // and 12/13 are the two it only counts.
+        for id in [11_000_000, 14_000_000, 15_000_000] {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C1".into(), root: None },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        }
+        assert_eq!(one(&app), Some((16_000_000, 2, vec![], "3 unread".to_string())));
+        // The last drawn one goes: the card is rebuilt on the two it counted,
+        // and none of the four deleted messages comes back with them.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 16_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(one(&app), Some((12_000_000, 0, vec![13_000_000], "2 unread".to_string())));
+        // Those two go too, and now there is nothing unread to stand for.
+        for id in [12_000_000, 13_000_000] {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C1".into(), root: None },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        }
+        assert_eq!(one(&app), None);
+        // A refresh does not resurrect them either: the ledger of what was
+        // deleted outlives the rebuild the view does for itself. Slack still
+        // calls the conversation unread, so a card comes back — but on the
+        // newest message the archive holds that is not one of the deleted
+        // ones, and saying the unread messages are not there.
+        app.on_msg_key(Some(Action::Refresh));
+        assert_eq!(
+            one(&app),
+            Some((10_000_000, 0, vec![], "unread · not in the archive".to_string()))
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card whose unread messages the archive does not hold positions
+    /// nothing, so it leaves whatever `open_conv` reported standing — for a
+    /// conversation only Slack has and no session to fetch it with, that is
+    /// the news the reader needs.
+    #[test]
+    fn a_fallback_card_keeps_the_status_the_conversation_open_reported() {
+        let dir = crate::archive::test_dir("unreads-fallback-status");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        // The second card is #five, which no archive holds.
+        app.on_msg_key(Some(Action::Down));
+        assert_eq!(app.selected().unwrap().channel_id, "C5");
+        app.on_msg_key(Some(Action::Open));
+        assert_eq!(app.status, "not signed in, and this conversation is not cached");
+        assert_eq!(app.corpus.convs[app.open.as_ref().unwrap().conv].id, "C5");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The unread cases, one conversation each: a long unread run, a short
+    /// one, a read channel, a conversation whose unread messages the archive
+    /// does not hold, one no archive holds at all, one whose newest cached
+    /// message is far behind what Slack reports, and a muted one.
+    fn unreads_test_app(dir: &std::path::Path) -> App {
+        crate::archive::channel_database(
+            dir,
+            &[
+                ("C1", "one", Kind::Channel),
+                ("C2", "two", Kind::Channel),
+                ("C3", "three", Kind::Channel),
+                ("C4", "four", Kind::Channel),
+                ("C6", "six", Kind::Channel),
+                ("C7", "loud", Kind::Channel),
+            ],
+            &[
+                // #one: read through 10, then six unread messages.
+                ("C1", 10, 0, "U1", "one read"),
+                ("C1", 11, 0, "U2", "one unread first"),
+                ("C1", 12, 0, "U2", "one unread second"),
+                ("C1", 13, 0, "U2", "one unread third"),
+                ("C1", 14, 0, "U2", "one unread fourth"),
+                ("C1", 15, 0, "U2", "one unread fifth"),
+                ("C1", 16, 0, "U2", "one unread sixth"),
+                // #two: two unread, both newer than #one's newest.
+                ("C2", 20, 0, "U1", "two read"),
+                ("C2", 21, 0, "U3", "two unread first"),
+                ("C2", 22, 0, "U3", "two unread second"),
+                // #three is read through its newest message.
+                ("C3", 30, 0, "U1", "three read"),
+                // #four is unread on Slack and the archive stops short of it.
+                ("C4", 40, 0, "U1", "four stale"),
+                // #six the same, but its newest cached message is ancient
+                // while Slack says the conversation is the freshest of all.
+                ("C6", 5, 0, "U1", "six ancient"),
+                // #loud is muted, with unread messages the archive holds.
+                ("C7", 70, 0, "U1", "loud read"),
+                ("C7", 71, 0, "U2", "loud unread"),
+            ],
+        );
+        let mut app = mute_test_app();
+        app.corpus.archives.push(Archive::open("test".into(), dir).unwrap());
+        app.merge_conversations(vec![
+            json!({"id":"C1","name":"one","is_member":true,"has_unreads":true,
+                   "last_read":"10.000000","latest":"16.000000"}),
+            json!({"id":"C2","name":"two","is_member":true,"has_unreads":true,
+                   "last_read":"20.000000","latest":"22.000000"}),
+            json!({"id":"C3","name":"three","is_member":true,"latest":"30.000000"}),
+            json!({"id":"C4","name":"four","is_member":true,"has_unreads":true,
+                   "last_read":"40.000000","latest":"45.000000"}),
+            json!({"id":"C5","name":"five","is_member":true,"has_unreads":true,
+                   "latest":"50.000000"}),
+            json!({"id":"C6","name":"six","is_member":true,"has_unreads":true,
+                   "last_read":"5.000000","latest":"60.000000"}),
+            json!({"id":"C7","name":"loud","is_member":true,"has_unreads":true,
+                   "last_read":"70.000000","latest":"71.000000"}),
+        ]);
+        for conv in app.corpus.convs.iter_mut() {
+            conv.archive = 0;
+            conv.live_only = conv.id == "C5";
+        }
+        // The read markers and the unread flags come from Slack's counts, the
+        // way a signed-in session gets them.
+        app.apply_counts(&json!({"channels":[
+            {"id":"C1","has_unreads":true,"last_read":"10.000000","latest":"16.000000"},
+            {"id":"C2","has_unreads":true,"last_read":"20.000000","latest":"22.000000"},
+            {"id":"C3","has_unreads":false,"last_read":"30.000000","latest":"30.000000"},
+            {"id":"C4","has_unreads":true,"last_read":"40.000000","latest":"45.000000"},
+            {"id":"C5","has_unreads":true,"latest":"50.000000"},
+            {"id":"C6","has_unreads":true,"last_read":"5.000000","latest":"60.000000"},
+            {"id":"C7","has_unreads":true,"last_read":"70.000000","latest":"71.000000"},
+        ]}));
+        app.muted.insert("C7".to_string());
+        app.apply_filter();
+        app
+    }
+
+    /// UNREADS is the fifth top row and draws one card per conversation with
+    /// unread messages, newest unread message first: the conversation and its
+    /// count, the first unread message, the ones between elided, and the
+    /// newest of them.
+    #[test]
+    fn the_unreads_row_cards_every_unread_conversation_newest_unread_first() {
+        let dir = crate::archive::test_dir("unreads-cards");
+        let mut app = unreads_test_app(&dir);
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        assert_eq!(app.top_section, Some(TopSection::Unreads));
+        assert_eq!(TopSection::Unreads.label(), "UNREADS");
+        assert_eq!(TopSection::ALL.len(), 5);
+        let cursor = app.conv_cursor;
+        app.on_conv_key(Some(Action::Open));
+        assert!(matches!(app.stack.last(), Some(View::Unreads { .. })));
+        // It opens no conversation and leaves the sidebar cursor alone.
+        assert!(app.open.is_none());
+        assert_eq!(app.conv_cursor, cursor);
+        // Newest first, and for a card whose unread messages the archive does
+        // not hold, newest is what Slack last reported: #six's own cached
+        // message is the oldest thing on screen and its card is still first,
+        // because Slack puts the conversation at 60. Then #five at 50, #four
+        // at 45, #two's newest unread at 22 and #one's at 16. #three is read
+        // and #loud is muted: neither has a card.
+        let cards: Vec<(String, i64, i64, Vec<i64>)> = match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list
+                .msgs
+                .iter()
+                .zip(&list.cards)
+                .map(|(m, c)| {
+                    (c.conversation.clone(), m.id, c.hidden, c.tail.iter().map(|t| t.id).collect())
+                })
+                .collect(),
+            _ => panic!("not the UNREADS view"),
+        };
+        assert_eq!(
+            cards,
+            vec![
+                ("#six".to_string(), 5_000_000, 0, vec![]),
+                ("#five".to_string(), 50_000_000, 0, vec![]),
+                ("#four".to_string(), 40_000_000, 0, vec![]),
+                ("#two".to_string(), 21_000_000, 0, vec![22_000_000]),
+                // Six unread: the first, the newest three, and two elided.
+                ("#one".to_string(), 11_000_000, 2,
+                    vec![14_000_000, 15_000_000, 16_000_000]),
+            ]
+        );
+        assert!(app.status.contains("5 conversations with unread messages"), "{}", app.status);
+        assert!(app.title().starts_with("UNREADS · 5 conversations"), "{}", app.title());
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 44)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string())
+            .collect();
+        let screen = rows.join("\n");
+        let row_of = |needle: &str| {
+            rows.iter().position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{screen}"))
+        };
+        // The card of the long run: header with the count, the first unread,
+        // the elision, and the newest three. The two between are not drawn.
+        assert!(row_of("#one  6 unread") < row_of("one unread first"), "{screen}");
+        assert!(row_of("one unread first") < row_of("… 2 more"), "{screen}");
+        assert!(row_of("… 2 more") < row_of("one unread fourth"), "{screen}");
+        assert!(row_of("one unread fourth") < row_of("one unread fifth"), "{screen}");
+        assert!(row_of("one unread fifth") < row_of("one unread sixth"), "{screen}");
+        for elided in ["one unread second", "one unread third"] {
+            assert!(!screen.contains(elided), "{elided:?} should be elided:\n{screen}");
+        }
+        // The short run is drawn whole, with no elision line.
+        assert!(row_of("#two  2 unread") < row_of("two unread first"), "{screen}");
+        assert!(!rows[row_of("two unread first")..row_of("two unread second")]
+            .iter().any(|row| row.contains('…')), "a two-message run is elided:\n{screen}");
+        // The read channel has no card at all, and neither has the muted one:
+        // the muted block is where the alert channels sit and their counts
+        // would bury every card worth reading.
+        assert!(!screen.contains("#three"), "{screen}");
+        assert!(!screen.contains("#loud"), "{screen}");
+        assert!(!screen.contains("loud unread"), "{screen}");
+        // The stale conversation says the messages are not cached and draws
+        // the newest message the archive does hold; the conversation no
+        // archive holds draws a note in place of a message.
+        assert!(row_of("#four  unread · not in the archive") < row_of("four stale"), "{screen}");
+        assert!(screen.contains("#five  unread · not in the archive"), "{screen}");
+        assert!(screen.contains("not cached; open the conversation to load it from Slack"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `Enter` on a card opens that conversation at its first unread message,
+    /// the way opening a mention does; `r` re-reads the unread state.
+    #[test]
+    fn enter_on_an_unreads_card_opens_the_conversation_at_its_first_unread() {
+        let dir = crate::archive::test_dir("unreads-open");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        // Down to the card of #one, whose unread run is the long one.
+        for _ in 0..4 { app.on_msg_key(Some(Action::Down)); }
+        assert_eq!(app.selected().unwrap().id, 11_000_000);
+        app.on_msg_key(Some(Action::Open));
+        assert!(app.stack.is_empty(), "the view is left behind");
+        let open = app.open.as_ref().expect("a conversation is open");
+        assert_eq!(app.corpus.convs[open.conv].id, "C1");
+        assert_eq!(app.conv_cursor, app.filtered.iter().position(|&i| i == open.conv).unwrap());
+        assert_eq!(app.selected().unwrap().id, 11_000_000);
+        assert_eq!(app.selected().unwrap().text, "one unread first");
+        assert_eq!(app.focus, Focus::Msgs);
+        assert!(app.top_section.is_none());
+        assert!(app.status.contains("#one at the first unread message"), "{}", app.status);
+
+        // Back to UNREADS and refresh: the read marker has not moved, so the
+        // same four cards come back, in place rather than stacked.
+        app.escape_home();
+        assert!(app.stack.is_empty() && app.open.is_none() && app.focus == Focus::Convs);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        app.on_msg_key(Some(Action::Refresh));
+        assert_eq!(app.stack.len(), 1);
+        assert!(matches!(app.stack.last(), Some(View::Unreads { .. })));
+        assert_eq!(app.active_list().unwrap().len(), 5);
+        // Reading #two moves its marker; the refresh drops its card.
+        let two = app.corpus.convs.iter().position(|c| c.id == "C2").unwrap();
+        app.corpus.convs[two].unread = false;
+        app.on_msg_key(Some(Action::Reload));
+        assert_eq!(app.stack.len(), 1);
+        assert_eq!(app.active_list().unwrap().len(), 4);
+        assert_eq!(
+            match app.stack.last() {
+                Some(View::Unreads { list, .. }) =>
+                    list.cards.iter().map(|c| c.conversation.clone()).collect::<Vec<_>>(),
+                _ => panic!("not the UNREADS view"),
+            },
+            ["#six", "#five", "#four", "#one"]
+        );
+        // Esc leaves the view for the list, with no conversation opened.
+        app.on_msg_key(Some(Action::Close));
+        assert!(app.stack.is_empty(), "the view is still stacked");
+        assert!(app.open.is_none());
+        assert_eq!(app.focus, Focus::Convs);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Four threads for the card tests: six replies, exactly one, none at all,
     /// and one whose root carries no `reply_users`. The ids order the cards
     /// newest reply first, so they come out 50, 40, 30, 10.
@@ -8174,6 +9030,9 @@ pub(crate) mod tests {
         );
         assert!(app.title().contains("first and last message"), "{}", app.title());
 
+        // The cards are the whole screen: the conversations pane's own rows
+        // would otherwise be read as rows of a card.
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 44)).unwrap();
         terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -8280,7 +9139,7 @@ pub(crate) mod tests {
                 .map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
         };
         let card_last = |app: &App| match app.stack.last() {
-            Some(View::Threads { list }) => list.cards[0].last.as_ref().map(|m| m.id),
+            Some(View::Threads { list }) => list.cards[0].tail.first().map(|m| m.id),
             _ => panic!("not the THREADS view"),
         };
         // Slack confirms a delete: the reply's own id, and the thread it was
@@ -8370,14 +9229,16 @@ pub(crate) mod tests {
     /// reply going leaves zero, and zero draws no elision line at all.
     #[test]
     fn the_last_counted_reply_leaves_the_card_at_zero_never_below() {
-        let card = render::ThreadCard {
+        let card = render::Card {
             conversation: "#one".into(),
             participants: "bea".into(),
             hidden: 1,
+            counted_from: 1_000_000,
             counted_through: 2_000_000,
-            last: None,
+            tail: Vec::new(),
+            elision: render::Elision::Replies,
         };
-        let mut list = MsgList::threads(vec![(msg(1, "root of one"), card)]);
+        let mut list = MsgList::with_cards(vec![(msg(1, "root of one"), card)]);
         list.drop_reply("C1", 1_000_000, 2_000_000);
         assert_eq!(list.cards[0].hidden, 0);
         // Nothing left to elide, at any fit: there is no drawn reply to fold.
@@ -8528,8 +9389,10 @@ pub(crate) mod tests {
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(app.top_section,Some(TopSection::Threads));
         app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.top_section,Some(TopSection::Unreads));
+        app.on_key(key(KeyCode::Char('j')));
         assert!(app.top_section.is_none()); assert_eq!(app.conv_cursor,0);
-        for _ in 0..4 { app.on_key(key(KeyCode::Char('k'))); }
+        for _ in 0..5 { app.on_key(key(KeyCode::Char('k'))); }
         assert_eq!(app.top_section,Some(TopSection::Saved));
         app.on_key(key(KeyCode::Enter));
         assert!(app.open.is_none()); assert!(matches!(app.stack.last(),Some(View::Saved {..})));

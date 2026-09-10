@@ -171,14 +171,9 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Convs;
     let title = if app.filter.is_empty() {
         format!(
-            " {} · {} · {}by {} ",
+            " {} · {} · by {} ",
             app.filtered.len(),
             app.pane_settings.number.heading(),
-            if app.unreads_first {
-                "unread first · "
-            } else {
-                ""
-            },
             app.sort_label()
         )
     } else {
@@ -302,6 +297,16 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
             _ => None,
         }
     };
+    // The muted block below the grouped run closes the same way, under its
+    // own label: without a line of its own the last age or type label above
+    // it reads as a heading for it. A starred conversation that is also muted
+    // sits above the run, not in this block, and so is not in it.
+    let muted_block = |k: usize| -> bool {
+        app.filtered.get(k).is_some_and(|&i| {
+            let c = app.conv(i);
+            c.muted && !app.starred.contains(&c.id)
+        })
+    };
     let items: Vec<ListItem> = items
         .into_iter()
         .enumerate()
@@ -321,14 +326,12 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
                     // the list, or the muted block — or belongs to a different
                     // group. So a group with no conversations draws none, and
                     // two conversations of the same group share the one line
-                    // under the lower of them. The unread/read boundary is not
-                    // a restart: with `U` on, unread and read conversations of
-                    // the same group share a line, and an unread conversation
-                    // of a group below the read ones above the boundary closes
-                    // its own group where it sits.
+                    // under the lower of them.
                     if group(k + 1) != Some(g) {
                         rows.push(crate::render::divider(g, width));
                     }
+                } else if muted_block(k) && !muted_block(k + 1) {
+                    rows.push(crate::render::divider("muted", width));
                 }
             }
             ListItem::new(rows)
@@ -469,7 +472,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     // view on top returned above. `View::Thread` is, because `v` on a
     // conversation row opens a raw view with no conversation open, and
     // Enter on a Slack link inside it stacks a thread over that raw view.
-    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. } | View::Thread { .. })) {
+    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. } | View::Unreads { .. } | View::Thread { .. })) {
         let hint = Line::from(Span::styled(
             "  select a conversation and press Enter",
             Style::new().add_modifier(Modifier::DIM),
@@ -486,7 +489,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     {
         Some(View::Thread { list, live, .. }) => (list, live.as_deref().or(conv_archive)),
         Some(View::Saved { list }) | Some(View::Feed { list, .. }) => (list, None),
-        Some(View::Search { list, .. }) | Some(View::Threads { list }) => (list, conv_archive),
+        Some(View::Search { list, .. }) | Some(View::Threads { list }) | Some(View::Unreads { list, .. }) => (list, conv_archive),
         _ => { let Some(open) = open.as_mut() else { return }; (&mut open.list, conv_archive) },
     };
     let ctx = Ctx {
@@ -1322,7 +1325,6 @@ const HELP: &[HelpRow] = &[
         "the selected message's images, full pane; j/k between them",
     ),
     HelpRow::Bound(Action::InlineImages, "inline image thumbnails on/off"),
-    HelpRow::Bound(Action::UnreadsFirst, "unread conversations on top on/off"),
     HelpRow::Bound(
         Action::Compose,
         "write a message: to the open conversation, into the open thread, or into the selected hit's thread; Ctrl-v attaches the clipboard's image, Ctrl-j and Alt-Enter break the line, Enter sends, Esc keeps the draft and returns home",
@@ -2272,42 +2274,67 @@ mod conv_age_tests {
         assert_eq!(muted, gamma + 2, "{rows:#?}");
     }
 
-    /// The whole eligible run is one sequence, whatever `U` does to its order.
-    /// An unread and a read conversation of the same age therefore share the
-    /// one line that closes their group; and an unread conversation older than
-    /// the read ones below it closes its own group where `U` put it, which is
-    /// how the same label can be drawn twice.
+    /// The muted block closes with a line of its own, under the last muted
+    /// conversation. Without one the last age label above the block reads as
+    /// a heading for it. No muted conversation, no line; and only the two
+    /// grouping sorts draw one.
     #[test]
-    fn unread_first_does_not_restart_the_grouping() {
-        // `#alpha` is unread and `#beta` is read, both today: one line, under
-        // the lower of the two.
-        let mut app = aged_test_app(NOW, &[("alpha", Some(HOUR)), ("beta", Some(2 * HOUR))]);
-        assert!(app.unreads_first);
-        app.corpus.convs[0].unread = true;
+    fn the_muted_block_closes_with_a_muted_line() {
+        let mut app = aged_test_app(
+            NOW,
+            &[("gamma", Some(3 * DAY)), ("quiet", Some(HOUR)), ("hush", Some(2 * HOUR))],
+        );
+        let plain = rows(&mut app, 60, 20);
+        assert!(!plain.iter().any(|row| row.contains(" muted ")), "{plain:#?}");
+        app.muted.insert("C2".to_string());
+        app.muted.insert("C3".to_string());
         app.apply_filter();
-        let shared = rows(&mut app, 60, 20);
-        assert_eq!(age_lines(&shared), ["today"]);
-        let today = line_at(&shared, "today");
-        assert!(shared[today - 2].contains("#alpha"), "{shared:#?}");
-        assert!(shared[today - 1].contains("#beta"), "{shared:#?}");
+        let drawn = rows(&mut app, 60, 20);
+        // Both muted rows sink below the grouped run and share the one line,
+        // under the lower of them.
+        let quiet = drawn.iter().position(|row| row.contains("#quiet")).unwrap();
+        let hush = drawn.iter().position(|row| row.contains("#hush")).unwrap();
+        let lines: Vec<usize> = drawn
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains(" muted "))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(lines.len(), 1, "{drawn:#?}");
+        assert_eq!(lines[0], quiet.max(hush) + 1, "{drawn:#?}");
+        // The age run above it is untouched: it still closes under `#gamma`.
+        assert_eq!(age_lines(&drawn), ["this week"], "{drawn:#?}");
+        let gamma = drawn.iter().position(|row| row.contains("#gamma")).unwrap();
+        assert_eq!(line_at(&drawn, "this week"), gamma + 1, "{drawn:#?}");
+        // A sort that puts the list in neither order draws no line at all.
+        app.sort = Sort::Name;
+        app.apply_filter();
+        let named = rows(&mut app, 60, 20);
+        assert!(!named.iter().any(|row| row.contains(" muted ")), "{named:#?}");
+    }
 
-        // An unread 3-day-old conversation is lifted above the read today one,
-        // so `this week` closes its group before the today block starts.
+    /// Unread conversations are not hoisted: the list is in the sort's own
+    /// order and every group label is drawn once. The hoist used to override
+    /// the sort, and an unread run at the top formed groups of its own, so
+    /// `today` came out twice.
+    #[test]
+    fn unread_conversations_keep_the_sort_order_and_each_label_is_drawn_once() {
         let mut app = aged_test_app(
             NOW,
             &[("alpha", Some(HOUR)), ("beta", Some(2 * HOUR)), ("gamma", Some(3 * DAY))],
         );
+        // The oldest and the newest are unread; without a hoist neither moves.
         app.corpus.convs[0].unread = true;
         app.corpus.convs[2].unread = true;
         app.apply_filter();
         let rows = rows(&mut app, 60, 20);
-        assert_eq!(age_lines(&rows), ["today", "this week", "today"], "{rows:#?}");
-        let week = line_at(&rows, "this week");
-        assert!(rows[week - 1].contains("#gamma"), "{rows:#?}");
-        assert!(rows[week - 2].contains(" today "), "{rows:#?}");
-        assert!(rows[week - 3].contains("#alpha"), "{rows:#?}");
-        assert!(rows[week + 1].contains("#beta"), "{rows:#?}");
-        assert!(rows[week + 2].contains(" today "), "{rows:#?}");
+        assert_eq!(age_lines(&rows), ["today", "this week"], "{rows:#?}");
+        let today = line_at(&rows, "today");
+        assert!(rows[today - 2].contains("#alpha"), "{rows:#?}");
+        assert!(rows[today - 1].contains("#beta"), "{rows:#?}");
+        assert!(rows[line_at(&rows, "this week") - 1].contains("#gamma"), "{rows:#?}");
+        // Nothing in the pane's title claims the unread rows were moved.
+        assert!(!rows[0].contains("unread first"), "{rows:#?}");
     }
 
     /// Two conversations of the same age share one line, under the lower of
@@ -2497,6 +2524,55 @@ mod conv_type_tests {
             assert_eq!(app.conv_cursor, k);
             assert_eq!(&app.conv(app.filtered[app.conv_cursor]).name, name);
         }
+    }
+
+    /// Unread conversations are drawn where the sort puts them. The hoist
+    /// that lifted them to the top overrode every sort, and the run it formed
+    /// was a group of its own inside each sort's grouping, so a label closed
+    /// once above the boundary and once below it. Five conversations, two of
+    /// them unread: under `Type` each label is drawn once and under `Name`
+    /// the order is the names' alone.
+    #[test]
+    fn unread_conversations_keep_their_place_in_the_sort() {
+        let convs = vec![
+            ("#alpha", public("alpha"), Some(HOUR)),
+            ("#beta", public("beta"), Some(2 * HOUR)),
+            ("#gamma", public("gamma"), Some(3 * HOUR)),
+            ("@dee", json!({"user":"UHUMAN","is_im":true}), Some(4 * HOUR)),
+            ("@eve", json!({"user":"UNKNOWN","is_im":true}), Some(5 * HOUR)),
+        ];
+        let mut app = type_test_app(NOW, &convs);
+        // The oldest of each type: a hoist would have pulled one conversation
+        // out of each group and left the group's label drawn twice.
+        for name in ["#gamma", "@eve"] {
+            let at = app.corpus.convs.iter().position(|c| c.name == name).expect(name);
+            app.corpus.convs[at].unread = true;
+        }
+        app.sort = Sort::Type;
+        app.apply_filter();
+        let typed = rows(&mut app, 60, 20);
+        assert_eq!(type_lines(&typed), ["public channels", "direct messages"], "{typed:#?}");
+        // Inside a type the order is the recent one, newest first; the unread
+        // rows are still the last of their type.
+        for (above, below) in [("#alpha", "#beta"), ("#beta", "#gamma"), ("@dee", "@eve")] {
+            assert!(row_of(&typed, above) < row_of(&typed, below), "{above}/{below}: {typed:#?}");
+        }
+        assert_eq!(line_at(&typed, "public channels"), row_of(&typed, "#gamma") + 1, "{typed:#?}");
+        assert_eq!(line_at(&typed, "direct messages"), row_of(&typed, "@eve") + 1, "{typed:#?}");
+        // The unread rows keep their marks: the dot before the name.
+        assert!(typed[row_of(&typed, "#gamma")].contains("● #gamma"), "{typed:#?}");
+        // Under `Name` the list is the names in order and draws no line.
+        app.sort = Sort::Name;
+        app.apply_filter();
+        let named = rows(&mut app, 60, 20);
+        assert!(type_lines(&named).is_empty(), "{named:#?}");
+        for (above, below) in
+            [("#alpha", "#beta"), ("#beta", "#gamma"), ("#gamma", "@dee"), ("@dee", "@eve")]
+        {
+            assert!(row_of(&named, above) < row_of(&named, below), "{above}/{below}: {named:#?}");
+        }
+        // And the title says nothing about a hoist under either sort.
+        assert!(!named[0].contains("unread first"), "{named:#?}");
     }
 
     /// Only `Type` puts the list in type order, so only `Type` names the

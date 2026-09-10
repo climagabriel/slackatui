@@ -1488,29 +1488,63 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i
     Rendered { lines, images, tags }
 }
 
-/// One row of the THREADS view. Slack's Threads screen draws a card per
-/// thread; this carries what surrounds the root message — the conversation
-/// and participants line above it, how many replies the card leaves out, and
-/// the thread's newest reply. The root itself stays in the list's `msgs`, so
-/// the cursor and every list helper keep working on one item per card.
+/// One row of a card list. Two views draw one: THREADS, where the card is a
+/// thread — its root, the replies between elided, and the newest reply — and
+/// UNREADS, where it is a conversation's unread run: the first unread
+/// message, the ones between elided, and the newest of them. Either way the
+/// first message stays in the list's `msgs`, so the cursor and every list
+/// helper keep working on one item per card.
 #[derive(Clone, Debug, Default)]
-pub struct ThreadCard {
+pub struct Card {
     /// `#channel`, or the DM/group name as the sidebar shows it.
     pub conversation: String,
-    /// `a, b, and 3 others`: who took part, from the root's `reply_users`.
+    /// The dim text beside the name: `a, b, and 3 others` from the root's
+    /// `reply_users` in THREADS, the unread count in UNREADS.
     pub participants: String,
-    /// Replies the card does not draw: every one but the last.
+    /// Messages the card does not draw: the ones between the item and `tail`.
     pub hidden: i64,
-    /// The newest reply the archive held when the card was built: the drawn
-    /// reply's id, or the root's when there was none. A delete at or below it
-    /// is a reply this card counted. Above it the card cannot tell a reply
+    /// The oldest message `hidden` could stand for: the message the card led
+    /// with when it was built, exclusive. A thread's replies are all past its
+    /// root and an UNREADS card counts only messages past its first unread
+    /// one, so anything at or below this is a message the card never stood
+    /// for. Fixed at build rather than read off the current lead, which an
+    /// UNREADS promotion moves past messages the card is still counting.
+    pub counted_from: i64,
+    /// The newest message the card counted when it was built: the last of
+    /// `tail`, or the item's own id when `tail` is empty. A delete at or below
+    /// it is one this card counted. Above it the card cannot tell a message
     /// written since from one Slack's `reply_count` included and the archive
     /// never held, so it leaves the count alone for both: a count that reads
-    /// high until the next open, rather than one that drops for a reply it
+    /// high until the next open, rather than one that drops for a message it
     /// never stood for.
     pub counted_through: i64,
-    /// The thread's newest archived reply; None when the archive holds none.
-    pub last: Option<Msg>,
+    /// What the card draws under the elision, oldest first: the thread's
+    /// newest archived reply in THREADS, the newest unread messages in
+    /// UNREADS. Empty when the archive holds none.
+    pub tail: Vec<Msg>,
+    /// What `hidden` counts, as the elision line names it.
+    pub elision: Elision,
+}
+
+/// The noun a card's elision line counts in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Elision {
+    /// THREADS: `5 more replies`.
+    #[default]
+    Replies,
+    /// UNREADS: `5 more`, the messages themselves already being the subject.
+    Messages,
+}
+
+impl Elision {
+    /// `N more replies`, the count an elision line and a short card's header
+    /// both draw.
+    fn label(self, n: i64) -> String {
+        match self {
+            Self::Replies => format!("{n} more {}", if n == 1 { "reply" } else { "replies" }),
+            Self::Messages => format!("{n} more"),
+        }
+    }
 }
 
 /// How much of a card the pane can hold. `whole_message_viewport` draws
@@ -1518,18 +1552,13 @@ pub struct ThreadCard {
 /// parts of the card rather than overflowing it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CardFit {
-    /// Header, root, elision, last reply.
+    /// Header, the item, elision, the tail.
     Whole,
-    /// The last reply folded into the elision, which now counts it.
+    /// The tail folded into the elision, which now counts it.
     Folded,
-    /// The elision folded into the header. Six rows with a collapsed root,
+    /// The elision folded into the header. Six rows with a collapsed item,
     /// which is the shortest pane `ui::draw` will draw a message into.
     Root,
-}
-
-/// `N more replies`, the count both elisions share.
-fn replies_label(n: i64) -> String {
-    format!("{n} more {}", if n == 1 { "reply" } else { "replies" })
 }
 
 /// Clip to `room`, or give up: a budget that would go entirely on the
@@ -1550,14 +1579,14 @@ fn clip_or_drop(text: &str, room: usize) -> String {
 /// having been dropped to make room in the first place. The count keeps its
 /// columns; the participants give theirs up first, the conversation next.
 pub fn card_header(
-    card: &ThreadCard,
+    card: &Card,
     palette: &Palette,
     replies: i64,
     width: usize,
 ) -> Line<'static> {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let tail = if replies > 0 {
-        format!("  · {}", replies_label(replies))
+        format!("  · {}", card.elision.label(replies))
     } else {
         String::new()
     };
@@ -1588,20 +1617,25 @@ pub fn card_header(
     Line::from(spans)
 }
 
-/// The replies the card does not draw, elided. Reads like the
+/// The messages the card does not draw, elided. Reads like the
 /// collapsed-message elision, so the two are one idiom.
-pub fn card_elision(hidden: i64) -> Line<'static> {
+pub fn card_elision(elision: Elision, hidden: i64) -> Line<'static> {
     Line::from(Span::styled(
-        format!("  … {}", replies_label(hidden)),
+        format!("  … {}", elision.label(hidden)),
         Style::new().add_modifier(Modifier::DIM),
     ))
 }
 
-impl ThreadCard {
-    /// Replies this card does not draw at `fit`: everything but the last one,
-    /// plus that one once it is folded away.
+impl Card {
+    /// Messages this card does not draw at `fit`: the ones between the item
+    /// and `tail`, plus `tail` itself once it is folded away.
     pub fn elided(&self, fit: CardFit) -> i64 {
-        self.hidden + i64::from(fit != CardFit::Whole && self.last.is_some())
+        self.hidden
+            + if fit == CardFit::Whole {
+                0
+            } else {
+                self.tail.len() as i64
+            }
     }
 }
 
@@ -1908,12 +1942,14 @@ mod tests {
     /// root, and the dim elision that stands for the replies it leaves out.
     #[test]
     fn a_card_heads_with_its_conversation_and_elides_the_replies_between() {
-        let card = ThreadCard {
+        let card = Card {
             conversation: "#team-alpha".to_string(),
             participants: "bea, cyd, and 3 others".to_string(),
             hidden: 5,
+            counted_from: 1_000_000,
             counted_through: 9_000_000,
-            last: None,
+            tail: Vec::new(),
+            elision: Elision::Replies,
         };
         let header = card_header(&card, &TEST_PALETTE, 0, 80);
         assert_eq!(
@@ -1925,9 +1961,12 @@ mod tests {
             .add_modifier
             .contains(Modifier::BOLD));
         assert!(header.spans[1].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(line_text(&card_elision(5)), "  … 5 more replies");
-        assert_eq!(line_text(&card_elision(1)), "  … 1 more reply");
-        assert!(card_elision(5).spans[0]
+        assert_eq!(line_text(&card_elision(Elision::Replies, 5)), "  … 5 more replies");
+        assert_eq!(line_text(&card_elision(Elision::Replies, 1)), "  … 1 more reply");
+        // UNREADS counts messages, which the card is already drawing.
+        assert_eq!(line_text(&card_elision(Elision::Messages, 5)), "  … 5 more");
+        assert_eq!(line_text(&card_elision(Elision::Messages, 1)), "  … 1 more");
+        assert!(card_elision(Elision::Replies, 5).spans[0]
             .style
             .add_modifier
             .contains(Modifier::DIM));
@@ -1960,19 +1999,29 @@ mod tests {
         );
         // Folding the last reply away adds it to the count; dropping the
         // elision line does not change what the count is.
-        let counted = ThreadCard { last: Some(Msg::from_api("C1".into(),
-            serde_json::json!({"ts": "2.000000", "user": "U2"})).expect("a reply")), ..card.clone() };
+        let counted = Card { tail: vec![Msg::from_api("C1".into(),
+            serde_json::json!({"ts": "2.000000", "user": "U2"})).expect("a reply")], ..card.clone() };
         assert_eq!(counted.elided(CardFit::Whole), 5);
         assert_eq!(counted.elided(CardFit::Folded), 6);
         assert_eq!(counted.elided(CardFit::Root), 6);
         // A thread whose only replies are already drawn folds to nothing.
-        let single = ThreadCard { hidden: 0, ..counted };
+        let single = Card { hidden: 0, ..counted.clone() };
         assert_eq!(single.elided(CardFit::Whole), 0);
         assert_eq!(single.elided(CardFit::Folded), 1);
-        // No last reply at all: folding cannot invent one.
+        // No tail at all: folding cannot invent one.
         assert_eq!(card.elided(CardFit::Folded), 5);
+        // An UNREADS card folds its whole tail into the count, however many
+        // messages it drew.
+        let unread = Card { hidden: 2, elision: Elision::Messages,
+            tail: vec![counted.tail[0].clone(), counted.tail[0].clone()], ..card.clone() };
+        assert_eq!(unread.elided(CardFit::Whole), 2);
+        assert_eq!(unread.elided(CardFit::Folded), 4);
+        assert_eq!(
+            line_text(&card_header(&unread, &TEST_PALETTE, 4, 80)),
+            "#team-alpha  bea, cyd, and 3 others  · 4 more"
+        );
         // No participants known: the header is the conversation alone.
-        let bare = ThreadCard { participants: String::new(), ..card };
+        let bare = Card { participants: String::new(), ..card };
         assert_eq!(line_text(&card_header(&bare, &TEST_PALETTE, 0, 80)), "#team-alpha");
     }
 

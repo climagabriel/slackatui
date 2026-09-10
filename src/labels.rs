@@ -226,9 +226,7 @@ mod tests {
     /// when its right end is free.
     #[test]
     fn a_bordered_element_tags_the_right_end_of_its_top_border() {
-        let mut home = state("conversations");
-        // A short title leaves the right end of the top border free.
-        home.unreads_first = false;
+        let home = state("conversations");
         let buffer = drawn(home, 160, 24);
         assert_eq!(assert_border_tag(&buffer, "draw_convs"), 0);
         assert_eq!(assert_border_tag(&buffer, "draw_msgs"), 0);

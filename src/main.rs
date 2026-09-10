@@ -142,8 +142,24 @@ its room and the names beside it are cut. Deleting the reply a card draws
 folds it into the count; deleting one the count already stood for takes the
 count down.
 
-Conversations default to recent order: newest message first. Starred, muted,
-unread and search-match grouping take precedence. Press s to cycle recent,
+UNREADS below THREADS opens one card per conversation with unread messages,
+newest unread message first. A card heads with the conversation name and its
+unread count, then draws the first unread message, a dim count of the ones it
+leaves out, and the newest of them: at most four messages a card. Enter or l
+opens that conversation at its first unread message; h returns. r re-reads the
+unread state and redraws. The conversations are the ones the pane is showing,
+so the visibility settings and a typed /find needle narrow the view too; muted
+conversations are left out whatever the settings say, their unread counts being
+large enough to bury everything else. Where the archive holds nothing past the
+read marker -- a conversation only Slack has, one whose marker is still
+unknown, or one whose unread messages the last archive run did not reach --
+the card says \"not in the archive\" beside the name and draws the newest
+message the archive does hold instead; a conversation with no archived message
+at all draws a note in its place, and Enter opens it the way the list does,
+loading it from Slack when signed in.
+
+Conversations default to recent order: newest message first. Starred, muted
+and search-match grouping take precedence. Press s to cycle recent,
 size, my activity, and name. My activity weights your messages by recency
 using half-life. Your user id comes from the DM archive, or from SLACK_SELF_USER_ID.
 
@@ -320,10 +336,10 @@ sort: starred ones sit above the first grouped conversation and muted ones
 below the last divider. A group with nobody in it draws no line, the other
 sorts draw none, and none is drawn while a /find filter is typed: the needle
 re-sorts the list by how closely each name matches it, which is neither order.
-The grouped conversations are one sequence, so with unread first on an unread
-and a read conversation of the same group share one line; an unread
-conversation of a group below the read ones above it closes its own group where
-it sits. A divider is not a conversation: j and k step over it.
+Under both sorts the muted block at the bottom closes with a muted line under
+its last muted conversation, so the last age or type label above it is not read
+as a heading for it; no muted conversation, no line. A divider is not a
+conversation: j and k step over it.
 /conversations-pane selects visible categories and individual conversations.
 Ctrl-Shift-P opens the same menu and /keys can rebind it. Terminals must report
 the Shift modifier separately; otherwise use the command or rebind the action.

@@ -3,9 +3,9 @@
 //! Each fixture builds one application state, draws it through a `TestBackend`
 //! and compares the whole buffer — every cell's symbol and its style — against
 //! a file on disk. The set covers the conversations pane and its top rows, an
-//! open conversation down to the parts of a single message, the THREADS cards,
-//! every overlay and editor, and the status line: the inventory `/labels`
-//! names.
+//! open conversation down to the parts of a single message, the THREADS and
+//! UNREADS cards, every overlay and editor, and the status line: the
+//! inventory `/labels` names.
 //!
 //! They exist to pin the drawing as it was before that mode: with `/labels`
 //! off the buffers have to stay identical, cell for cell, and "identical to
@@ -24,7 +24,7 @@ use crate::app::{
     App, ConversationsPaneVisibility, Focus, MsgList, Mode, PromptKind, ScanOverlay, View,
 };
 use crate::archive::{FileInfo, Msg};
-use crate::render::ThreadCard;
+use crate::render::Card;
 
 /// One drawn state: what it is called on disk, how big the terminal is, and
 /// the application state it draws.
@@ -40,6 +40,7 @@ pub(crate) const FIXTURES: &[Fixture] = &[
     Fixture { name: "conversation", width: 120, height: 30, build: conversation },
     Fixture { name: "collapsed", width: 100, height: 18, build: collapsed },
     Fixture { name: "threads", width: 120, height: 30, build: threads },
+    Fixture { name: "unreads", width: 120, height: 30, build: unreads },
     Fixture { name: "compose", width: 120, height: 14, build: compose },
     Fixture { name: "compose-narrow", width: 50, height: 12, build: compose },
     Fixture { name: "scan-overlay", width: 100, height: 24, build: scan_overlay },
@@ -125,15 +126,39 @@ fn threads() -> App {
     let mut app = base();
     app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
     app.focus = Focus::Msgs;
-    let card = ThreadCard {
+    let card = Card {
         conversation: "#one".to_string(),
         participants: "alice, bob, and 2 others".to_string(),
         hidden: 5,
+        counted_from: 1_000_000,
         counted_through: 3_000_000,
-        last: Some(msg(3000, "the newest reply")),
+        tail: vec![msg(3000, "the newest reply")],
+        elision: crate::render::Elision::Replies,
     };
     app.stack.push(View::Threads {
-        list: MsgList::threads(vec![(msg(1000, "the thread root"), card)]),
+        list: MsgList::with_cards(vec![(msg(1000, "the thread root"), card)]),
+    });
+    app
+}
+
+/// The UNREADS view: one card, the conversation and its unread count, the
+/// first unread message, the elided count and the newest unread messages.
+fn unreads() -> App {
+    let mut app = base();
+    app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+    app.focus = Focus::Msgs;
+    let card = Card {
+        conversation: "#one".to_string(),
+        participants: "6 unread".to_string(),
+        hidden: 2,
+        counted_from: 1_000_000,
+        counted_through: 4_000_000,
+        tail: vec![msg(3000, "the newest but one"), msg(4000, "the newest unread")],
+        elision: crate::render::Elision::Messages,
+    };
+    app.stack.push(View::Unreads {
+        list: MsgList::with_cards(vec![(msg(1000, "the first unread message"), card)]),
+        deleted: Vec::new(),
     });
     app
 }

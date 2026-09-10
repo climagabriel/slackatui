@@ -29,7 +29,6 @@ pub enum Action {
     GoToDate,
     MyThreads,
     ChannelTabs,
-    UnreadsFirst,
     Compose,
     QuoteReply,
     Delete,
@@ -72,7 +71,6 @@ impl Action {
             Action::GoToDate => "go to a date",
             Action::MyThreads => "threads I took part in or was mentioned in",
             Action::ChannelTabs => "channel tabs and canvases",
-            Action::UnreadsFirst => "unread conversations on top",
             Action::Compose => "write a message",
             Action::QuoteReply => "quote the message and reply",
             Action::Delete => "delete your own message",
@@ -115,7 +113,6 @@ impl Action {
             Action::GoToDate => "go_to_date",
             Action::MyThreads => "my_threads",
             Action::ChannelTabs => "channel_tabs",
-            Action::UnreadsFirst => "unreads_first",
             Action::Compose => "compose",
             Action::QuoteReply => "quote_reply",
             Action::Delete => "delete",
@@ -160,7 +157,6 @@ pub const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::GoToDate, &["d"]),
     (Action::MyThreads, &["ctrl-t"]),
     (Action::ChannelTabs, &["T"]),
-    (Action::UnreadsFirst, &["U"]),
     (Action::Compose, &["c"]),
     (Action::QuoteReply, &[">"]),
     (Action::Delete, &["D"]),
@@ -647,6 +643,38 @@ mod tests {
         std::fs::write(&path, "{\"quit\":[\"meta-q\"]}\n").unwrap();
         let error = Keymap::load(Some(&path)).unwrap_err();
         assert!(error.contains("unknown key"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The unread hoist is gone with its key, and a file saved by a release
+    /// that still had it loads: `load` only looks up the actions that exist,
+    /// so an action name it no longer knows is ignored rather than rejected,
+    /// and the key that named it stays unbound.
+    #[test]
+    fn the_hoist_key_is_unbound_and_a_file_naming_the_old_action_still_loads() {
+        assert!(Keymap::default()
+            .action(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE))
+            .is_none());
+        assert!(!DEFAULTS.iter().any(|(_, keys)| keys.contains(&"U")));
+        let path = std::env::temp_dir().join(format!(
+            "slack-tui-keys-hoist-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"unreads_first":["U"],"channel_tabs":["T"],"quit":["ctrl-q"]}"#,
+        )
+        .unwrap();
+        let loaded = Keymap::load(Some(&path)).expect("an old settings file still loads");
+        assert!(loaded
+            .action(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE))
+            .is_none());
+        assert_eq!(loaded.text(Action::Quit), "ctrl-q");
+        assert_eq!(loaded.text(Action::ChannelTabs), "T");
         std::fs::remove_file(path).unwrap();
     }
 }

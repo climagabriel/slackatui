@@ -1511,6 +1511,72 @@ impl Archive {
         )
     }
 
+    /// What an UNREADS card draws for one conversation: how many top-level
+    /// messages the archive holds past `last_read`, and the messages the card
+    /// shows — the first unread one, then the newest `limit` of them, oldest
+    /// first and never repeated.
+    ///
+    /// The first unread is fetched in its own query rather than taken from
+    /// the newest page: it is the message the card opens the conversation at,
+    /// and a conversation with more unread messages than `limit` has a first
+    /// unread the newest page does not reach. The count is what tells the
+    /// card how many messages sit between the two, so it can say so.
+    ///
+    /// An empty answer means the archive holds nothing past the marker, which
+    /// a live-only or a stale conversation both produce; the caller decides
+    /// what to draw instead.
+    ///
+    /// `skip` are ids to leave out and not count. This archive is opened
+    /// read-only and is deliberately a record of what Slack held, so a
+    /// message deleted from Slack is still in it; a caller rebuilding a card
+    /// after such a delete passes the ids it deleted, or the query hands them
+    /// straight back. Each query asks for `skip.len()` rows more than it
+    /// needs, so an excluded row cannot cost the answer a real one.
+    pub fn unread_page(
+        &self,
+        cid: &str,
+        last_read: i64,
+        limit: usize,
+        skip: &[i64],
+    ) -> rusqlite::Result<(i64, Vec<Msg>)> {
+        self.ensure_combined_fresh()?;
+        let counted: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT ID) FROM MESSAGE \
+                 WHERE CHANNEL_ID = ?1 AND ID > ?2 AND {}",
+                Self::TOP_LEVEL
+            ),
+            params![cid, last_read],
+            |r| r.get(0),
+        )?;
+        // A skipped id the archive never held would take the count below what
+        // is really there; the drawn messages are the floor.
+        let excluded = skip.iter().filter(|id| **id > last_read).count() as i64;
+        let total = (counted - excluded).max(0);
+        if total == 0 || limit == 0 {
+            return Ok((total, Vec::new()));
+        }
+        let keep = |msgs: Vec<Msg>| -> Vec<Msg> {
+            msgs.into_iter().filter(|m| !skip.contains(&m.id)).collect()
+        };
+        let after = last_read.saturating_add(1);
+        let room = limit + skip.len();
+        let mut newest = keep(self.timeline_page(cid, Some(i64::MAX), Some(after), room)?);
+        if newest.len() > limit {
+            newest.drain(..newest.len() - limit);
+        }
+        if (newest.len() as i64) >= total {
+            return Ok((total, newest));
+        }
+        let mut msgs = keep(self.timeline_page(cid, None, Some(after), 1 + skip.len())?);
+        msgs.truncate(1);
+        // The first unread is below the newest page whenever the count says
+        // the two do not meet, so it never duplicates a row of it.
+        let first = msgs.first().map(|m| m.id);
+        msgs.extend(newest.into_iter().filter(|m| Some(m.id) != first));
+        Ok((total, msgs))
+    }
+
     /// The thread: root first, then its replies, ascending.
     pub fn thread(&self, cid: &str, root: i64) -> rusqlite::Result<Vec<Msg>> {
         let sql = format!(
