@@ -1396,45 +1396,49 @@ pub fn thread_footer(m: &Msg, ctx: &Ctx, in_thread: bool) -> Option<Line<'static
     )))
 }
 
-/// One message as lines: header, wrapped body, files, reactions, thread
-/// footer. `in_thread` drops the footer (the replies are on screen).
-pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i64) -> Rendered {
+/// A join, a purpose change, a deleted message, a huddle: what Slack calls a
+/// subtype rather than a message. One dim italic run behind the time, wrapped
+/// under an indent of its own. It draws neither a header nor a body, so its
+/// rows are neither.
+pub fn system_message(m: &Msg, ctx: &Ctx, width: usize, today: i64) -> Vec<Line<'static>> {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let time = message_time(m, ctx, today);
     let sub = m.subtype.as_deref().unwrap_or("");
-    if is_system(m) {
-        let text = match sub {
-            "tombstone" => "(message deleted)".to_string(),
-            "huddle_thread" => "[huddle]".to_string(),
-            _ => {
-                let p = plain(&body(m, ctx));
-                let p = p.trim();
-                if p.is_empty() {
-                    format!("[{sub}]")
-                } else {
-                    p.split_whitespace().collect::<Vec<_>>().join(" ")
-                }
+    let text = match sub {
+        "tombstone" => "(message deleted)".to_string(),
+        "huddle_thread" => "[huddle]".to_string(),
+        _ => {
+            let p = plain(&body(m, ctx));
+            let p = p.trim();
+            if p.is_empty() {
+                format!("[{sub}]")
+            } else {
+                p.split_whitespace().collect::<Vec<_>>().join(" ")
             }
-        };
-        let segs = vec![Seg::new(
-            text,
-            Sty {
-                dim: true,
-                italic: true,
-                ..Sty::default()
-            },
-        )];
-        let indent = format!("{}  · ", " ".repeat(time.len()));
-        let mut lines = wrap(&segs, width, &indent, ctx.palette);
-        if let Some(first) = lines.first_mut() {
-            first.spans[0] = Span::styled(format!("{time}  · "), dim);
         }
-        // The one line a system message gets opens with the time the header
-        // carries; what follows it is the message.
-        let mut tags = vec!["message_body"; lines.len()];
-        if let Some(first) = tags.first_mut() {
-            *first = "message_header";
-        }
+    };
+    let segs = vec![Seg::new(
+        text,
+        Sty {
+            dim: true,
+            italic: true,
+            ..Sty::default()
+        },
+    )];
+    let indent = format!("{}  · ", " ".repeat(time.len()));
+    let mut lines = wrap(&segs, width, &indent, ctx.palette);
+    if let Some(first) = lines.first_mut() {
+        first.spans[0] = Span::styled(format!("{time}  · "), dim);
+    }
+    lines
+}
+
+/// One message as lines: header, wrapped body, files, reactions, thread
+/// footer. `in_thread` drops the footer (the replies are on screen).
+pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i64) -> Rendered {
+    if is_system(m) {
+        let lines = system_message(m, ctx, width, today);
+        let tags = vec!["system_message"; lines.len()];
         return Rendered {
             lines,
             images: Vec::new(),

@@ -274,9 +274,10 @@ what the keys do in the two lists, one action per row; /version shows the
 version in the status line's right corner, and hides it again.
 /labels tags every element on screen with the function or struct that draws
 it, so a change can be asked for by name: a bordered element carries its tag
-at the right end of its top border, and a borderless line after its own text.
-A tag that does not fit is dropped rather than shortened, and never covers
-what the element drew. The mode is off at every start and is not saved.
+at the right end of its top border, or of its bottom border where a title
+fills the top one, and a borderless line after its own text. A tag that fits
+on neither is dropped rather than shortened, and never covers what the element
+drew. The mode is off at every start and is not saved.
 /mute and /unmute update your preference in Slack and verify it
 by reading it back. They require sign-in; failures do not create a local mute.
 Old muted.json overrides are ignored. Muted conversations sort last;
