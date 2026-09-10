@@ -72,23 +72,15 @@ pub struct FlatLine {
     pub image: Option<ImageSlot>,
 }
 
-/// One message's lines appended to `flat`, every one of them tagged as
-/// belonging to item `index`; a THREADS card calls this twice, for its root
-/// and for its last reply. A message taller than `budget` is collapsed to its
-/// first line, a hidden-line count and its last line, and the return says
-/// whether it was.
-#[allow(clippy::too_many_arguments)]
-fn push_message(
-    flat: &mut Vec<FlatLine>,
-    index: usize,
-    m: &Msg,
-    ctx: &Ctx,
-    width: usize,
-    in_thread: bool,
-    today: i64,
-    budget: Option<usize>,
-) -> bool {
-    let mut rendered = render::message_lines(m, ctx, width, in_thread, today);
+/// The line that stands for what a collapsed message does not show.
+pub fn collapse_elision(hidden: usize) -> Line<'static> {
+    Line::from(format!("  ... ({hidden} more lines)"))
+}
+
+/// A message rendered and then, when it is taller than `budget`, cut down to
+/// its first line, a count of what is hidden and its last line. The return
+/// says whether it was cut.
+fn collapse(rendered: &mut render::Rendered, ctx: &Ctx, budget: Option<usize>) -> bool {
     let collapsed =
         budget.is_some_and(|budget| rendered.lines.len() + 2 > budget) && rendered.lines.len() > 3;
     if collapsed {
@@ -111,11 +103,13 @@ fn push_message(
             // lines, so a configured word colors the name here too.
             tail = ctx.palette.highlight_line(render::file_label(f));
         }
+        let tail_tag = rendered.tags.pop().unwrap_or("");
         rendered.lines.truncate(1);
-        rendered
-            .lines
-            .push(Line::from(format!("  ... ({hidden} more lines)")));
+        rendered.lines.push(collapse_elision(hidden));
         rendered.lines.push(tail);
+        rendered.tags.truncate(1);
+        rendered.tags.push("collapse_elision");
+        rendered.tags.push(tail_tag);
         // Slot lines index the truncated vec, so the surviving last row has to
         // be readdressed to index 2. Only a one-row image on that row
         // survives: anything taller reaches rows the preview dropped, and
@@ -128,6 +122,27 @@ fn push_message(
             keep
         });
     }
+    collapsed
+}
+
+/// One message's lines appended to `flat`, every one of them tagged as
+/// belonging to item `index`; a THREADS card calls this twice, for its root
+/// and for its last reply. A message taller than `budget` is collapsed, and
+/// the return says whether it was. The render's element tags stop here: a
+/// list holds lines only.
+#[allow(clippy::too_many_arguments)]
+fn push_message(
+    flat: &mut Vec<FlatLine>,
+    index: usize,
+    m: &Msg,
+    ctx: &Ctx,
+    width: usize,
+    in_thread: bool,
+    today: i64,
+    budget: Option<usize>,
+) -> bool {
+    let mut rendered = render::message_lines(m, ctx, width, in_thread, today);
+    let collapsed = collapse(&mut rendered, ctx, budget);
     let base = flat.len();
     for line in rendered.lines {
         flat.push(FlatLine {
@@ -425,6 +440,57 @@ impl MsgList {
             first.saturating_sub(back)
         };
         self.align_top = false;
+    }
+
+    /// What each row of item `index` draws, named after the code that draws
+    /// it, from the blank row above the item to the blank row below it. A row
+    /// no tag belongs on is empty.
+    ///
+    /// Recomputed from the messages here rather than kept beside the lines:
+    /// `/labels` is a draw-time mode and the list stores nothing for it. The
+    /// card layout that fits is found the way `rebuild_on_day` found it, by
+    /// trying them in order; the one whose rows match the rows the item
+    /// actually occupies is the one that was drawn.
+    pub fn item_tags(&self, ctx: &Ctx, width: usize, index: usize, today: i64) -> Vec<&'static str> {
+        let (Some(root), Some(top), Some(bottom)) =
+            (self.msgs.get(index), self.first.get(index), self.last.get(index))
+        else {
+            return Vec::new();
+        };
+        let rows = bottom - top + 1;
+        let cards = !self.cards.is_empty();
+        let budget = self
+            .pane_height
+            .map(|pane| if cards { pane / 3 } else { pane / 2 });
+        let card = self.cards.get(index);
+        let message_tags = |m: &Msg| {
+            let mut rendered = render::message_lines(m, ctx, width, self.in_thread, today);
+            collapse(&mut rendered, ctx, budget);
+            rendered.tags
+        };
+        for fit in [CardFit::Whole, CardFit::Folded, CardFit::Root] {
+            // The blank row above the item, which carries the focus outline.
+            let mut tags = vec![""];
+            if card.is_some() {
+                tags.push("card_header");
+            }
+            tags.extend(message_tags(root));
+            if let Some(card) = card {
+                if fit != CardFit::Root && card.elided(fit) > 0 {
+                    tags.push("card_elision");
+                }
+                if fit == CardFit::Whole {
+                    if let Some(reply) = &card.last {
+                        tags.extend(message_tags(reply));
+                    }
+                }
+            }
+            tags.push("");
+            if tags.len() == rows || !cards {
+                return tags;
+            }
+        }
+        Vec::new()
     }
 
     /// Select a contiguous viewport containing complete message blocks only.
@@ -822,6 +888,9 @@ pub struct App {
     pub highlight_cached: bool,
     /// `/version`: the version in the status line's right corner.
     pub show_version: bool,
+    /// `/labels`: every element on screen tagged with the code that draws it.
+    /// A debug mode, off at every start and never written anywhere.
+    pub labels: bool,
     /// `U`: unread conversations at the top of the list.
     pub unreads_first: bool,
     /// The target of the open compose prompt.
@@ -965,6 +1034,7 @@ impl App {
             conv_offset: 0,
             highlight_cached: false,
             show_version: false,
+            labels: false,
             unreads_first: true,
             compose: None,
             attachment: None,
@@ -1192,6 +1262,10 @@ impl App {
                 self.restore_filter(filter_before);
                 self.toggle_version();
             }
+            Some(Command::Labels) => {
+                self.restore_filter(filter_before);
+                self.toggle_labels();
+            }
             Some(Command::Upload(path)) => {
                 self.restore_filter(filter_before);
                 self.attach(&path);
@@ -1252,6 +1326,13 @@ impl App {
         } else {
             String::new()
         };
+    }
+
+    /// `/labels`: name every element on screen after the code that draws it,
+    /// or stop. Nothing is written: the next start has it off again.
+    fn toggle_labels(&mut self) {
+        self.labels = !self.labels;
+        self.status = if self.labels { "labels on" } else { "labels off" }.to_string();
     }
 
     /// `/keys`: the key editor over the messages pane.
@@ -5526,6 +5607,8 @@ enum Command {
     Keys,
     /// `version`: show the version in the corner, or hide it again.
     Version,
+    /// `labels`: tag every element on screen with the code that draws it.
+    Labels,
     /// `upload [path]`: attach a file, the clipboard's image without a path.
     Upload(String),
 }
@@ -5552,6 +5635,7 @@ fn parse_command(line: &str) -> Option<Command> {
         }
         "keys" | "keybindings" if rest.is_empty() => Some(Command::Keys),
         "version" if rest.is_empty() => Some(Command::Version),
+        "labels" if rest.is_empty() => Some(Command::Labels),
         "upload" | "attach" => Some(Command::Upload(rest.to_string())),
         "cache" => {
             let (op, name) = match rest.split_once(char::is_whitespace) {
@@ -8486,6 +8570,25 @@ pub(crate) mod tests {
         assert!(app.status.contains("shared multi-channel archive"));
         assert!(file_path.is_file());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `/labels` is a toggle that says which way it went, completes like the
+    /// other commands, and is off at every start.
+    #[test]
+    fn the_labels_command_toggles_the_mode_and_reports_it() {
+        let mut app = mute_test_app();
+        assert!(!app.labels);
+        app.run_command("labels", "");
+        assert!(app.labels);
+        assert_eq!(app.status, "labels on");
+        app.run_command("/labels", "");
+        assert!(!app.labels);
+        assert_eq!(app.status, "labels off");
+        // An argument is not a labels command, and leaves the mode alone.
+        app.run_command("labels off", "");
+        assert!(!app.labels);
+        assert!(app.status.starts_with("unknown command"));
+        assert!(complete::COMMANDS.iter().any(|c| c.name == "labels"));
     }
 
     pub(crate) fn mute_test_app() -> App {

@@ -267,6 +267,16 @@ fn narrow() -> App {
     app
 }
 
+/// The application state one fixture builds, for a test that wants to draw it
+/// at another size or with another mode on.
+pub(crate) fn state(name: &str) -> App {
+    let fixture = FIXTURES
+        .iter()
+        .find(|fixture| fixture.name == name)
+        .unwrap_or_else(|| panic!("no fixture named {name}"));
+    (fixture.build)()
+}
+
 /// One fixture drawn, through the same `ui::draw` the application runs.
 pub(crate) fn drawn(fixture: &Fixture) -> Buffer {
     let mut app = (fixture.build)();

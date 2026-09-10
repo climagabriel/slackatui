@@ -106,6 +106,11 @@ pub struct ImageSlot {
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
     pub images: Vec<ImageSlot>,
+    /// The part of the message each line belongs to, named after the function
+    /// that built it, and empty for a line no tag belongs on: the rows a
+    /// picture is reserved. One entry per line. Only a draw with `/labels` on
+    /// reads them; every other caller drops them, so nothing is stored.
+    pub tags: Vec<&'static str>,
 }
 
 /// Highlight one line of pretty-printed JSON without changing its contents.
@@ -1271,54 +1276,29 @@ pub fn file_label(f: &FileInfo) -> Line<'static> {
     Line::from(Span::styled(s, Style::new().add_modifier(Modifier::DIM)))
 }
 
-/// One message as lines: header, wrapped body, files, reactions, thread
-/// footer. `in_thread` drops the footer (the replies are on screen).
-pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i64) -> Rendered {
-    let dim = Style::new().add_modifier(Modifier::DIM);
-    let time = format!("{} {}", ctx.tz.date_label(m.secs(), today), ctx.tz.fmt(
-        m.secs(),
-        match ctx.tz {
-            Tz::Utc => "%H:%M UTC",
-            Tz::Local => "%H:%M %:z",
-        },
-    ));
-    let sub = m.subtype.as_deref().unwrap_or("");
-    if is_system(m) {
-        let text = match sub {
-            "tombstone" => "(message deleted)".to_string(),
-            "huddle_thread" => "[huddle]".to_string(),
-            _ => {
-                let p = plain(&body(m, ctx));
-                let p = p.trim();
-                if p.is_empty() {
-                    format!("[{sub}]")
-                } else {
-                    p.split_whitespace().collect::<Vec<_>>().join(" ")
-                }
-            }
-        };
-        let segs = vec![Seg::new(
-            text,
-            Sty {
-                dim: true,
-                italic: true,
-                ..Sty::default()
+/// When the message was sent, as its header and its one-line system form
+/// both open with.
+fn message_time(m: &Msg, ctx: &Ctx, today: i64) -> String {
+    format!(
+        "{} {}",
+        ctx.tz.date_label(m.secs(), today),
+        ctx.tz.fmt(
+            m.secs(),
+            match ctx.tz {
+                Tz::Utc => "%H:%M UTC",
+                Tz::Local => "%H:%M %:z",
             },
-        )];
-        let indent = format!("{}  · ", " ".repeat(time.len()));
-        let mut lines = wrap(&segs, width, &indent, ctx.palette);
-        if let Some(first) = lines.first_mut() {
-            first.spans[0] = Span::styled(format!("{time}  · "), dim);
-        }
-        return Rendered {
-            lines,
-            images: Vec::new(),
-        };
-    }
-    let mut lines = Vec::new();
-    let mut images = Vec::new();
+        )
+    )
+}
+
+/// The line above a message's body: when it was sent, who sent it, and what
+/// the message is besides — a bot, a channel it was found in, an edit, a
+/// thread reply that also went to the channel.
+pub fn message_header(m: &Msg, ctx: &Ctx, in_thread: bool, today: i64) -> Line<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
     let mut spans = vec![
-        Span::styled(time, dim),
+        Span::styled(message_time(m, ctx, today), dim),
         Span::raw("  "),
         Span::styled(String::new(), Style::new().add_modifier(Modifier::BOLD)),
     ];
@@ -1353,12 +1333,127 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i
         }))
         .add_modifier(Modifier::BOLD);
     spans[2] = Span::styled(author, author_style);
-    lines.push(Line::from(spans));
+    Line::from(spans)
+}
+
+/// The message's own text, wrapped to `width` under the header's indent.
+pub fn message_body(m: &Msg, ctx: &Ctx, width: usize) -> Vec<Line<'static>> {
+    wrap(&body(m, ctx), width, "  ", ctx.palette)
+}
+
+/// The reactions on a message as `:name: count`, wrapped over as many rows as
+/// they need. Empty when there are none.
+pub fn reaction_lines(m: &Msg, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let reactions = m.reactions();
+    if reactions.is_empty() {
+        return Vec::new();
+    }
+    let text = reactions
+        .iter()
+        .map(|(name, count)| format!(":{name}:({count})"))
+        .collect::<Vec<_>>()
+        .join("   ");
+    let available = width.saturating_sub(2).max(1);
+    let mut lines = Vec::new();
+    let mut row = String::new();
+    let mut columns = 0;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if columns + character_width > available && !row.is_empty() {
+            lines.push(Line::from(Span::styled(format!("  {row}"), dim)));
+            row.clear();
+            columns = 0;
+        }
+        row.push(character);
+        columns += character_width;
+    }
+    if !row.is_empty() {
+        lines.push(Line::from(Span::styled(format!("  {row}"), dim)));
+    }
+    lines
+}
+
+/// How many replies hang off a message and how many of them the archive has.
+/// None inside a thread, where the replies are on screen already.
+pub fn thread_footer(m: &Msg, ctx: &Ctx, in_thread: bool) -> Option<Line<'static>> {
+    if in_thread || !m.has_thread() {
+        return None;
+    }
+    let n = m.archived_replies;
+    let total = m.reply_count.max(n);
+    let plural = |k: i64| if k == 1 { "reply" } else { "replies" };
+    let s = if n == 0 {
+        format!("  ↳ {total} {} · not archived", plural(total))
+    } else if n < total {
+        format!("  ↳ {n} of {total} {} archived", plural(total))
+    } else {
+        format!("  ↳ {n} {}", plural(n))
+    };
+    Some(Line::from(Span::styled(
+        s,
+        Style::new().fg(ctx.palette.get(Role::ThreadInfo)),
+    )))
+}
+
+/// One message as lines: header, wrapped body, files, reactions, thread
+/// footer. `in_thread` drops the footer (the replies are on screen).
+pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i64) -> Rendered {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let time = message_time(m, ctx, today);
+    let sub = m.subtype.as_deref().unwrap_or("");
+    if is_system(m) {
+        let text = match sub {
+            "tombstone" => "(message deleted)".to_string(),
+            "huddle_thread" => "[huddle]".to_string(),
+            _ => {
+                let p = plain(&body(m, ctx));
+                let p = p.trim();
+                if p.is_empty() {
+                    format!("[{sub}]")
+                } else {
+                    p.split_whitespace().collect::<Vec<_>>().join(" ")
+                }
+            }
+        };
+        let segs = vec![Seg::new(
+            text,
+            Sty {
+                dim: true,
+                italic: true,
+                ..Sty::default()
+            },
+        )];
+        let indent = format!("{}  · ", " ".repeat(time.len()));
+        let mut lines = wrap(&segs, width, &indent, ctx.palette);
+        if let Some(first) = lines.first_mut() {
+            first.spans[0] = Span::styled(format!("{time}  · "), dim);
+        }
+        // The one line a system message gets opens with the time the header
+        // carries; what follows it is the message.
+        let mut tags = vec!["message_body"; lines.len()];
+        if let Some(first) = tags.first_mut() {
+            *first = "message_header";
+        }
+        return Rendered {
+            lines,
+            images: Vec::new(),
+            tags,
+        };
+    }
+    let mut lines = Vec::new();
+    let mut images = Vec::new();
+    let mut tags: Vec<&'static str> = Vec::new();
+    lines.push(message_header(m, ctx, in_thread, today));
+    tags.push("message_header");
     let body_start = lines.len();
-    lines.extend(wrap(&body(m, ctx), width, "  ", ctx.palette));
+    let body = message_body(m, ctx, width);
+    tags.extend(std::iter::repeat_n("message_body", body.len()));
+    lines.extend(body);
     let body_end = lines.len();
     for f in m.files() {
         lines.push(file_label(&f));
+        tags.push("file_label");
         if let Some(font) = ctx.image_font {
             if let Some((cols, rows)) = image_cells(&f, font, width) {
                 images.push(ImageSlot {
@@ -1369,49 +1464,24 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i
                 });
                 for _ in 0..rows {
                     lines.push(Line::from(""));
+                    // A picture's rows are the picture's; a tag on one would
+                    // be a tag over content.
+                    tags.push("");
                 }
             }
         }
     }
-    let reactions = m.reactions();
-    if !reactions.is_empty() {
-        let text = reactions.iter().map(|(name, count)| format!(":{name}:({count})"))
-            .collect::<Vec<_>>().join("   ");
-        let available = width.saturating_sub(2).max(1);
-        let mut row = String::new();
-        let mut columns = 0;
-        for character in text.chars() {
-            let character_width = character.width().unwrap_or(0);
-            if columns + character_width > available && !row.is_empty() {
-                lines.push(Line::from(Span::styled(format!("  {row}"), dim)));
-                row.clear();
-                columns = 0;
-            }
-            row.push(character);
-            columns += character_width;
-        }
-        if !row.is_empty() { lines.push(Line::from(Span::styled(format!("  {row}"), dim))); }
-    }
-    if !in_thread && m.has_thread() {
-        let n = m.archived_replies;
-        let total = m.reply_count.max(n);
-        let plural = |k: i64| if k == 1 { "reply" } else { "replies" };
-        let s = if n == 0 {
-            format!("  ↳ {total} {} · not archived", plural(total))
-        } else if n < total {
-            format!("  ↳ {n} of {total} {} archived", plural(total))
-        } else {
-            format!("  ↳ {n} {}", plural(n))
-        };
-        lines.push(Line::from(Span::styled(
-            s,
-            Style::new().fg(ctx.palette.get(Role::ThreadInfo)),
-        )));
+    let reactions = reaction_lines(m, width);
+    tags.extend(std::iter::repeat_n("reaction_lines", reactions.len()));
+    lines.extend(reactions);
+    if let Some(footer) = thread_footer(m, ctx, in_thread) {
+        lines.push(footer);
+        tags.push("thread_footer");
     }
     let lines = lines.into_iter().enumerate().map(|(index, line)| {
         if (body_start..body_end).contains(&index) { line } else { ctx.palette.highlight_line(line) }
     }).collect();
-    Rendered { lines, images }
+    Rendered { lines, images, tags }
 }
 
 /// One row of the THREADS view. Slack's Threads screen draws a card per

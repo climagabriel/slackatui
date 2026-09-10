@@ -73,6 +73,11 @@ pub const COMMANDS: &[Cmd] = &[
         args: "",
         help: "show the version in the corner of the status line, or hide it",
     },
+    Cmd {
+        name: "labels",
+        args: "",
+        help: "tag every element on screen with the code that draws it, or stop",
+    },
 ];
 
 const CACHE_OPS: &[(&str, &str)] = &[

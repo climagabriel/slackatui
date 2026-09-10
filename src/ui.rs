@@ -38,29 +38,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help {
         draw_help(frame, area, app);
     }
-    if let Some(menu) = &app.pane_menu {
-        let block = Block::bordered()
-            .title(" conversations-pane ")
-            .border_style(border(true, &app.palette));
-        let inner = block.inner(main);
-        frame.render_widget(Clear, main);
-        frame.render_widget(block, main);
-        let [help, list] =
-            Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(inner);
-        frame.render_widget(Paragraph::new(
-            "Outside Search: j/k or ↑/↓ select · h/l unset/set · Space cycle · Enter save · Esc cancel/home\nSearch row: type · Backspace erase · Ctrl-U clear · ↓/Tab/Enter leave\nMuted and Number: h/l previous/next. Individuals: h hide, l show; Space cycles category/show/hide.\nReset: select Reset, Space, then Enter."), help);
-        let items: Vec<_> = menu.rows().into_iter().map(ListItem::new).collect();
-        let mut state = ListState::default().with_selected(Some(menu.cursor));
-        frame.render_stateful_widget(
-            List::new(items).highlight_style(
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(app.palette.get(Role::Accent)),
-            ),
-            list,
-            &mut state,
-        );
-    }
+    draw_pane_menu(frame, app, main);
     if let Some((key, received)) = &app.last_key {
         if received.elapsed() < std::time::Duration::from_secs(3) && main.height >= 3 && main.width >= 4 {
             let width=(key.width().saturating_add(4)).min(main.width as usize) as u16;
@@ -74,6 +52,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     // Last of all, so nothing draws over what the reader is waiting on.
     draw_scan_overlay(frame, app, area);
+}
+
+/// The conversations-pane picker, over the whole main area.
+fn draw_pane_menu(frame: &mut Frame, app: &App, main: Rect) {
+    let Some(menu) = &app.pane_menu else { return };
+    let block = Block::bordered()
+        .title(" conversations-pane ")
+        .border_style(border(true, &app.palette));
+    let inner = block.inner(main);
+    frame.render_widget(Clear, main);
+    frame.render_widget(block, main);
+    crate::labels::border(frame, app.labels, main, "draw_pane_menu");
+    let [help, list] = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(
+        "Outside Search: j/k or ↑/↓ select · h/l unset/set · Space cycle · Enter save · Esc cancel/home\nSearch row: type · Backspace erase · Ctrl-U clear · ↓/Tab/Enter leave\nMuted and Number: h/l previous/next. Individuals: h hide, l show; Space cycles category/show/hide.\nReset: select Reset, Space, then Enter."), help);
+    let items: Vec<_> = menu.rows().into_iter().map(ListItem::new).collect();
+    let mut state = ListState::default().with_selected(Some(menu.cursor));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(app.palette.get(Role::Accent)),
+        ),
+        list,
+        &mut state,
+    );
 }
 
 /// The rect a `/find` progress box takes: centred, four fifths of the
@@ -111,6 +115,7 @@ fn draw_scan_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
+    crate::labels::border(frame, app.labels, rect, "scan_overlay");
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -274,6 +279,7 @@ fn draw_convs(frame: &mut Frame, app: &mut App, area: Rect) {
         .with_offset(app.conv_offset.min(app.filtered.len() + crate::app::TopSection::ALL.len() - 1))
         .with_selected(Some(app.top_section.map(crate::app::TopSection::row).unwrap_or(if app.filtered.is_empty() { 0 } else { app.conv_cursor + crate::app::TopSection::ALL.len() })));
     frame.render_stateful_widget(list, area, &mut state);
+    crate::labels::border(frame, app.labels, area, "draw_convs");
     app.conv_offset = state.offset();
 }
 
@@ -287,10 +293,16 @@ fn muted_message_style(mut style: Style) -> Style {
 }
 
 fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Read before the fields are borrowed apart below, where `app` itself is
+    // out of reach.
+    let labels = app.labels;
     if app.channel_browser.as_ref().is_some_and(|browser| browser.visible) {
         let mut browser = app.channel_browser.take().expect("visible browser");
         browser.previews = app.picker.is_some();
         browser.draw(frame, area, &app.palette);
+        // The channel-tabs menu takes the whole pane; the code behind it is
+        // `Browser::draw` in canvas.rs.
+        crate::labels::border(frame, labels, area, "Browser::draw");
         for (thumbnail_area, file) in &browser.thumbnails {
             app.ensure_image(file, false);
             if let Some(protocol) = app.inline_protocol(&file.id, thumbnail_area.width, thumbnail_area.height) {
@@ -333,6 +345,7 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         .border_style(border(focused, &app.palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    crate::labels::border(frame, labels, area, "draw_msgs");
     app.msgs_height = inner.height as usize;
     if inner.width < 4 || inner.height == 0 {
         return;
@@ -355,13 +368,8 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(shown), inner);
         return;
     }
-    if let Some(View::Raw { browser, .. }) = app.stack.last_mut() {
-        let height = inner.height.saturating_sub(2);
-        let rows = browser.rows(inner.width as usize, height as usize, &app.palette);
-        frame.render_widget(Paragraph::new(rows), Rect { height, ..inner });
-        let help = vec![Line::raw(browser.label()),
-            Line::raw("j/k: leaf/link · Enter: follow · h: back · PgUp/PgDn: scroll · Esc: home")];
-        frame.render_widget(Paragraph::new(help), Rect { y: inner.y + height, height: inner.height - height, ..inner });
+    if matches!(app.stack.last(), Some(View::Raw { .. })) {
+        draw_raw(frame, app, inner);
         return;
     }
     let image_font = app.image_font();
@@ -432,6 +440,40 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
     let last = list.last.get(cursor).copied();
     let scroll = list.scroll;
     let outline = Style::reset().fg(Color::Rgb(112, 112, 112)).bg(palette.get(Role::Background));
+    // What each visible row is, asked of the list rather than kept by it, and
+    // drawn once the pictures are in place so none is written over one.
+    let row_tags: Vec<(u16, &'static str)> = if labels {
+        let today = ctx.tz.day(chrono::Utc::now().timestamp());
+        let mut out: Vec<(u16, &'static str)> = Vec::new();
+        let mut item: Option<(usize, Vec<&'static str>)> = None;
+        for (i, fl) in list.flat.iter().enumerate().skip(list.scroll).take(end - list.scroll) {
+            let tag = match fl.msg {
+                // The unread part opens in the palette's unread color, bold;
+                // every other divider is dim. That is the whole difference
+                // between the two functions that draw them.
+                None => match fl.line.spans.first() {
+                    Some(span) if span.style.add_modifier.contains(Modifier::BOLD) => "divider_new",
+                    _ => "divider",
+                },
+                Some(k) => {
+                    if item.as_ref().is_none_or(|(index, _)| *index != k) {
+                        item = Some((k, list.item_tags(&ctx, text_w, k, today)));
+                    }
+                    let start = list.first[k];
+                    item.as_ref()
+                        .and_then(|(_, tags)| tags.get(i - start))
+                        .copied()
+                        .unwrap_or("")
+                }
+            };
+            if !tag.is_empty() {
+                out.push(((i - list.scroll) as u16, tag));
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
     let mut shown: Vec<Line> = Vec::with_capacity(inner.height as usize);
     for (i, fl) in list.flat.iter().enumerate().skip(list.scroll).take(end - list.scroll) {
         let selected = fl.msg == Some(cursor);
@@ -511,6 +553,21 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
         }
+    }
+    // A row's tag belongs inside the text column, clear of the focus outline
+    // on either side of it.
+    for (row, tag) in row_tags {
+        crate::labels::after_text(
+            frame,
+            true,
+            Rect {
+                x: inner.x + 1,
+                y: inner.y + row,
+                width: text_w as u16,
+                height: 1,
+            },
+            tag,
+        );
     }
 }
 
@@ -662,13 +719,23 @@ pub fn compose_layout(ed: &crate::edit::Editor, width: u16, cap: usize) -> Compo
 
 /// The compose border's two titles for a box `width` cells wide: the label on
 /// the left, and as many hints as the rest of the border holds on the right.
-/// Hints go first, one at a time from the right end; the label is truncated
-/// only once there is no hint left to drop.
-pub fn compose_titles(label: &str, width: u16) -> (String, String) {
+/// With `labels` on the element's own tag rides the right end, past the hints.
+/// The tag goes first, then hints one at a time from the right end; the label
+/// is truncated only once there is nothing left to drop.
+pub fn compose_titles(label: &str, width: u16, labels: bool) -> (String, String) {
     let room = width.saturating_sub(2) as usize;
     let left = format!(" {label} ");
+    let mut rights: Vec<String> = Vec::new();
+    if labels {
+        rights.push(format!(
+            " {} · {COMPOSE_TAG} ",
+            COMPOSE_HINTS.join(" · ")
+        ));
+    }
     for keep in (1..=COMPOSE_HINTS.len()).rev() {
-        let right = format!(" {} ", COMPOSE_HINTS[..keep].join(" · "));
+        rights.push(format!(" {} ", COMPOSE_HINTS[..keep].join(" · ")));
+    }
+    for right in rights {
         if left.width() + right.width() <= room {
             return (left, right);
         }
@@ -677,6 +744,80 @@ pub fn compose_titles(label: &str, width: u16) -> (String, String) {
         return (left, String::new());
     }
     (clip(&left, room), String::new())
+}
+
+/// What the compose box calls itself under `/labels`.
+pub const COMPOSE_TAG: &str = "draw_compose";
+
+/// The compose box: a bordered draft over the status line, with the target on
+/// the left of its top border and its bindings on the right.
+fn draw_compose(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    label: &str,
+    buf: &crate::edit::Editor,
+) {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    // The cap the split already granted: `prompt_rows` asked for
+    // `visible + 2`, so the interior it left is `visible` again, and a
+    // narrower one (a terminal too short for the box) shortens the
+    // layout rather than pushing the cursor outside it.
+    let layout = compose_layout(buf, area.width, area.height.saturating_sub(2) as usize);
+    let (left, right) = compose_titles(label, area.width, app.labels);
+    let mut block = Block::bordered()
+        .border_style(border(true, &app.palette))
+        .style(background_style(&app.palette))
+        .title(Span::styled(
+            left,
+            Style::new().fg(app.palette.get(Role::Accent)),
+        ));
+    if !right.is_empty() {
+        block = block.title(Line::from(Span::styled(right, dim)).right_aligned());
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let end = (layout.scroll + layout.visible).min(layout.rows.len());
+    let shown: Vec<Line> = layout.rows[layout.scroll..end]
+        .iter()
+        .map(|row| Line::raw(row.clone()))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(shown)), inner);
+    frame.set_cursor_position((
+        inner.x + layout.cursor.1 as u16,
+        inner.y + (layout.cursor.0 - layout.scroll) as u16,
+    ));
+}
+
+/// The raw JSON of one message, with the keys that walk it below.
+fn draw_raw(frame: &mut Frame, app: &mut App, inner: Rect) {
+    let Some(View::Raw { browser, .. }) = app.stack.last_mut() else {
+        return;
+    };
+    let height = inner.height.saturating_sub(2);
+    let rows = browser.rows(inner.width as usize, height as usize, &app.palette);
+    frame.render_widget(Paragraph::new(rows), Rect { height, ..inner });
+    let help = vec![
+        Line::raw(browser.label()),
+        Line::raw("j/k: leaf/link · Enter: follow · h: back · PgUp/PgDn: scroll · Esc: home"),
+    ];
+    frame.render_widget(
+        Paragraph::new(help),
+        Rect {
+            y: inner.y + height,
+            height: inner.height - height,
+            ..inner
+        },
+    );
+    crate::labels::after_text(frame, app.labels, first_row(inner), "draw_raw");
+}
+
+/// The top row of `area`, where a borderless element carries its tag.
+fn first_row(area: Rect) -> Rect {
+    Rect { height: 1, ..area }
 }
 
 /// `/keys`: one action per row with the keys that reach it.
@@ -729,6 +870,7 @@ fn draw_keys(frame: &mut Frame, app: &App, inner: Rect) {
         Style::new().add_modifier(Modifier::DIM),
     )));
     frame.render_widget(Paragraph::new(lines), inner);
+    crate::labels::after_text(frame, app.labels, first_row(inner), "draw_keys");
 }
 
 fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
@@ -790,6 +932,7 @@ fn draw_color_palette(frame: &mut Frame, app: &App, inner: Rect) {
         Style::new().add_modifier(Modifier::DIM),
     )));
     frame.render_widget(Paragraph::new(lines), inner);
+    crate::labels::after_text(frame, app.labels, first_row(inner), "draw_color_palette");
 }
 
 fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
@@ -799,6 +942,7 @@ fn draw_image_view(frame: &mut Frame, app: &mut App, inner: Rect) {
     let mut protocol = shown.take();
     draw_picture(frame, app, inner, &file, zoom, &mut protocol, None);
     if let Some(View::Image { shown, .. }) = app.stack.last_mut() { *shown = protocol; }
+    crate::labels::after_text(frame, app.labels, first_row(inner), "draw_image_view");
 }
 
 fn draw_picture(
@@ -992,37 +1136,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             (None, _) => "message".to_string(),
         };
         if *kind == PromptKind::Compose {
-            // The cap the split already granted: `prompt_rows` asked for
-            // `visible + 2`, so the interior it left is `visible` again, and a
-            // narrower one (a terminal too short for the box) shortens the
-            // layout rather than pushing the cursor outside it.
-            let layout = compose_layout(buf, area.width, area.height.saturating_sub(2) as usize);
-            let (left, right) = compose_titles(&compose_label, area.width);
-            let mut block = Block::bordered()
-                .border_style(border(true, &app.palette))
-                .style(background_style(&app.palette))
-                .title(Span::styled(
-                    left,
-                    Style::new().fg(app.palette.get(Role::Accent)),
-                ));
-            if !right.is_empty() {
-                block = block.title(Line::from(Span::styled(right, dim)).right_aligned());
-            }
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            if inner.width == 0 || inner.height == 0 {
-                return;
-            }
-            let end = (layout.scroll + layout.visible).min(layout.rows.len());
-            let shown: Vec<Line> = layout.rows[layout.scroll..end]
-                .iter()
-                .map(|row| Line::raw(row.clone()))
-                .collect();
-            frame.render_widget(Paragraph::new(Text::from(shown)), inner);
-            frame.set_cursor_position((
-                inner.x + layout.cursor.1 as u16,
-                inner.y + (layout.cursor.0 - layout.scroll) as u16,
-            ));
+            draw_compose(frame, app, area, &compose_label, buf);
             return;
         }
         let label = match kind {
@@ -1081,6 +1195,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    crate::labels::after_text(frame, app.labels, first_row(area), "draw_status");
 }
 
 /// The guide's rows, in order: an action shows the keys bound to it now, a
@@ -1220,6 +1335,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
             .style(background_style(palette)),
         rect,
     );
+    crate::labels::border(frame, app.labels, rect, "draw_help");
 }
 
 pub fn human_count(n: i64) -> String {

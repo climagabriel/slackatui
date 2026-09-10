@@ -24,6 +24,7 @@ mod sent;
 mod author_search;
 mod storage;
 mod session_log;
+mod labels;
 mod ui;
 #[cfg(test)]
 mod ui_fixtures;
@@ -202,7 +203,7 @@ environment
 keys (also ? inside)
   j/k move, f/b half page down/up, g/G oldest/newest, h/l or Tab panes,
   Enter thread, Esc back, / a command (Tab completes: upload, keys,
-  colorpalette, version, find, search, leave, mute, unmute, star, unstar, pin, unpin, cache),
+  colorpalette, version, labels, find, search, leave, mute, unmute, star, unstar, pin, unpin, cache),
   d go to date, v raw JSON,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
@@ -271,6 +272,11 @@ background the terminal already draws), and
 /colorpalette default over the terminal's own sixteen colors; /keys rebinds
 what the keys do in the two lists, one action per row; /version shows the
 version in the status line's right corner, and hides it again.
+/labels tags every element on screen with the function or struct that draws
+it, so a change can be asked for by name: a bordered element carries its tag
+at the right end of its top border, and a borderless line after its own text.
+A tag that does not fit is dropped rather than shortened, and never covers
+what the element drew. The mode is off at every start and is not saved.
 /mute and /unmute update your preference in Slack and verify it
 by reading it back. They require sign-in; failures do not create a local mute.
 Old muted.json overrides are ignored. Muted conversations sort last;
