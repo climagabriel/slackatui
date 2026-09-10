@@ -1375,7 +1375,7 @@ pub fn message_lines(m: &Msg, ctx: &Ctx, width: usize, in_thread: bool, today: i
     }
     let reactions = m.reactions();
     if !reactions.is_empty() {
-        let text = reactions.iter().map(|(name, count)| format!(":{name}: {count}"))
+        let text = reactions.iter().map(|(name, count)| format!(":{name}:({count})"))
             .collect::<Vec<_>>().join("   ");
         let available = width.saturating_sub(2).max(1);
         let mut row = String::new();
@@ -1924,7 +1924,7 @@ mod tests {
             for thread in [false, true] {
                 let rendered = message_lines(&message, &context, 120, thread, 0);
                 assert!(rendered.images.is_empty());
-                assert!(rendered.lines.iter().any(|line| line_text(line).contains(":eyes: 2   :custom_emoji: 3")));
+                assert!(rendered.lines.iter().any(|line| line_text(line).contains(":eyes:(2)   :custom_emoji:(3)")));
             }
         }
     }
@@ -1947,7 +1947,7 @@ mod tests {
             assert!(footer.len()>1);
             assert!(footer.iter().all(|line| line.width()<=width));
             let rebuilt = footer.iter().map(|line| line_text(line).strip_prefix("  ").unwrap().to_string()).collect::<String>();
-            assert_eq!(rebuilt,":a_very_long_custom_reaction_name: 12   :eyes: 3   :final_reaction: 4");
+            assert_eq!(rebuilt,":a_very_long_custom_reaction_name:(12)   :eyes:(3)   :final_reaction:(4)");
         }
     }
 
