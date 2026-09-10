@@ -71,6 +71,10 @@ messages open for line-by-line reading: j/k or Up/Down scroll one line, PageUp/P
 Home/End reach its start/end. l or Right again for raw JSON.
 h/Left returns one level along the path you entered, ending at
 the conversation list. Esc returns home; a second Esc selects its first row. JSON colors follow /colorpalette.
+v opens the raw JSON of the selected message. On a conversation row it opens the raw JSON of what
+the row stands for instead: the archived channel object for a channel or group message, the other
+party's user object for a direct message. A conversation no archive holds, and a direct message
+whose counterpart the archive's user table is missing, say so in the status line and open nothing.
 In raw JSON, j/k or Up/Down select leaf values, skipping nonempty containers. Slack
 message links are separate selections within a leaf; Enter follows the
 link inside slack-tui. After following a link, h returns to the raw
@@ -204,7 +208,7 @@ keys (also ? inside)
   j/k move, f/b half page down/up, g/G oldest/newest, h/l or Tab panes,
   Enter thread, Esc back, / a command (Tab completes: upload, keys,
   colorpalette, version, labels, find, search, leave, mute, unmute, star, unstar, pin, unpin, cache),
-  d go to date, v raw JSON,
+  d go to date, v raw JSON of the message, or of the selected conversation's / user's own object,
   o show a hit or a thread root in the channel, r reload, s sort, q quit,
   R refresh from Slack, a archive a conversation not cached yet,
   i view a message's images, I inline thumbnails on/off,

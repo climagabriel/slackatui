@@ -400,7 +400,11 @@ fn draw_msgs(frame: &mut Frame, app: &mut App, area: Rect) {
         palette,
         ..
     } = app;
-    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. })) {
+    // `View::Raw` is not in this list because it never reaches here: a raw
+    // view on top returned above. `View::Thread` is, because `v` on a
+    // conversation row opens a raw view with no conversation open, and
+    // Enter on a Slack link inside it stacks a thread over that raw view.
+    if open.is_none() && !stack.iter().any(|v| matches!(v, View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. } | View::Thread { .. })) {
         let hint = Line::from(Span::styled(
             "  select a conversation and press Enter",
             Style::new().add_modifier(Modifier::DIM),
@@ -1279,7 +1283,7 @@ const HELP: &[HelpRow] = &[
         "mark unread from the message under the cursor (the highlighted conversation in the list)",
     ),
     HelpRow::Bound(Action::Help, "this guide"),
-    HelpRow::Bound(Action::RawJson, "raw JSON of the selected message"),
+    HelpRow::Bound(Action::RawJson, "raw JSON of the selected message, or the selected conversation's / user's in the conversation list"),
     HelpRow::Bound(Action::Save, "save selected message to Slack Later; /save"),
     HelpRow::Bound(Action::Unsave, "remove selected message from Slack Later; /unsave"),
     HelpRow::Fixed("in raw JSON", "j/k select leaf values or Slack links; Enter follows the selected link; h returns; PgUp/PgDn scroll long values; g/G select first/last value or link"),

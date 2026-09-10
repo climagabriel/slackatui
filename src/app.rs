@@ -4674,6 +4674,52 @@ impl App {
         self.stack.push(View::Raw { title, browser: crate::raw::Browser::new(&m.data) });
     }
 
+    /// `v` on a conversation row: the raw JSON of what the row stands for —
+    /// the `CHANNEL` object for a channel or group message, the
+    /// counterpart's `S_USER` object for a direct message. Read by id from
+    /// the conversation's own archive when the key is pressed, so the same
+    /// id in two archives answers with that archive's row, and `Conv` stays
+    /// as small as it is.
+    fn open_conv_raw(&mut self) {
+        // A top row (SAVED, SENT, MENTIONS, THREADS) stands for no object.
+        if self.top_section.is_some() {
+            return;
+        }
+        let Some(&index) = self.filtered.get(self.conv_cursor) else {
+            return;
+        };
+        let me = self.corpus.me.clone();
+        let conv = &self.corpus.convs[index];
+        let name = conv.name.clone();
+        let found = match self.corpus.conv_archive(conv) {
+            None => Err(format!("{name} is in Slack only; no archive row to show")),
+            Some(archive) if conv.kind == Kind::Im => {
+                match archive.im_counterpart(&conv.id, me.as_deref()) {
+                    None => Err(format!("{name}: this archive names no counterpart")),
+                    Some(uid) => match archive.user_json(&uid) {
+                        Some(user) => Ok((format!("raw · {name} · {uid}"), user)),
+                        None => Err(format!("{name}: {uid} is not in this archive's user table")),
+                    },
+                }
+            }
+            Some(archive) => match archive.channel_json(&conv.id) {
+                Some(channel) => Ok((format!("raw · {name} · {}", conv.id), channel)),
+                None => Err(format!("{name}: this archive holds no channel row for it")),
+            },
+        };
+        match found {
+            Ok((title, value)) => {
+                // Leaving for raw JSON.
+                self.nav_generation = self.nav_generation.wrapping_add(1);
+                self.stack.push(View::Raw {
+                    title,
+                    browser: crate::raw::Browser::new(&value),
+                });
+            }
+            Err(status) => self.status = status,
+        }
+    }
+
     fn goto_date(&mut self, text: &str) {
         // Leaving for a date.
         self.nav_generation = self.nav_generation.wrapping_add(1);
@@ -5214,6 +5260,11 @@ impl App {
         }
         if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) && !control {
             self.stack.pop();
+            // Nothing left behind it: a raw view opened from a conversation
+            // row hands the focus back to the list it came from.
+            if self.stack.is_empty() && self.open.is_none() {
+                self.focus = Focus::Convs;
+            }
             return;
         }
         let Some(View::Raw { browser, .. }) = self.stack.last_mut() else { return };
@@ -5296,6 +5347,10 @@ impl App {
         let place = self.corpus.channel_names.get(&link.channel).map(|name| format!("#{name}"))
             .unwrap_or_else(|| link.channel.clone());
         self.stack.push(View::Thread { root, list, live: None, place: Some(place) });
+        // A list in the messages pane takes the focus, so its keys reach it:
+        // a raw view opened from a conversation row left the focus on the
+        // list, and `on_conv_key` has no answer for a thread.
+        self.focus = Focus::Msgs;
         self.status = "Opened linked Slack message · h: back".into();
     }
 
@@ -5377,6 +5432,7 @@ impl App {
             Some(Action::Compose) => self.compose(),
             // `>` quotes the message under the cursor, and this pane has none.
             Some(Action::QuoteReply) => self.status = "select a message first".to_string(),
+            Some(Action::RawJson) => self.open_conv_raw(),
             Some(Action::React) => self.view_reactions(),
             Some(Action::MarkRead) => self.mark_read(),
             Some(Action::MarkUnread) => self.mark_unread(),
@@ -9246,4 +9302,277 @@ pub(crate) mod tests {
         assert!(!app.images.contains_key("F1:full"));
     }
 
+    /// An archive on disk carrying the rows `v` on a conversation row reads:
+    /// a channel object with a `purpose` and a topic holding a Slack
+    /// permalink, a group message, a direct message whose counterpart has a
+    /// `tz`, one whose counterpart the user table does not name, and one the
+    /// channel object does not name at all. Duplicate rows are written first
+    /// with the wrong value, so a reader that takes the oldest row fails.
+    fn conversation_row_archive(app: &mut App, link: &str) -> PathBuf {
+        let dir = crate::archive::test_dir("raw-conversation-rows");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.join("slackdump.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE CHANNEL(ID TEXT, NAME TEXT, DATA BLOB, CHUNK_ID INTEGER);
+                 CREATE TABLE CHANNEL_USER(CHANNEL_ID TEXT, USER_ID TEXT);
+                 CREATE TABLE S_USER(ID TEXT, USERNAME TEXT, DATA BLOB);
+                 CREATE TABLE MESSAGE(ID INTEGER, CHUNK_ID INTEGER, CHANNEL_ID TEXT, TS TEXT,
+                     PARENT_ID INTEGER, THREAD_TS TEXT, IS_PARENT INTEGER, LATEST_REPLY TEXT,
+                     TXT TEXT, DATA BLOB);",
+            )
+            .unwrap();
+            let channel = |id: &str, chunk: i64, data: Value| {
+                conn.execute(
+                    "INSERT INTO CHANNEL VALUES (?1, ?2, CAST(?3 AS BLOB), ?4)",
+                    rusqlite::params![id, "", data.to_string(), chunk],
+                )
+                .unwrap();
+            };
+            channel("C1", 1, json!({"id":"C1","purpose":{"value":"an older purpose"}}));
+            channel("C1", 2, json!({"id":"C1","name":"one","is_channel":true,
+                "purpose":{"value":"keep nginx builds moving"},"topic":{"value":link}}));
+            channel("G1", 1, json!({"id":"G1","is_mpim":true,"is_group":true,
+                "name":"mpdm-ivan--olga-1","purpose":{"value":"the three of us"}}));
+            channel("D2", 1, json!({"id":"D2","is_im":true,"user":"U2"}));
+            channel("D3", 1, json!({"id":"D3","is_im":true,"user":"U9"}));
+            // No `user` field: the counterpart comes from CHANNEL_USER.
+            channel("D4", 1, json!({"id":"D4","is_im":true}));
+            conn.execute_batch(
+                "INSERT INTO CHANNEL_USER VALUES ('D4','U1'), ('D4','U2');",
+            )
+            .unwrap();
+            let user = |id: &str, data: Value| {
+                conn.execute(
+                    "INSERT INTO S_USER VALUES (?1, ?2, CAST(?3 AS BLOB))",
+                    rusqlite::params![id, "oliver.hendricks", data.to_string()],
+                )
+                .unwrap();
+            };
+            user("U2", json!({"id":"U2","name":"oliver.hendricks","tz":"Etc/UTC"}));
+            user("U2", json!({"id":"U2","name":"oliver.hendricks","tz":"Europe/Prague",
+                "profile":{"display_name":"ivan","title":"nginx"}}));
+            let data = json!({"text":"the linked message","ts":"7.000000","user":"U1"}).to_string();
+            conn.execute(
+                "INSERT INTO MESSAGE VALUES (7000000,1,'C1','7.000000',NULL,NULL,0,NULL,?1,CAST(?2 AS BLOB))",
+                rusqlite::params!["the linked message", data],
+            )
+            .unwrap();
+        }
+        app.corpus.me = Some("U1".into());
+        app.corpus.workspace_url = "https://myorg.slack.com".into();
+        app.merge_conversations(vec![
+            json!({"id":"G1","name":"mpdm-ivan--olga-1","is_mpim":true}),
+            json!({"id":"D2","user":"U2","is_im":true}),
+            json!({"id":"D3","user":"U9","is_im":true}),
+            json!({"id":"D4","is_im":true}),
+            json!({"id":"C9","name":"live-only","is_member":true}),
+        ]);
+        app.corpus
+            .archives
+            .push(Archive::open("full/rows".into(), &dir).unwrap());
+        let index = app.corpus.archives.len() - 1;
+        for id in ["C1", "G1", "D2", "D3", "D4"] {
+            let conv = app.corpus.conv_by_channel(id).unwrap();
+            app.corpus.convs[conv].archive = index;
+            app.corpus.convs[conv].live_only = false;
+        }
+        app.apply_filter();
+        dir
+    }
+
+    /// Put the cursor on one conversation row of the list.
+    fn select_conversation(app: &mut App, id: &str) {
+        let conv = app.corpus.conv_by_channel(id).unwrap();
+        app.top_section = None;
+        app.conv_cursor = app.filtered.iter().position(|&i| i == conv).unwrap();
+        app.focus = Focus::Convs;
+    }
+
+    fn screen(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `v` on a channel row opens the archived `CHANNEL` object, including
+    /// fields `Conv` never extracts, and takes the newest chunk's row.
+    /// `h` and Esc both come back to the same row of the list.
+    #[test]
+    fn raw_json_on_a_channel_row_draws_the_archived_channel_object() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        select_conversation(&mut app, "C1");
+        let (cursor, offset) = (app.conv_cursor, app.conv_offset);
+        for close in [KeyCode::Char('h'), KeyCode::Esc] {
+            app.on_key(key(KeyCode::Char('v')));
+            assert!(matches!(app.stack.last(), Some(View::Raw { .. })), "{close:?}");
+            assert!(app.open.is_none(), "{close:?}");
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let drawn = screen(&terminal);
+            assert!(drawn.contains("\"purpose\""), "{drawn}");
+            assert!(drawn.contains("keep nginx builds moving"), "{drawn}");
+            assert!(!drawn.contains("an older purpose"), "{drawn}");
+            assert!(drawn.contains("\"is_channel\""), "{drawn}");
+            assert!(drawn.contains("raw · #one · C1"), "{drawn}");
+            assert!(!drawn.contains("select a conversation and press Enter"), "{drawn}");
+            app.on_key(key(close));
+            assert!(app.stack.is_empty(), "{close:?}");
+            assert_eq!((app.conv_cursor, app.conv_offset), (cursor, offset), "{close:?}");
+            assert_eq!(app.focus, Focus::Convs, "{close:?}");
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            assert!(screen(&terminal).contains("select a conversation and press Enter"));
+        }
+        // With a conversation open behind the list, `h` still comes back to
+        // the row the cursor was on rather than into that conversation.
+        app.open_conv(app.corpus.conv_by_channel("G1").unwrap());
+        select_conversation(&mut app, "C1");
+        app.on_key(key(KeyCode::Char('v')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("keep nginx builds moving"));
+        app.on_key(key(KeyCode::Char('h')));
+        assert_eq!(app.focus, Focus::Convs);
+        assert_eq!((app.conv_cursor, app.conv_offset), (cursor, offset));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.open.as_ref().map(|open| open.conv), app.corpus.conv_by_channel("G1"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A group message answers with its conversation object; a direct
+    /// message with the counterpart's user object, including a field `User`
+    /// never extracts, and from the newest of the duplicate rows. The
+    /// counterpart is the channel object's `user`, or CHANNEL_USER without
+    /// the owner when the object does not name one.
+    #[test]
+    fn raw_json_on_group_and_direct_message_rows_draws_conversation_and_user() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        select_conversation(&mut app, "G1");
+        app.on_key(key(KeyCode::Char('v')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let drawn = screen(&terminal);
+        assert!(drawn.contains("\"is_mpim\""), "{drawn}");
+        assert!(drawn.contains("mpdm-ivan--olga-1"), "{drawn}");
+        assert!(drawn.contains("the three of us"), "{drawn}");
+        app.on_key(key(KeyCode::Char('h')));
+
+        for (id, title) in [("D2", "· U2"), ("D4", "· U2")] {
+            select_conversation(&mut app, id);
+            app.on_key(key(KeyCode::Char('v')));
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let drawn = screen(&terminal);
+            assert!(drawn.contains("\"tz\""), "{id}: {drawn}");
+            assert!(drawn.contains("Europe/Prague"), "{id}: {drawn}");
+            assert!(!drawn.contains("Etc/UTC"), "{id}: {drawn}");
+            assert!(drawn.contains("oliver.hendricks"), "{id}: {drawn}");
+            assert!(drawn.contains(title), "{id}: {drawn}");
+            assert!(!drawn.contains("\"is_im\""), "{id}: user object, not the channel: {drawn}");
+            app.on_key(key(KeyCode::Char('h')));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The three rows that stand for no object it can read: a direct message
+    /// whose counterpart the user table is missing, a conversation known
+    /// from Slack alone, and a top-section row.
+    #[test]
+    fn raw_json_refuses_rows_with_no_archived_object_and_says_which() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        select_conversation(&mut app, "D3");
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("U9 is not in this archive's user table"), "{}", app.status);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("select a conversation and press Enter"));
+
+        select_conversation(&mut app, "C9");
+        app.status.clear();
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("in Slack only"), "{}", app.status);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("select a conversation and press Enter"));
+
+        for section in TopSection::ALL {
+            app.top_section = Some(section);
+            app.status = "untouched".into();
+            app.on_key(key(KeyCode::Char('v')));
+            assert!(app.stack.is_empty(), "{section:?}");
+            assert_eq!(app.status, "untouched", "{section:?}");
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            assert!(!screen(&terminal).contains("\"purpose\""), "{section:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A Slack link inside a conversation's own JSON opens the message it
+    /// points at, with no conversation open behind the raw view.
+    #[test]
+    fn a_slack_link_in_a_conversation_object_opens_its_message() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(
+            &mut app,
+            "https://myorg.slack.com/archives/C1/p7000000",
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        select_conversation(&mut app, "C1");
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.stack.last(), Some(View::Thread { .. })), "{}", app.status);
+        assert!(app.open.is_none());
+        // The thread's own keys need the messages pane to hold the focus.
+        assert_eq!(app.focus, Focus::Msgs);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let drawn = screen(&terminal);
+        assert!(drawn.contains("the linked message"), "{drawn}");
+        assert!(!drawn.contains("select a conversation and press Enter"), "{drawn}");
+        app.on_key(key(KeyCode::Char('h')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("keep nginx builds moving"));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Convs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `v` on a message still opens that message's JSON: the same buffer
+    /// before and after the conversation rows learned the key.
+    #[test]
+    fn raw_json_on_a_message_is_unchanged_by_the_conversation_row_key() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list =
+            MsgList::new(vec![msg(1, "a message of its own")], false);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let drawn = screen(&terminal);
+        assert!(drawn.contains("raw · 1.000000 · #one"), "{drawn}");
+        assert!(drawn.contains("a message of its own"), "{drawn}");
+        assert!(drawn.contains("\"ts\": \"1.000000\""), "{drawn}");
+        assert!(!drawn.contains("\"purpose\""), "{drawn}");
+    }
 }

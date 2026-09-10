@@ -84,7 +84,7 @@ impl Action {
             Action::MarkRead => "mark read",
             Action::MarkUnread => "mark unread from here",
             Action::ShowInChannel => "show a hit or thread root in the channel",
-            Action::RawJson => "raw JSON of the message",
+            Action::RawJson => "raw JSON of the message or conversation",
             Action::Reload => "reload from the archive",
             Action::Refresh => "refresh from Slack",
             Action::Archive => "archive a conversation",

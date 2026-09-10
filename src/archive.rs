@@ -847,6 +847,65 @@ impl Archive {
         self.users().get(uid).is_some_and(|u| u.is_bot)
     }
 
+    /// One row's stored Slack object, as JSON. `DATA` is a blob of UTF-8
+    /// JSON, so the cast is how every other reader here reaches its text.
+    fn row_json(&self, sql: &str, id: &str) -> Option<Value> {
+        let text: String = self
+            .conn
+            .query_row(sql, params![id], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()?;
+        serde_json::from_str(&text).ok().filter(Value::is_object)
+    }
+
+    /// The whole `CHANNEL` row of one conversation, not the handful of
+    /// fields `Conv` keeps. A refresh appends a new chunk rather than
+    /// rewriting the old one, so the newest chunk answers.
+    pub fn channel_json(&self, cid: &str) -> Option<Value> {
+        self.row_json(
+            "SELECT CAST(DATA AS TEXT) FROM CHANNEL WHERE ID = ?1 \
+             ORDER BY CHUNK_ID DESC, rowid DESC LIMIT 1",
+            cid,
+        )
+    }
+
+    /// The whole `S_USER` row of one user. `MAX(rowid)` per id is what
+    /// `load_users` takes; for a single id that is the last row.
+    pub fn user_json(&self, uid: &str) -> Option<Value> {
+        self.row_json(
+            "SELECT CAST(DATA AS TEXT) FROM S_USER WHERE ID = ?1 ORDER BY rowid DESC LIMIT 1",
+            uid,
+        )
+    }
+
+    /// The other side of a direct message: the channel object's own `user`
+    /// field, else the one member of `CHANNEL_USER` that is not the owner.
+    /// The two sources `display_name` names an IM row from.
+    pub fn im_counterpart(&self, cid: &str, me: Option<&str>) -> Option<String> {
+        if let Some(user) = self
+            .channel_json(cid)
+            .and_then(|channel| channel["user"].as_str().map(str::to_string))
+            .filter(|user| !user.is_empty())
+        {
+            return Some(user);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT USER_ID FROM CHANNEL_USER WHERE CHANNEL_ID = ?1")
+            .ok()?;
+        let members: Vec<String> = stmt
+            .query_map(params![cid], |r| r.get::<_, String>(0))
+            .ok()?
+            .flatten()
+            .collect();
+        members
+            .iter()
+            .find(|user| Some(user.as_str()) != me)
+            .or_else(|| members.first())
+            .cloned()
+    }
+
     pub fn channel_name(&self, cid: &str) -> Option<String> {
         self.channel_names
             .get(cid)
