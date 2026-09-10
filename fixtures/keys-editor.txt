@@ -1,0 +1,40 @@
+  0 |┌ 2 · auto · unread firs┐┌ keys · what each action answers to ─────────────────────────────────────┐|
+    0..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..100:fg=Cyan,bg=Reset,ul=Reset
+  1 |│SAVED                  ││ action                                     keys                         │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..6:fg=Reset,bg=Reset,ul=Reset,+BOLD 6..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..74:fg=Reset,bg=Reset,ul=Reset,+DIM 74..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+  2 |│SENT                   ││ › move down                               j, down                       │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..5:fg=Reset,bg=Reset,ul=Reset,+BOLD 5..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Cyan,bg=Reset,ul=Reset,+BOLD 69..76:fg=Yellow,bg=Reset,ul=Reset 76..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+  3 |│MENTIONS               ││   move up                                 k, up                         │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..9:fg=Reset,bg=Reset,ul=Reset,+BOLD 9..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..74:fg=Yellow,bg=Reset,ul=Reset 74..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+  4 |│THREADS                ││   half a page down                        ctrl-d, f                     │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..8:fg=Reset,bg=Reset,ul=Reset,+BOLD 8..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..78:fg=Yellow,bg=Reset,ul=Reset 78..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+  5 |│───────────────────────││   half a page up                          ctrl-u, b                     │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset,+DIM 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..78:fg=Yellow,bg=Reset,ul=Reset 78..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+  6 |│#one                  0││   a page down                             ctrl-f, page-down             │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..5:fg=Black,bg=Gray,ul=Reset,+BOLD 5..24:fg=Black,bg=Gray,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..86:fg=Yellow,bg=Reset,ul=Reset 86..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+  7 |│@U1                   0││   a page up                               page-up                       │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..4:fg=Reset,bg=Reset,ul=Reset,+DIM 4..23:fg=Reset,bg=Reset,ul=Reset 23..24:fg=Reset,bg=Reset,ul=Reset,+DIM 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..76:fg=Yellow,bg=Reset,ul=Reset 76..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+  8 |│                       ││   oldest / first                          g, home                       │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..76:fg=Yellow,bg=Reset,ul=Reset 76..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+  9 |│                       ││   newest / last                           G, end                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..75:fg=Yellow,bg=Reset,ul=Reset 75..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 10 |│                       ││   open: conversation, thread, raw JSON    enter, l, right               │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..84:fg=Yellow,bg=Reset,ul=Reset 84..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 11 |│                       ││   back one view, then the list            h, left                       │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..76:fg=Yellow,bg=Reset,ul=Reset 76..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 12 |│                       ││   home; again: first conversation         esc                           │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..72:fg=Yellow,bg=Reset,ul=Reset 72..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 13 |│                       ││   the other pane                          tab                           │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..72:fg=Yellow,bg=Reset,ul=Reset 72..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 14 |│                       ││   conversations pane: shown, hidden, auto-hidectrl-b                    │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..73:fg=Reset,bg=Reset,ul=Reset 73..79:fg=Yellow,bg=Reset,ul=Reset 79..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 15 |│                       ││   a command line                          /                             │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..69:fg=Reset,bg=Reset,ul=Reset 69..70:fg=Yellow,bg=Reset,ul=Reset 70..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 16 |│                       ││                                                                         │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 17 |│                       ││ j/k action · e bind · A add · d reset action · D reset all · Enter save │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..26:fg=Cyan,bg=Reset,ul=Reset 26..99:fg=Reset,bg=Reset,ul=Reset,+DIM 99..100:fg=Cyan,bg=Reset,ul=Reset
+ 18 |└───────────────────────┘└─────────────────────────────────────────────────────────────────────────┘|
+    0..25:fg=DarkGray,bg=Reset,ul=Reset,+DIM 25..100:fg=Cyan,bg=Reset,ul=Reset
+ 19 | UTC not signed in, and this conversation is not cached                                             |
+    0..5:fg=Reset,bg=Reset,ul=Reset,+DIM 5..57:fg=Yellow,bg=Reset,ul=Reset 57..100:fg=Reset,bg=Reset,ul=Reset

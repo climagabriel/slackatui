@@ -1,0 +1,28 @@
+  0 |┌ 2 · auto · unread first · b┐┌ #one · channel · 0 loaded · live from Slack, not cached ───────────────────────────────┐|
+    0..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..120:fg=Cyan,bg=Reset,ul=Reset
+  1 |│SAVED                       ││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..6:fg=Reset,bg=Reset,ul=Reset,+BOLD 6..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  2 |│SENT                        ││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..5:fg=Reset,bg=Reset,ul=Reset,+BOLD 5..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  3 |│MENTIONS                    ││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..9:fg=Reset,bg=Reset,ul=Reset,+BOLD 9..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  4 |│THREADS                     ││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..8:fg=Reset,bg=Reset,ul=Reset,+BOLD 8..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  5 |│────────────────────────────││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..29:fg=Reset,bg=Reset,ul=Reset,+DIM 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  6 |│#one                       0││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..5:fg=Black,bg=Gray,ul=Reset,+BOLD 5..29:fg=Black,bg=Gray,ul=Reset 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  7 |│@U1                        0││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..4:fg=Reset,bg=Reset,ul=Reset,+DIM 4..28:fg=Reset,bg=Reset,ul=Reset 28..29:fg=Reset,bg=Reset,ul=Reset,+DIM 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  8 |│                            ││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  9 |│                            ││                                                                                        │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..29:fg=Reset,bg=Reset,ul=Reset 29..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..31:fg=Cyan,bg=Reset,ul=Reset 31..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 10 |└────────────────────────────┘└────────────────────────────────────────────────────────────────────────────────────────┘|
+    0..30:fg=DarkGray,bg=Reset,ul=Reset,+DIM 30..120:fg=Cyan,bg=Reset,ul=Reset
+ 11 |┌ message to #one ──────────────────────────────────────────── Enter send · Ctrl-j newline · Esc cancel · Ctrl-v image ┐|
+    0..62:fg=Cyan,bg=Reset,ul=Reset 62..119:fg=Cyan,bg=Reset,ul=Reset,+DIM 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 12 |│a draft                                                                                                               │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 13 |└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘|
+    0..120:fg=Cyan,bg=Reset,ul=Reset

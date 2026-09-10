@@ -635,6 +635,21 @@ pub struct ScanOverlay {
 }
 
 impl ScanOverlay {
+    /// A box with the lines already in it and no worker behind it, for a test
+    /// that only draws one.
+    #[cfg(test)]
+    pub(crate) fn for_test(label: &str, lines: Vec<crate::live::ScanLine>) -> ScanOverlay {
+        let (_sender, progress) = std::sync::mpsc::channel();
+        ScanOverlay {
+            label: label.to_string(),
+            lines,
+            started: Instant::now(),
+            live_pending: false,
+            finished: false,
+            progress,
+        }
+    }
+
     /// Take whatever the worker has said since the last frame.
     fn drain(&mut self) {
         while let Ok(line) = self.progress.try_recv() {

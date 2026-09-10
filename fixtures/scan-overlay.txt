@@ -1,0 +1,48 @@
+  0 |┌ 2 · auto · unread firs┐┌ messages ───────────────────────────────────────────────────────────────┐|
+    0..25:fg=Cyan,bg=Reset,ul=Reset 25..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  1 |│SAVED                  ││  select a conversation and press Enter                                  │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..6:fg=Reset,bg=Reset,ul=Reset,+BOLD 6..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=Cyan,bg=Reset,ul=Reset 25..26:fg=DarkGray,bg=Reset,ul=Reset,+DIM 26..65:fg=Reset,bg=Reset,ul=Reset,+DIM 65..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  2 |│SENT     ┌ /find nginx ─────────────────────────────────────────────────────────────────┐         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..5:fg=Reset,bg=Reset,ul=Reset,+BOLD 5..10:fg=Reset,bg=Reset,ul=Reset 10..18:fg=Cyan,bg=DarkGray,ul=Reset 18..23:fg=Green,bg=DarkGray,ul=Reset 23..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  3 |│MENTIONS │scanning #one                                                                 │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..9:fg=Reset,bg=Reset,ul=Reset,+BOLD 9..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  4 |│THREADS  │3 hits                                                                        │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..8:fg=Reset,bg=Reset,ul=Reset,+BOLD 8..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..17:fg=Reset,bg=DarkGray,ul=Reset,+DIM 17..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  5 |│─────────│                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset,+DIM 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  6 |│#one     │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Black,bg=White,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  7 |│@U1      │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..4:fg=Reset,bg=Reset,ul=Reset,+DIM 4..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  8 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  9 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 10 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 11 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 12 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 13 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 14 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 15 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 16 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 17 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 18 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 19 |│         │                                                                              │         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..11:fg=Cyan,bg=DarkGray,ul=Reset 11..89:fg=Reset,bg=DarkGray,ul=Reset 89..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 20 |│         └ ⠋ 0s · Esc ──────────────────────────────────────────────────────────────────┘         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..10:fg=Reset,bg=Reset,ul=Reset 10..90:fg=Cyan,bg=DarkGray,ul=Reset 90..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 21 |│                       ││                                                                         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..24:fg=Reset,bg=Reset,ul=Reset 24..25:fg=Cyan,bg=Reset,ul=Reset 25..26:fg=DarkGray,bg=Reset,ul=Reset,+DIM 26..99:fg=Reset,bg=Reset,ul=Reset 99..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 22 |└───────────────────────┘└─────────────────────────────────────────────────────────────────────────┘|
+    0..25:fg=Cyan,bg=Reset,ul=Reset 25..100:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 23 | UTC archive loaded                                                                                 |
+    0..5:fg=Reset,bg=Reset,ul=Reset,+DIM 5..21:fg=Yellow,bg=Reset,ul=Reset 21..100:fg=Reset,bg=Reset,ul=Reset

@@ -25,6 +25,8 @@ mod author_search;
 mod storage;
 mod session_log;
 mod ui;
+#[cfg(test)]
+mod ui_fixtures;
 
 use std::path::PathBuf;
 use std::time::Duration;
