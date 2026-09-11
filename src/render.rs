@@ -1556,8 +1556,8 @@ pub enum CardFit {
     Whole,
     /// The tail folded into the elision, which now counts it.
     Folded,
-    /// The elision folded into the header. Six rows with a collapsed item,
-    /// which is the shortest pane `ui::draw` will draw a message into.
+    /// The elision folded into the header. Seven rows with a collapsed item,
+    /// which is the shortest pane `ui::draw` will draw a card into.
     Root,
 }
 

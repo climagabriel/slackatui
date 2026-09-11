@@ -107,8 +107,8 @@ fn conversation() -> App {
     app
 }
 
-/// A message taller than its share of the pane, shown as its first row, the
-/// count of what is hidden and its last row.
+/// A message taller than its share of the pane, shown as its header, its
+/// first body row, the count of what is hidden and its last row.
 fn collapsed() -> App {
     let mut app = base();
     app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;

@@ -82,18 +82,34 @@ pub fn collapse_elision(hidden: usize) -> Line<'static> {
     Line::from(format!("  ... ({hidden} more lines)"))
 }
 
+/// How many rows a preview keeps from the top of a message: its header and
+/// its first body line, so the preview says who wrote it *and* what they
+/// wrote. A system message (a join, a purpose change, a deleted message)
+/// draws no header, and its first row is already its content.
+fn collapse_head(rendered: &render::Rendered) -> usize {
+    if rendered.tags.first() == Some(&"message_header") {
+        2
+    } else {
+        1
+    }
+}
+
 /// A message rendered and then, when it is taller than `budget`, cut down to
-/// its first line, a count of what is hidden and its last line. The return
+/// its opening rows, a count of what is hidden and its last line. The return
 /// says whether it was cut.
 fn collapse(rendered: &mut render::Rendered, ctx: &Ctx, budget: Option<usize>) -> bool {
-    let collapsed =
-        budget.is_some_and(|budget| rendered.lines.len() + 2 > budget) && rendered.lines.len() > 3;
+    let head = collapse_head(rendered);
+    // A message only one row taller than the preview would be is left whole:
+    // the elision would cost the row it saved and say less than the line it
+    // replaced.
+    let collapsed = budget.is_some_and(|budget| rendered.lines.len() + 2 > budget)
+        && rendered.lines.len() > head + 2;
     if collapsed {
-        // Keep the message's own first and last rows around the elision, so a
-        // preview shows how the message ends as well as how it starts.
+        // Keep the message's own opening and last rows around the elision, so
+        // a preview shows how the message ends as well as how it starts.
         // Everything between them is the count.
         let last_row = rendered.lines.len() - 1;
-        let hidden = last_row - 1;
+        let hidden = last_row - head;
         let mut tail = rendered.lines.pop().expect("a collapsed message has lines");
         // A message ending inside a taller-than-one-row image keeps one of that
         // image's blank reserved rows as the preview's last line, and the
@@ -109,20 +125,22 @@ fn collapse(rendered: &mut render::Rendered, ctx: &Ctx, budget: Option<usize>) -
             tail = ctx.palette.highlight_line(render::file_label(f));
         }
         let tail_tag = rendered.tags.pop().unwrap_or("");
-        rendered.lines.truncate(1);
+        rendered.lines.truncate(head);
         rendered.lines.push(collapse_elision(hidden));
         rendered.lines.push(tail);
-        rendered.tags.truncate(1);
+        rendered.tags.truncate(head);
         rendered.tags.push("collapse_elision");
         rendered.tags.push(tail_tag);
         // Slot lines index the truncated vec, so the surviving last row has to
-        // be readdressed to index 2. Only a one-row image on that row
-        // survives: anything taller reaches rows the preview dropped, and
-        // would paint over the elision or the next message.
+        // be readdressed to the row past the elision. Only a one-row image on
+        // that row survives: anything taller reaches rows the preview dropped,
+        // and would paint over the elision or the next message. The kept
+        // opening rows can hold no slot of their own: a picture is reserved
+        // below the file line that names it, which is itself below the header.
         rendered.images.retain_mut(|slot| {
             let keep = slot.line == last_row && slot.rows == 1;
             if keep {
-                slot.line = 2;
+                slot.line = head + 1;
             }
             keep
         });
@@ -221,6 +239,15 @@ impl MsgList {
             in_thread: true,
             ..Default::default()
         }
+    }
+
+    /// The shortest pane `ui::draw_msgs` will draw an item into. The blank
+    /// row above the item, the item's shortest form — a collapsed message,
+    /// which keeps its header, its first body line, the elision and its last
+    /// line — and the blank row below. A card spends one more row on its own
+    /// header, which `CardFit::Root` is the last to shed.
+    pub fn min_pane_height(&self) -> usize {
+        if self.cards.is_empty() { 6 } else { 7 }
     }
 
     pub fn len(&self) -> usize {
@@ -11668,17 +11695,18 @@ pub(crate) mod tests {
         app.corpus.convs[0].archive = 0;
         app.corpus.convs[0].live_only = false;
         app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        // `ui::draw` refuses to draw a message into fewer than six inner rows,
-        // so six and eight are the shortest panes a card must survive. Two of
-        // the terminal's rows are the pane border and one is the status line.
-        // At six the whole count moves into the header; at eight it gets its
-        // own elision line; on a tall pane the last reply is drawn and the
-        // count drops to the one reply left over.
+        // `ui::draw` refuses to draw a card into fewer than seven inner rows —
+        // the blank above, the card header, a collapsed root's four rows and
+        // the blank below — so seven and eight are the shortest panes a card
+        // must survive. Two of the terminal's rows are the pane border and one
+        // is the status line. At seven the whole count moves into the header;
+        // at eight it gets its own elision line; on a tall pane the last reply
+        // is drawn and the count drops to the one reply left over.
         // A collapsed root keeps its own last line, so this is on screen at
         // every height and proves the card was drawn at all.
         let tail = "worst case the card has to fit around";
         let cases = [
-            (6 + 3, false, "#one  U1  · 2 more replies", ""),
+            (7 + 3, false, "#one  U1  · 2 more replies", ""),
             (8 + 3, false, "#one  U1", "… 2 more replies"),
             (30, true, "#one  U1", "… 1 more reply"),
         ];
@@ -11712,7 +11740,7 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// At six rows the count is on the header, and a narrow pane must not
+    /// At seven rows the count is on the header, and a narrow pane must not
     /// clip it off the end: the elision line it moved out of is gone, so a
     /// clipped count is a count nowhere.
     #[test]
@@ -11741,9 +11769,9 @@ pub(crate) mod tests {
         app.corpus.convs[0].live_only = false;
         app.corpus.convs[0].name = "#team-cdn-core-alpha-and-everything".into();
         app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        // Six inner rows and forty columns: the count is the last thing on
-        // the header and the first thing a clip would take.
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(66, 9)).unwrap();
+        // Seven inner rows and sixty-six columns: the count is the last thing
+        // on the header and the first thing a clip would take.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(66, 10)).unwrap();
         terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rows: Vec<String> = (0..buffer.area.height).map(|y| (0..buffer.area.width)
@@ -11932,12 +11960,13 @@ pub(crate) mod tests {
                     let collapsed = height == 24;
                     assert_eq!(app.active_list().unwrap().collapsed, vec![collapsed]);
                     // 13 rendered rows: the header and 12 body rows. Collapsed,
-                    // the last one stays and the 11 between it and the header go.
+                    // the header, the first body row and the last one stay,
+                    // and the 10 between them go.
                     let list = app.active_list().unwrap();
                     assert_eq!(list.flat.iter().filter(|line|
-                        line.line.to_string() == "  ... (11 more lines)").count(),
+                        line.line.to_string() == "  ... (10 more lines)").count(),
                         usize::from(collapsed));
-                    assert_eq!(list.last[0] - list.first[0], if collapsed { 4 } else { 14 });
+                    assert_eq!(list.last[0] - list.first[0], if collapsed { 5 } else { 14 });
                     app.on_key(key(forward));
                     if collapsed {
                         assert!(app.active_list().unwrap().line_scroll);
@@ -11957,9 +11986,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// A collapsed message shows its own first and last rows around the
-    /// elision. The last row carries an image only when the whole image fits
-    /// on it, and the slot has to be readdressed to its new index.
+    /// A collapsed message shows its header, its first body row and its last
+    /// row around the elision. The last row carries an image only when the
+    /// whole image fits on it, and the slot has to be readdressed to its new
+    /// index.
     #[test]
     fn collapsed_preview_keeps_the_last_row_and_only_an_image_that_fits_it() {
         let corpus = Corpus::stub(&[]);
@@ -11987,12 +12017,14 @@ pub(crate) mod tests {
         assert_eq!(list.collapsed, vec![true]);
         let rows: Vec<_> = list.flat[list.first[0]..=list.last[0]]
             .iter().map(|line| line.line.to_string()).collect();
-        assert_eq!(rows.len(), 5); // blank, first, elision, last, blank.
+        // blank, header, first body row, elision, last, blank.
+        assert_eq!(rows.len(), 6);
         assert!(rows[1].contains("UTC") && !rows[1].contains("body"));
-        assert_eq!(rows[2], "  ... (21 more lines)");
-        assert_eq!(rows[3], ""); // The image's reserved row.
-        let slot = list.flat[list.first[0] + 3].image.as_ref().expect("image kept");
-        assert_eq!((slot.line, slot.rows), (2, 1)); // Readdressed to the truncated vec.
+        assert_eq!(rows[2], "  body 0");
+        assert_eq!(rows[3], "  ... (20 more lines)");
+        assert_eq!(rows[4], ""); // The image's reserved row.
+        let slot = list.flat[list.first[0] + 4].image.as_ref().expect("image kept");
+        assert_eq!((slot.line, slot.rows), (3, 1)); // Readdressed to the truncated vec.
         assert!(list.flat.iter().filter(|line| line.image.is_some()).count() == 1);
         // Uncollapsed, the same slot keeps its original index.
         list.rebuild_for_pane(&context, 120, 100);
@@ -12007,10 +12039,11 @@ pub(crate) mod tests {
         list.rebuild_for_pane(&context, 120, 24);
         assert_eq!(list.collapsed, vec![true]);
         assert!(list.flat.iter().all(|line| line.image.is_none()));
-        assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  ... (34 more lines)");
+        assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  body 0");
+        assert_eq!(list.flat[list.first[0] + 3].line.to_string(), "  ... (33 more lines)");
         let label = render::file_label(&tall.files()[0]).to_string();
         assert_eq!(label, "  [file] wide.png (png)");
-        let collapsed_tail = list.flat[list.first[0] + 3].line.clone();
+        let collapsed_tail = list.flat[list.first[0] + 4].line.clone();
         assert_eq!(collapsed_tail.to_string(), label);
         // The name went through the highlight pass: "wide" is green.
         assert!(collapsed_tail.spans.iter().any(|span|
@@ -12029,19 +12062,31 @@ pub(crate) mod tests {
         })).unwrap()], false);
         list.rebuild_for_pane(&context, 120, 24);
         assert_eq!(list.collapsed, vec![true]);
-        assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  ... (20 more lines)");
-        assert_eq!(list.flat[list.first[0] + 3].line.to_string(), "  [file] notes.txt (text, 12B)");
-        // The smallest message that collapses: four rows, two of them hidden,
-        // with the first and the last shown once each.
-        let mut list = MsgList::new(vec![msg(1, "one\ntwo\nthree")], false);
+        assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  body 0");
+        assert_eq!(list.flat[list.first[0] + 3].line.to_string(), "  ... (19 more lines)");
+        assert_eq!(list.flat[list.first[0] + 4].line.to_string(), "  [file] notes.txt (text, 12B)");
+        // The smallest message that collapses: five rows, two of them hidden,
+        // with the header, the first body row and the last shown once each.
+        let mut list = MsgList::new(vec![msg(1, "one\ntwo\nthree\nfour")], false);
         list.rebuild_for_pane(&context, 120, 8);
         assert_eq!(list.collapsed, vec![true]);
         let rows: Vec<_> = list.flat[list.first[0]..=list.last[0]]
             .iter().map(|line| line.line.to_string()).collect();
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         assert!(rows[1].contains("UTC") && !rows[1].contains("one"));
-        assert_eq!(rows[2], "  ... (2 more lines)");
-        assert_eq!(rows[3], "  three");
+        assert_eq!(rows[2], "  one");
+        assert_eq!(rows[3], "  ... (2 more lines)");
+        assert_eq!(rows[4], "  four");
+        // One row shorter, and collapsing would save nothing: the elision
+        // would stand in for the single line it replaced. Left whole.
+        let mut list = MsgList::new(vec![msg(1, "one\ntwo\nthree")], false);
+        list.rebuild_for_pane(&context, 120, 8);
+        assert_eq!(list.collapsed, vec![false]);
+        let rows: Vec<_> = list.flat[list.first[0]..=list.last[0]]
+            .iter().map(|line| line.line.to_string()).collect();
+        assert_eq!(rows.len(), 6);
+        assert!(rows[1].contains("UTC"));
+        assert_eq!(&rows[2..], ["  one", "  two", "  three", ""]);
     }
 
     #[test]
