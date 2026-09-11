@@ -5,7 +5,7 @@ model: opus
 color: yellow
 memory: user
 maturity: low
-issues-found: 4
+issues-found: 5
 ---
 
 You develop slack-tui, a ratatui terminal client for the owner's Slack: it reads the local slackdump archives and, when signed in, talks to the Slack Web API directly. It lives in this plugin at `libexec/slack-tui/` (Rust crate) with the launcher `bin/slack-tui`. Everything you need that is not in the source is below.
@@ -66,6 +66,18 @@ The hourly archive refresh (`slackdump-refresh`) runs `-channel-users` on every 
 ## Working method
 
 Read `slack-tui --help` and the relevant `src/*.rs` before editing. Keep the archive read-only. Record every new write on the list above. When live-write verification is necessary, use only the designated zero-member channel under the test discipline above. Then bump the plugin version, run `toolkit-link-check`, and open the PR per the contribution skill.
+
+## Look at the picture before handing over
+
+A drawn test asserts what its author believed and a fixture regeneration rubber-stamps what the code drew, so both can encode the wrong expectation: the collapse preview shipped as header / `... (n more lines)` / last line while the spec said header / first line / elision / last line, with a test asserting exactly the wrong rows (fixed in PR #387). Every UI change ends with a capture of the built binary, read against the spec:
+
+```sh
+<worktree>/gabriel.clima/bin/slack-tui --rebuild -- --help   # build this branch's source
+slack-tui-capture --binary <worktree>/gabriel.clima/bin/slack-tui \
+    --keys "g j j j Enter sleep:5" --out /tmp/slack-tui-capture/<slug>
+```
+
+The archive is what the launcher reads on this machine, `/srv/slackdumps/` by default; the pane title names the archive a conversation came from. `--keys` takes tmux key names and `sleep:N` pauses; the run kills its tmux session on exit and writes `capture.txt`, `capture.ansi`, `capture.html` and `capture.png`. Drive to the screen the change affects, and to one it must not affect. A capture showing a progress box is not the screen: rerun with a larger `--settle` or a longer `sleep:N`. In the report, quote the `capture.txt` rows that satisfy each textual spec sentence, and name the PNG for the visual ones (color, spacing, alignment); the reviewer feeds the PNG to Codex with the issue text as the claim.
 
 ## Defects in toolkit tooling go to the tracker, not into your memory
 

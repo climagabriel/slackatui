@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+# maturity: low; issues-found: 0
+"""slack-tui-capture: run a slack-tui binary in a detached tmux session, drive it
+with keys, and capture what it drew as text, ANSI, HTML and a PNG.
+
+The picture is the check the tests cannot make: a drawn test asserts what its
+author believed, a fixture regeneration rubber-stamps what the code drew. This
+puts the real binary, on the real archive, in front of a reader, and in front
+of Codex through --image.
+
+usage: slack-tui-capture --keys "g j j Enter" [--binary PATH] [--size 170x50]
+                         [--settle SECS] [--out DIR] [--no-png]
+
+--keys     tmux send-keys tokens, space separated. A token `sleep:N` waits N
+           seconds before the next key; `Enter`, `Escape`, `Tab`, `Up`, `Down`
+           and other tmux key names pass through; anything else is typed.
+--binary   the launcher to run (default: slack-tui on PATH). Pass the versioned
+           plugin-cache path when the session's PATH is frozen on an older
+           release, as the slack-tui-developer agent prose explains.
+--size     terminal columns x rows (default 170x50).
+--settle   seconds to wait after launch before the first key (default 10),
+           and after the last key before capturing (same value).
+--out      output directory (default /tmp/slack-tui-capture/<UTC timestamp>).
+--no-png   skip the Chrome render; text, ANSI and HTML are still written.
+
+Writes capture.txt (plain), capture.ansi (with SGR), capture.html, capture.png,
+prints their paths, and exits 0. The tmux session is killed on exit whatever
+happened. Exit 2 on a usage or environment error, 3 when the binary exited
+before the capture, 4 when Chrome wrote no PNG (the other three files stand).
+"""
+import argparse
+import html
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+SESSION_PREFIX = "slack-tui-capture-"
+
+BASIC = [
+    "#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
+    "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
+]
+
+
+def color256(n):
+    if n < 16:
+        return BASIC[n]
+    if n < 232:
+        n -= 16
+        r, g, b = n // 36, (n // 6) % 6, n % 6
+        step = [0, 95, 135, 175, 215, 255]
+        return "#%02x%02x%02x" % (step[r], step[g], step[b])
+    v = 8 + (n - 232) * 10
+    return "#%02x%02x%02x" % (v, v, v)
+
+
+def ansi_to_html(ansi, cols):
+    """A small SGR interpreter: bold, dim, italic, underline, reverse, 16/256/
+    truecolor foreground and background, reset. Everything else is dropped.
+    One div per row, spans inside it; a span is an inline-block the height of
+    the row so its background fills the row, and a row never wraps."""
+    state = {"fg": None, "bg": None, "bold": False, "dim": False, "ul": False, "it": False, "rev": False}
+
+    def style():
+        fg = state["fg"] or "#d0d0d0"
+        bg = state["bg"] or "#000000"
+        if state["rev"]:
+            fg, bg = bg, fg
+        css = [f"color:{fg}", f"background:{bg}"]
+        if state["bold"]:
+            css.append("font-weight:bold")
+        if state["dim"]:
+            # Faint intensity dims the glyphs, never the background.
+            css[0] = "color:" + fg + "99"
+        if state["ul"]:
+            css.append("text-decoration:underline")
+        if state["it"]:
+            css.append("font-style:italic")
+        return ";".join(css)
+
+    def apply(codes):
+        k = 0
+        while k < len(codes):
+            c = codes[k]
+            if c == 0:
+                for key in state:
+                    state[key] = None if key in ("fg", "bg") else False
+            elif c == 1:
+                state["bold"] = True
+            elif c == 2:
+                state["dim"] = True
+            elif c == 3:
+                state["it"] = True
+            elif c == 4:
+                state["ul"] = True
+            elif c == 7:
+                state["rev"] = True
+            elif c == 22:
+                state["bold"] = state["dim"] = False
+            elif c == 23:
+                state["it"] = False
+            elif c == 24:
+                state["ul"] = False
+            elif c == 27:
+                state["rev"] = False
+            elif 30 <= c <= 37:
+                state["fg"] = BASIC[c - 30]
+            elif 90 <= c <= 97:
+                state["fg"] = BASIC[c - 90 + 8]
+            elif 40 <= c <= 47:
+                state["bg"] = BASIC[c - 40]
+            elif 100 <= c <= 107:
+                state["bg"] = BASIC[c - 100 + 8]
+            elif c == 39:
+                state["fg"] = None
+            elif c == 49:
+                state["bg"] = None
+            elif c in (38, 48) and k + 1 < len(codes):
+                key = "fg" if c == 38 else "bg"
+                if codes[k + 1] == 5 and k + 2 < len(codes):
+                    state[key] = color256(codes[k + 2])
+                    k += 2
+                elif codes[k + 1] == 2 and k + 4 < len(codes):
+                    state[key] = "#%02x%02x%02x" % tuple(codes[k + 2:k + 5])
+                    k += 4
+            k += 1
+
+    pattern = re.compile(r"\x1b\[([0-9;]*)m")
+    rows = []
+    for line in ansi.split("\n"):
+        parts = []
+        pos = 0
+        for m in pattern.finditer(line):
+            if m.start() > pos:
+                parts.append(f'<span style="{style()}">{html.escape(line[pos:m.start()])}</span>')
+            pos = m.end()
+            apply([int(c) if c else 0 for c in m.group(1).split(";")] or [0])
+        if pos < len(line):
+            parts.append(f'<span style="{style()}">{html.escape(line[pos:])}</span>')
+        rows.append(f'<div class="r">{"".join(parts)}</div>')
+    body = "\n".join(rows)
+    return (
+        "<!doctype html><meta charset=utf-8><style>"
+        "body{margin:0;background:#000}"
+        ".t{display:inline-block;padding:8px;font:14px/17px 'DejaVu Sans Mono',monospace;"
+        f"color:#d0d0d0;background:#000;min-width:{cols}ch}}"
+        ".r{white-space:pre;height:17px}"
+        ".r span{display:inline-block;height:17px;line-height:17px;vertical-align:top;white-space:pre}"
+        f"</style><div class=t>{body}</div>"
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--keys", default="")
+    ap.add_argument("--binary", default="slack-tui")
+    ap.add_argument("--size", default="170x50")
+    ap.add_argument("--settle", type=float, default=10.0)
+    ap.add_argument("--out")
+    ap.add_argument("--no-png", action="store_true")
+    ap.add_argument("--help", "-h", action="store_true")
+    args = ap.parse_args()
+    if args.help:
+        print(__doc__.strip())
+        return 0
+    try:
+        cols, rows = (int(v) for v in args.size.lower().split("x"))
+    except ValueError:
+        print(f"--size must be COLSxROWS, got {args.size!r}", file=sys.stderr)
+        return 2
+    binary = shutil.which(args.binary) or args.binary
+    if not os.access(binary, os.X_OK):
+        print(f"{args.binary}: not executable", file=sys.stderr)
+        return 2
+    if not shutil.which("tmux"):
+        print("tmux is not installed", file=sys.stderr)
+        return 2
+    chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+    if not args.no_png and not chrome:
+        print("no Chrome on PATH; pass --no-png", file=sys.stderr)
+        return 2
+    out = os.path.abspath(args.out or os.path.join("/tmp/slack-tui-capture", datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")))
+    os.makedirs(out, exist_ok=True)
+    session = SESSION_PREFIX + str(os.getpid())
+
+    def tmux(*a, check=True, capture=False):
+        return subprocess.run(["tmux", *a], check=check, capture_output=capture, text=True)
+
+    try:
+        tmux("new-session", "-d", "-s", session, "-x", str(cols), "-y", str(rows), binary)
+        time.sleep(args.settle)
+        for token in args.keys.split():
+            if token.startswith("sleep:"):
+                time.sleep(float(token[6:]))
+                continue
+            tmux("send-keys", "-t", session, token)
+            time.sleep(0.3)
+        if args.keys.strip():
+            time.sleep(args.settle)
+        alive = tmux("has-session", "-t", session, check=False).returncode == 0
+        if not alive:
+            print("the binary exited before the capture", file=sys.stderr)
+            return 3
+        plain = tmux("capture-pane", "-t", session, "-p", capture=True).stdout
+        ansi = tmux("capture-pane", "-t", session, "-p", "-e", capture=True).stdout
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+    paths = {}
+    for name, text in (("capture.txt", plain), ("capture.ansi", ansi)):
+        p = os.path.join(out, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        paths[name] = p
+    page = ansi_to_html(ansi, cols)
+    p = os.path.join(out, "capture.html")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(page)
+    paths["capture.html"] = p
+    if not args.no_png:
+        png = os.path.join(out, "capture.png")
+        # A PNG from an earlier run must not pass for this one.
+        if os.path.exists(png):
+            os.remove(png)
+        # DejaVu Sans Mono at 14 px is 8.43 px a column; a little over so the
+        # last column is never clipped, the surplus is black margin.
+        width = int(cols * 8.5) + 24
+        height = rows * 17 + 16
+        try:
+            subprocess.run(
+                [chrome, "--headless=new", "--no-sandbox", "--disable-gpu", "--hide-scrollbars",
+                 f"--window-size={width},{height}", f"--screenshot={png}", "file://" + p],
+                check=False, capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            print("Chrome did not finish within 60 s", file=sys.stderr)
+        if os.path.exists(png):
+            paths["capture.png"] = png
+        else:
+            print("Chrome wrote no PNG; the text, ANSI and HTML captures stand", file=sys.stderr)
+            for name in ("capture.txt", "capture.ansi", "capture.html"):
+                print(paths[name])
+            return 4
+    for name in ("capture.txt", "capture.ansi", "capture.html", "capture.png"):
+        if name in paths:
+            print(paths[name])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
