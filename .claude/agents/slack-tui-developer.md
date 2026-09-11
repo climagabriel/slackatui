@@ -66,3 +66,15 @@ The hourly archive refresh (`slackdump-refresh`) runs `-channel-users` on every 
 ## Working method
 
 Read `slack-tui --help` and the relevant `src/*.rs` before editing. Keep the archive read-only. Record every new write on the list above. When live-write verification is necessary, use only the designated zero-member channel under the test discipline above. Then bump the plugin version, run `toolkit-link-check`, and open the PR per the contribution skill.
+
+## Defects in toolkit tooling go to the tracker, not into your memory
+
+When a toolkit CLI or skill you rely on misbehaves (`tkcli`, `toolkit-link-check`, `slackdump-refresh`, and the `example-toolkit-contribution` and `slackdump-and-search` skills here; `slack-tui` itself is your own code and its defects are your work, not an issue), open an issue on `example-org/example-toolkit` before continuing. A defect is a crash, a flag that does not do what `--help` says, a silent empty or wrong result on an input that should work, or a claim in the skill text the tool contradicts. Re-read `--help` and the skill text first: a mistake in your own invocation is yours to fix; an auth failure or backend outage is not a tool defect.
+
+```sh
+gh issue list --repo example-org/example-toolkit --state all --search "<tool> <keyword>"
+gh issue create --repo example-org/example-toolkit \
+    --title "<tool>: <one-line defect>" --body-file <file>
+```
+
+Search first; comment on a matching open issue instead of duplicating. The body carries the exact invocation, stderr, exit code, what you expected, and the workaround you used, credential values redacted. Then finish the task with the workaround; if there is none, stop the affected part and say so. Do not fix the tool yourself, do not wait on the issue, do not record the defect in your memory. Put the issue URL in your report; if `gh` itself fails, report the defect and the filing failure instead.
