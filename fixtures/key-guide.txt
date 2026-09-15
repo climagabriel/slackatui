@@ -1,0 +1,60 @@
+  0 |┌ 2 · auto · by recent ───┐┌ messages ───────────────────────────────────────────────────────────────────────┐|
+    0..27:fg=Cyan,bg=Reset,ul=Reset 27..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  1 |│SAVED ┌ keys ────────────────────────────────────────────────────────────────────────────────────────┐      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..6:fg=Reset,bg=Reset,ul=Reset,+BOLD 6..7:fg=Reset,bg=Reset,ul=Reset 7..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  2 |│SENT  │  j, down                      move; at the top of the channel, moving up loads older messages│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..5:fg=Reset,bg=Reset,ul=Reset,+BOLD 5..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  3 |│MENTIO│  k, up                        move up                                                        │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset,+BOLD 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  4 |│THREAD│  ctrl-d, f                    half a page down                                               │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset,+BOLD 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  5 |│UNREAD│  ctrl-u, b                    half a page up                                                 │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset,+BOLD 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  6 |│──────│  ctrl-f, page-down            a full page down                                               │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset,+DIM 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  7 |│#one  │  page-up                      a full page up                                                 │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Black,bg=White,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  8 |│@U1   │  g, home                      oldest message of the channel, top of the list                 │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..4:fg=Reset,bg=Reset,ul=Reset,+DIM 4..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+  9 |│──────│  G, end                       newest message of the channel, end of the list                 │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset,+DIM 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 10 |│      │  tab                          the other pane                                                 │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 11 |│      │  enter, l, right              open conversation; l/Right opens a known thread, expands a coll│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 12 |│      │  h, left                      back: close the thread, search or raw view; then the pane      │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 13 |│      │  esc                          in the list, drop the filter and then close the conversation: t│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 14 |│      │  /                            a command, Tab completes it and its argument: keys rebinds what│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 15 |│      │  —                            rebind these keys (also /keys)                                 │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 16 |│      │  o                            from a search hit or a thread: show the message in the channel │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 17 |│      │  d                            go to a date (YYYY-MM-DD)                                      │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 18 |│      │  T                            channel tabs: canvases, files and bookmarks                    │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 19 |│      │  ctrl-t                       threads you took part in or were mentioned in, newest reply fir│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 20 |│      │  i                            the selected message's images, full pane; j/k between them     │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 21 |│      │  I                            inline image thumbnails on/off                                 │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 22 |│      │  c                            write a message: to the open conversation, into the open thread│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 23 |│      │  >                            quote the selected message and answer under it, in one new mess│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 24 |│      │  D                            delete the selected message, which Slack allows only for your o│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 25 |│      │  e                            view reactions on the selected message: cached counts and known│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 26 |│      │  m                            mark read: the highlighted conversation, or the open one at its│      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 27 |│      │  M                            mark unread from the message under the cursor (the highlighted │      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..7:fg=Reset,bg=Reset,ul=Reset 7..39:fg=Cyan,bg=Reset,ul=Reset 39..102:fg=Reset,bg=Reset,ul=Reset 102..103:fg=Cyan,bg=Reset,ul=Reset 103..109:fg=Reset,bg=Reset,ul=Reset 109..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 28 |└──────└──────────────────────────────────────────────────────────────────────────────────────────────┘──────┘|
+    0..103:fg=Cyan,bg=Reset,ul=Reset 103..110:fg=DarkGray,bg=Reset,ul=Reset,+DIM
+ 29 | UTC archive loaded                                                                                           |
+    0..5:fg=Reset,bg=Reset,ul=Reset,+DIM 5..21:fg=Yellow,bg=Reset,ul=Reset 21..110:fg=Reset,bg=Reset,ul=Reset

@@ -1,0 +1,756 @@
+//! Local conversation visibility preferences and their menu; no Slack mutations.
+//!
+//! Two different preferences live in this file, one word apart in English and
+//! deliberately far apart on disk. `Settings` is the `Ctrl-Shift-P` picker:
+//! *which conversations* the list shows. `ConversationsPaneVisibility` is
+//! `Ctrl-B`: *whether the pane itself* is drawn. They are saved under separate
+//! keys of the same per-workspace object, by writers that merge rather than
+//! replace, so neither can drop the other.
+use crate::archive::{Conv, Kind};
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+/// The `Ctrl-B` state's key in a workspace's settings. Spelled out in full:
+/// `hidden_categories` next door is about conversations, not about the pane.
+const VISIBILITY_KEY: &str = "conversations_pane_visibility";
+
+/// When the conversations pane appears. `Ctrl-B` advances one step and wraps;
+/// the third state is not a flag the key sets but a question asked at every
+/// draw, so entering and leaving a conversation moves the pane by itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ConversationsPaneVisibility {
+    #[default]
+    AlwaysShown,
+    AlwaysHidden,
+    /// Shown while the conversation list has the focus, hidden while a
+    /// conversation is being read.
+    AutoHideInsideConversation,
+}
+
+impl ConversationsPaneVisibility {
+    const ALL: [Self; 3] = [
+        Self::AlwaysShown,
+        Self::AlwaysHidden,
+        Self::AutoHideInsideConversation,
+    ];
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::AlwaysShown => Self::AlwaysHidden,
+            Self::AlwaysHidden => Self::AutoHideInsideConversation,
+            Self::AutoHideInsideConversation => Self::AlwaysShown,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AlwaysShown => "conversations pane: always shown",
+            Self::AlwaysHidden => "conversations pane: always hidden",
+            Self::AutoHideInsideConversation => {
+                "conversations pane: auto-hide inside a conversation"
+            }
+        }
+    }
+
+    /// How the state is spelled in the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::AlwaysShown => "always_shown",
+            Self::AlwaysHidden => "always_hidden",
+            Self::AutoHideInsideConversation => "auto_hide_inside_conversation",
+        }
+    }
+}
+
+/// The saved state, or the default. A key that is missing, misspelled, or of
+/// the wrong type is not worth refusing to start over, and is not worth
+/// dropping the picker's preferences for either, so it reads as the default.
+pub fn load_visibility(path: Option<&Path>, workspace: &str) -> ConversationsPaneVisibility {
+    let saved = path
+        .and_then(|path| read(path).ok())
+        .and_then(|doc| doc.get(workspace)?.get(VISIBILITY_KEY)?.as_str().map(str::to_string));
+    saved
+        .and_then(|key| {
+            ConversationsPaneVisibility::ALL
+                .into_iter()
+                .find(|state| state.key() == key)
+        })
+        .unwrap_or_default()
+}
+
+/// Writes the state, leaving every other preference in the file alone.
+pub fn save_visibility(
+    path: Option<&Path>,
+    workspace: &str,
+    visibility: ConversationsPaneVisibility,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    update(path, workspace, |entry| {
+        entry.insert(VISIBILITY_KEY.into(), json!(visibility.key()));
+    })
+}
+
+/// Read the document, let `edit` change this workspace's object, write it
+/// back. Keys neither writer knows about survive, and a file that is not a
+/// settings document is left exactly as it is rather than replaced.
+fn update(
+    path: &Path,
+    workspace: &str,
+    edit: impl FnOnce(&mut Map<String, Value>),
+) -> Result<(), String> {
+    let mut doc = read(path)?;
+    let object = doc.as_object_mut().ok_or("invalid settings object")?;
+    let mut entry = match object.remove(workspace) {
+        Some(Value::Object(entry)) => entry,
+        _ => Map::new(),
+    };
+    edit(&mut entry);
+    object.insert(workspace.into(), Value::Object(entry));
+    save(path, &doc).map_err(|e| e.to_string())
+}
+
+pub const CATEGORIES: [&str; 6] = [
+    "Public channels",
+    "Private channels",
+    "Direct messages",
+    "Group DMs",
+    "Archived conversations",
+    "Muted",
+];
+const KEYS: [&str; 6] = ["public", "private", "dm", "group", "archived", "muted"];
+
+pub fn category(c: &Conv) -> usize {
+    if c.archived {
+        return 4;
+    }
+    match c.kind {
+        Kind::Channel => 0,
+        Kind::Private => 1,
+        Kind::Im => 2,
+        Kind::Mpim => 3,
+    }
+}
+
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Settings {
+    pub hidden: BTreeSet<String>,
+    pub overrides: BTreeMap<String, bool>,
+    pub number: NumberColumn,
+    pub only_muted: bool,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub enum NumberColumn {
+    #[default]
+    Sort,
+    Messages,
+    Mine,
+    Activity,
+    Mentions,
+    Unread,
+    Hidden,
+}
+
+impl NumberColumn {
+    const ALL: [Self; 7] = [
+        Self::Sort,
+        Self::Messages,
+        Self::Mine,
+        Self::Activity,
+        Self::Mentions,
+        Self::Unread,
+        Self::Hidden,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Sort => "sort",
+            Self::Messages => "messages",
+            Self::Mine => "mine",
+            Self::Activity => "activity",
+            Self::Mentions => "mentions",
+            Self::Hidden => "hidden",
+            Self::Unread => "unread",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sort => "Follow sorting (current behavior)",
+            Self::Messages => "Cached messages (not a Slack-wide total)",
+            Self::Mine => "Your cached messages",
+            Self::Activity => "Your recency-weighted activity score",
+            Self::Mentions => "Mentions (last known count)",
+            Self::Hidden => "Hidden",
+            Self::Unread => "Unread messages (1–9, then 9+)",
+        }
+    }
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::Sort => "auto",
+            Self::Messages => "cached msgs",
+            Self::Mine => "my msgs",
+            Self::Activity => "score",
+            Self::Mentions => "mentions",
+            Self::Hidden => "no number",
+            Self::Unread => "unread msgs",
+        }
+    }
+    pub fn next(self) -> Self {
+        Self::ALL[(Self::ALL.iter().position(|&n| n == self).unwrap() + 1) % Self::ALL.len()]
+    }
+    pub fn previous(self) -> Self {
+        Self::ALL[(Self::ALL.iter().position(|&n| n == self).unwrap() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+    pub fn value(self, c: &Conv, sort_mine: bool) -> Option<i64> {
+        match self {
+            Self::Hidden => None,
+            Self::Sort => Some(if sort_mine {
+                c.score.round() as i64
+            } else {
+                c.msgs
+            }),
+            Self::Mentions => Some(c.mentions),
+            Self::Unread => if c.unread { c.unread_count.filter(|count| *count > 0) } else { None },
+            _ if c.live_only => None,
+            Self::Messages => Some(c.msgs),
+            Self::Mine => Some(c.mine),
+            Self::Activity => Some(c.score.round() as i64),
+        }
+    }
+}
+
+impl Settings {
+    pub fn visible(&self, c: &Conv) -> bool {
+        self.visible_id(&c.id, category(c), c.muted)
+    }
+    pub fn visible_id(&self, id: &str, category: usize, muted: bool) -> bool {
+        if self.only_muted {
+            return muted && self.overrides.get(id).copied().unwrap_or(true);
+        }
+        self.overrides.get(id).copied().unwrap_or(
+            !self.hidden.contains(KEYS[category]) && !(muted && self.hidden.contains("muted")),
+        )
+    }
+    pub fn toggle_category(&mut self, category: usize) {
+        if category == 5 {
+            if self.only_muted {
+                self.only_muted = false;
+            } else if self.hidden.remove("muted") {
+                self.only_muted = true;
+            } else {
+                self.hidden.insert("muted".into());
+            }
+            return;
+        }
+        if !self.hidden.remove(KEYS[category]) {
+            self.hidden.insert(KEYS[category].into());
+        }
+    }
+    pub fn cycle(&mut self, id: &str) {
+        match self.overrides.get(id) {
+            None => {
+                self.overrides.insert(id.into(), true);
+            }
+            Some(true) => {
+                self.overrides.insert(id.into(), false);
+            }
+            Some(false) => {
+                self.overrides.remove(id);
+            }
+        }
+    }
+    pub fn load(path: Option<&Path>, workspace: &str) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let doc = read(path)?;
+        let Some(v) = doc.get(workspace) else {
+            return Ok(Self::default());
+        };
+        let hidden = v["hidden_categories"]
+            .as_array()
+            .ok_or("invalid hidden_categories")?;
+        let overrides = v["overrides"].as_object().ok_or("invalid overrides")?;
+        let mut settings = Self::default();
+        if let Some(number) = v.get("number") {
+            settings.number = NumberColumn::ALL
+                .into_iter()
+                .find(|n| Some(n.key()) == number.as_str())
+                .ok_or("invalid number column")?;
+        }
+        if let Some(only_muted) = v.get("only_muted") {
+            settings.only_muted = only_muted.as_bool().ok_or("invalid only_muted")?;
+        }
+        for value in hidden {
+            let key = value
+                .as_str()
+                .filter(|k| KEYS.contains(k))
+                .ok_or("invalid category")?;
+            settings.hidden.insert(key.into());
+        }
+        for (id, value) in overrides {
+            settings.overrides.insert(
+                id.clone(),
+                value.as_bool().ok_or("invalid visibility override")?,
+            );
+        }
+        Ok(settings)
+    }
+    /// Merges into the workspace's object: the `Ctrl-B` state is saved beside
+    /// these keys by a different writer and must survive a picker save.
+    pub fn save(&self, path: Option<&Path>, workspace: &str) -> Result<(), String> {
+        let Some(path) = path else {
+            return Ok(());
+        };
+        update(path, workspace, |entry| {
+            entry.insert("hidden_categories".into(), json!(self.hidden));
+            entry.insert("overrides".into(), json!(self.overrides));
+            entry.insert("number".into(), json!(self.number.key()));
+            entry.insert("only_muted".into(), json!(self.only_muted));
+        })
+    }
+}
+
+fn read(path: &Path) -> Result<Value, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let doc: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if !doc.is_object() {
+                return Err("invalid settings object".into());
+            }
+            Ok(doc)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn save(path: &Path, value: &Value) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let part = path.with_extension(format!("{}.{}.tmp", std::process::id(), stamp));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&part)?;
+    let result = (|| {
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        std::fs::rename(&part, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(part);
+    }
+    result
+}
+
+pub struct Entry {
+    pub id: String,
+    pub name: String,
+    pub category: usize,
+    pub muted: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn categories_muted_and_individual_exceptions() {
+        let mut s = Settings::default();
+        for cat in 0..5 {
+            assert!(s.visible_id("C1", cat, true));
+        }
+        s.toggle_category(5);
+        assert!(!s.visible_id("C1", 0, true));
+        assert!(s.visible_id("C1", 0, false));
+        s.toggle_category(0);
+        assert!(!s.visible_id("C1", 0, false));
+        s.cycle("C1");
+        assert!(s.visible_id("C1", 0, true));
+        s.cycle("C1");
+        assert!(!s.visible_id("C1", 1, false));
+        s.cycle("C1");
+        assert!(s.visible_id("C1", 1, false));
+        assert!(!s.visible_id("C2", 0, false));
+    }
+
+    #[test]
+    fn muted_only_menu_ignores_categories_but_keeps_individual_hides() {
+        let mut menu = Menu::new(Settings::default(), &[]);
+        for category in 0..5 {
+            menu.settings.toggle_category(category);
+        }
+        menu.cursor = 7;
+        menu.toggle(); // Include -> Hide.
+        assert!(menu.rows()[7].starts_with("Muted: Hide"));
+        menu.toggle(); // Hide -> Only.
+        assert!(menu.rows()[7].starts_with("Muted: Only"));
+        for category in 0..5 {
+            assert!(menu.settings.visible_id("muted", category, true));
+            assert!(!menu.settings.visible_id("unmuted", category, false));
+        }
+        menu.settings.cycle("unmuted");
+        assert!(!menu.settings.visible_id("unmuted", 0, false));
+        menu.settings.cycle("muted");
+        menu.settings.cycle("muted");
+        assert!(!menu.settings.visible_id("muted", 0, true));
+        menu.toggle(); // Only -> Include; category preferences survive.
+        assert!(!menu.settings.only_muted);
+        assert!(menu.rows()[7].starts_with("Muted: Include"));
+        assert!(!menu.settings.visible_id("other", 0, true));
+        menu.cursor = 1;
+        menu.toggle();
+        assert_eq!(menu.settings, Settings::default());
+    }
+
+    /// A temporary directory of this test's own, removed by the caller.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "slack-pane-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// Each state survives a save and load, per workspace, and the two writers
+    /// of this file leave each other's keys alone.
+    #[test]
+    fn visibility_round_trips_every_state_beside_the_picker_settings() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("visibility");
+        let path = dir.join("conversations-pane.json");
+
+        let mut picker = Settings::default();
+        picker.toggle_category(0);
+        picker.cycle("C1");
+        picker.number = NumberColumn::Mine;
+        picker.save(Some(&path), "workspace-a").unwrap();
+
+        for state in ConversationsPaneVisibility::ALL {
+            save_visibility(Some(&path), "workspace-a", state).unwrap();
+            assert_eq!(load_visibility(Some(&path), "workspace-a"), state);
+            // The picker's preferences are untouched by a Ctrl-B save.
+            assert_eq!(Settings::load(Some(&path), "workspace-a").unwrap(), picker);
+            // And a picker save does not drop the Ctrl-B state.
+            picker.save(Some(&path), "workspace-a").unwrap();
+            assert_eq!(load_visibility(Some(&path), "workspace-a"), state);
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // One workspace's pane says nothing about another's.
+        save_visibility(
+            Some(&path),
+            "workspace-a",
+            ConversationsPaneVisibility::AlwaysHidden,
+        )
+        .unwrap();
+        assert_eq!(
+            load_visibility(Some(&path), "workspace-b"),
+            ConversationsPaneVisibility::AlwaysShown
+        );
+        save_visibility(
+            Some(&path),
+            "workspace-b",
+            ConversationsPaneVisibility::AutoHideInsideConversation,
+        )
+        .unwrap();
+        assert_eq!(
+            load_visibility(Some(&path), "workspace-a"),
+            ConversationsPaneVisibility::AlwaysHidden
+        );
+        // With no configuration directory there is nothing to save or load.
+        assert_eq!(
+            load_visibility(None, "workspace-a"),
+            ConversationsPaneVisibility::AlwaysShown
+        );
+        save_visibility(None, "workspace-a", ConversationsPaneVisibility::AlwaysHidden).unwrap();
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Nothing about this key may stop the client from starting, and nothing
+    /// about it may cost the user their other preferences.
+    #[test]
+    fn visibility_falls_back_and_never_costs_other_preferences() {
+        let dir = scratch("visibility-fallback");
+        let path = dir.join("conversations-pane.json");
+
+        // A file written before this key existed: the old default, and the
+        // picker's preferences still load.
+        std::fs::write(
+            &path,
+            r#"{"old":{"hidden_categories":["muted"],"overrides":{"C1":false},"number":"mine","only_muted":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_visibility(Some(&path), "old"),
+            ConversationsPaneVisibility::AlwaysShown
+        );
+        let old = Settings::load(Some(&path), "old").unwrap();
+        assert_eq!(old.number, NumberColumn::Mine);
+        assert_eq!(old.overrides.get("C1"), Some(&false));
+
+        // A value this build does not know, and a value of the wrong type.
+        for bad in [r#""sometimes""#, "17", "null", r#"{"mode":"always_shown"}"#] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"old":{{"hidden_categories":[],"overrides":{{}},"conversations_pane_visibility":{bad}}}}}"#),
+            )
+            .unwrap();
+            assert_eq!(
+                load_visibility(Some(&path), "old"),
+                ConversationsPaneVisibility::AlwaysShown,
+                "{bad}"
+            );
+            assert!(Settings::load(Some(&path), "old").is_ok(), "{bad}");
+        }
+
+        // A corrupt file is read as the default and is never overwritten.
+        std::fs::write(&path, "broken").unwrap();
+        assert_eq!(
+            load_visibility(Some(&path), "old"),
+            ConversationsPaneVisibility::AlwaysShown
+        );
+        assert!(
+            save_visibility(Some(&path), "old", ConversationsPaneVisibility::AlwaysHidden).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+
+        // A whole document of the wrong shape, and a path that cannot be
+        // written at all: an error, never a panic.
+        std::fs::write(&path, "[1,2]").unwrap();
+        assert!(
+            save_visibility(Some(&path), "old", ConversationsPaneVisibility::AlwaysHidden).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1,2]");
+        let inside_a_file = path.join("conversations-pane.json");
+        assert_eq!(
+            load_visibility(Some(&inside_a_file), "old"),
+            ConversationsPaneVisibility::AlwaysShown
+        );
+        assert!(save_visibility(
+            Some(&inside_a_file),
+            "old",
+            ConversationsPaneVisibility::AlwaysHidden
+        )
+        .is_err());
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn persists_per_workspace_and_preserves_corrupt_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("slack-pane-test-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut a = Settings::default();
+        a.toggle_category(5);
+        a.cycle("C1");
+        a.number = NumberColumn::Mine;
+        a.toggle_category(5);
+        assert!(a.only_muted);
+        a.save(Some(&path), "workspace-a").unwrap();
+        Settings::default()
+            .save(Some(&path), "workspace-b")
+            .unwrap();
+        assert_eq!(Settings::load(Some(&path), "workspace-a").unwrap(), a);
+        assert_eq!(
+            Settings::load(Some(&path), "workspace-b").unwrap(),
+            Settings::default()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for number in NumberColumn::ALL {
+            a.number = number;
+            a.save(Some(&path), "workspace-a").unwrap();
+            assert_eq!(
+                Settings::load(Some(&path), "workspace-a").unwrap().number,
+                number
+            );
+        }
+        std::fs::write(
+            &path,
+            r#"{"old":{"hidden_categories":["muted"],"overrides":{"C1":false}}}"#,
+        )
+        .unwrap();
+        let old = Settings::load(Some(&path), "old").unwrap();
+        assert_eq!(old.number, NumberColumn::Sort);
+        assert!(!old.only_muted);
+        assert!(old.hidden.contains("muted"));
+        assert_eq!(old.overrides.get("C1"), Some(&false));
+        std::fs::write(&path, "broken").unwrap();
+        assert!(a.save(Some(&path), "workspace-a").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+}
+pub struct Menu {
+    pub settings: Settings,
+    pub entries: Vec<Entry>,
+    pub query: String,
+    pub cursor: usize,
+}
+impl Menu {
+    pub fn new(settings: Settings, convs: &[Conv]) -> Self {
+        let mut entries = BTreeMap::new();
+        for c in convs {
+            if !entries.contains_key(&c.id) || !c.live_only {
+                entries.insert(
+                    c.id.clone(),
+                    Entry {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        category: category(c),
+                        muted: c.muted,
+                    },
+                );
+            }
+        }
+        let mut entries: Vec<_> = entries.into_values().collect();
+        entries.sort_by_key(|e| e.name.to_lowercase());
+        Self {
+            settings,
+            entries,
+            query: String::new(),
+            cursor: 1,
+        }
+    }
+    pub fn matching(&self) -> Vec<usize> {
+        let q = self.query.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.name.to_lowercase().contains(&q) || e.id.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+    pub fn rows(&self) -> Vec<String> {
+        let mut rows = vec![format!("Search: {}", self.query), "Reset to default — show everything".into()];
+        for (i, label) in CATEGORIES.iter().enumerate() {
+            if i == 5 {
+                let mode = if self.settings.only_muted {
+                    "Only (all categories; individual hides apply)"
+                } else if self.settings.hidden.contains("muted") {
+                    "Hide"
+                } else {
+                    "Include"
+                };
+                rows.push(format!("Muted: {mode} · Space cycles include → hide → only"));
+                continue;
+            }
+            rows.push(format!(
+                "[{}] {label}",
+                if self.settings.hidden.contains(KEYS[i]) {
+                    " "
+                } else {
+                    "x"
+                }
+            ));
+        }
+        rows.push(format!(
+            "Number column: {} · Space cycles",
+            self.settings.number.label()
+        ));
+        for i in self.matching() {
+            let e = &self.entries[i];
+            let choice = match self.settings.overrides.get(&e.id) {
+                None => "category",
+                Some(true) => "show",
+                Some(false) => "hide",
+            };
+            rows.push(format!(
+                "[{}] {:8} {} · {}{}",
+                if self.settings.visible_id(&e.id, e.category, e.muted) {
+                    "x"
+                } else {
+                    " "
+                },
+                choice,
+                e.name,
+                e.id,
+                if e.muted { " · muted" } else { "" }
+            ));
+        }
+        rows
+    }
+    pub fn set(&mut self, enabled: bool) {
+        match self.cursor {
+            0 => {},
+            1 if enabled => self.settings = Settings::default(),
+            1 => {},
+            2..=6 => {
+                let key = KEYS[self.cursor - 2];
+                if enabled {
+                    self.settings.hidden.remove(key);
+                } else {
+                    self.settings.hidden.insert(key.into());
+                }
+            }
+            7 => {
+                self.settings.toggle_category(5);
+                if !enabled {
+                    self.settings.toggle_category(5);
+                }
+            }
+            8 => self.settings.number = if enabled {
+                self.settings.number.next()
+            } else {
+                self.settings.number.previous()
+            },
+            _ => {
+                if let Some(&i) = self.matching().get(self.cursor - 9) {
+                    self.settings.overrides.insert(self.entries[i].id.clone(), enabled);
+                }
+            }
+        }
+    }
+    pub fn toggle(&mut self) {
+        match self.cursor {
+            0 => {},
+            1 => self.settings = Settings::default(),
+            2..=7 => self.settings.toggle_category(self.cursor - 2),
+            8 => self.settings.number = self.settings.number.next(),
+            _ => {
+                if let Some(&i) = self.matching().get(self.cursor - 9) {
+                    self.settings.cycle(&self.entries[i].id);
+                }
+            }
+        }
+    }
+}

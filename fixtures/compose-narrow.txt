@@ -1,0 +1,24 @@
+  0 |┌ 2 · auto · by recen┐┌ #one · channel · 0 loade…┐|
+    0..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..50:fg=Cyan,bg=Reset,ul=Reset
+  1 |│SAVED               ││                          │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..6:fg=Reset,bg=Reset,ul=Reset,+BOLD 6..21:fg=Reset,bg=Reset,ul=Reset 21..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..23:fg=Cyan,bg=Reset,ul=Reset 23..49:fg=Reset,bg=Reset,ul=Reset 49..50:fg=Cyan,bg=Reset,ul=Reset
+  2 |│SENT                ││                          │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..5:fg=Reset,bg=Reset,ul=Reset,+BOLD 5..21:fg=Reset,bg=Reset,ul=Reset 21..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..23:fg=Cyan,bg=Reset,ul=Reset 23..49:fg=Reset,bg=Reset,ul=Reset 49..50:fg=Cyan,bg=Reset,ul=Reset
+  3 |│MENTIONS            ││                          │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..9:fg=Reset,bg=Reset,ul=Reset,+BOLD 9..21:fg=Reset,bg=Reset,ul=Reset 21..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..23:fg=Cyan,bg=Reset,ul=Reset 23..49:fg=Reset,bg=Reset,ul=Reset 49..50:fg=Cyan,bg=Reset,ul=Reset
+  4 |│THREADS             ││                          │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..8:fg=Reset,bg=Reset,ul=Reset,+BOLD 8..21:fg=Reset,bg=Reset,ul=Reset 21..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..23:fg=Cyan,bg=Reset,ul=Reset 23..49:fg=Reset,bg=Reset,ul=Reset 49..50:fg=Cyan,bg=Reset,ul=Reset
+  5 |│UNREADS             ││                          │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..8:fg=Reset,bg=Reset,ul=Reset,+BOLD 8..21:fg=Reset,bg=Reset,ul=Reset 21..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..23:fg=Cyan,bg=Reset,ul=Reset 23..49:fg=Reset,bg=Reset,ul=Reset 49..50:fg=Cyan,bg=Reset,ul=Reset
+  6 |│────────────────────││                          │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..21:fg=Reset,bg=Reset,ul=Reset,+DIM 21..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..23:fg=Cyan,bg=Reset,ul=Reset 23..49:fg=Reset,bg=Reset,ul=Reset 49..50:fg=Cyan,bg=Reset,ul=Reset
+  7 |│#one               0││                          │|
+    0..1:fg=DarkGray,bg=Reset,ul=Reset,+DIM 1..5:fg=Black,bg=Gray,ul=Reset,+BOLD 5..21:fg=Black,bg=Gray,ul=Reset 21..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..23:fg=Cyan,bg=Reset,ul=Reset 23..49:fg=Reset,bg=Reset,ul=Reset 49..50:fg=Cyan,bg=Reset,ul=Reset
+  8 |└────────────────────┘└──────────────────────────┘|
+    0..22:fg=DarkGray,bg=Reset,ul=Reset,+DIM 22..50:fg=Cyan,bg=Reset,ul=Reset
+  9 |┌ message to #one ── Enter send · Ctrl-j newline ┐|
+    0..20:fg=Cyan,bg=Reset,ul=Reset 20..49:fg=Cyan,bg=Reset,ul=Reset,+DIM 49..50:fg=Cyan,bg=Reset,ul=Reset
+ 10 |│a draft                                         │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..49:fg=Reset,bg=Reset,ul=Reset 49..50:fg=Cyan,bg=Reset,ul=Reset
+ 11 |└────────────────────────────────────────────────┘|
+    0..50:fg=Cyan,bg=Reset,ul=Reset

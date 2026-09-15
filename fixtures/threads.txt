@@ -1,0 +1,60 @@
+  0 |┌ threads you took part in or were mentioned in · 1 · first and last message · newest reply first ─────────────────────┐|
+    0..120:fg=Cyan,bg=Reset,ul=Reset
+  1 |│╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮│|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  2 |││#one  alice, bob, and 2 others                                                                                      ││|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..2:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 2..6:fg=Cyan,bg=Reset,ul=Reset,+BOLD 6..32:fg=Reset,bg=Reset,ul=Reset,+DIM 32..118:fg=Reset,bg=Reset,ul=Reset 118..119:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  3 |││Thu 1970-01-01 00:16 UTC  U1                                                                                        ││|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..2:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 2..26:fg=Reset,bg=Reset,ul=Reset,+DIM 26..28:fg=Reset,bg=Reset,ul=Reset 28..30:fg=LightBlue,bg=Reset,ul=Reset,+BOLD 30..118:fg=Reset,bg=Reset,ul=Reset 118..119:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  4 |││  the thread root                                                                                                   ││|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..2:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 2..118:fg=Reset,bg=Reset,ul=Reset 118..119:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  5 |││  … 5 more replies                                                                                                  ││|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..2:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 2..20:fg=Reset,bg=Reset,ul=Reset,+DIM 20..118:fg=Reset,bg=Reset,ul=Reset 118..119:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  6 |││Thu 1970-01-01 00:50 UTC  U1                                                                                        ││|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..2:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 2..26:fg=Reset,bg=Reset,ul=Reset,+DIM 26..28:fg=Reset,bg=Reset,ul=Reset 28..30:fg=LightBlue,bg=Reset,ul=Reset,+BOLD 30..118:fg=Reset,bg=Reset,ul=Reset 118..119:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  7 |││  the newest reply                                                                                                  ││|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..2:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 2..118:fg=Reset,bg=Reset,ul=Reset 118..119:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  8 |│╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯│|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Rgb(112, 112, 112),bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+  9 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 10 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 11 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 12 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 13 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 14 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 15 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 16 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 17 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 18 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 19 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 20 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 21 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 22 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 23 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 24 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 25 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 26 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 27 |│                                                                                                                      │|
+    0..1:fg=Cyan,bg=Reset,ul=Reset 1..119:fg=Reset,bg=Reset,ul=Reset 119..120:fg=Cyan,bg=Reset,ul=Reset
+ 28 |└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘|
+    0..120:fg=Cyan,bg=Reset,ul=Reset
+ 29 | UTC archive loaded  /archives/C1/p1000000000                                                                           |
+    0..5:fg=Reset,bg=Reset,ul=Reset,+DIM 5..21:fg=Yellow,bg=Reset,ul=Reset 21..45:fg=Blue,bg=Reset,ul=Reset 45..120:fg=Reset,bg=Reset,ul=Reset

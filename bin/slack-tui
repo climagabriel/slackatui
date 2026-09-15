@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# maturity: low; issues-found: 3
+# slack-tui - front door for libexec/slack-tui, a Rust crate. Builds it on
+# first use into the user's cache and execs the binary; rebuilds when the
+# source changes (checksum), so a plugin update takes effect on the next run.
+# The build never lands beside the source: a plugin install is read-only and
+# replaced wholesale on update.
+#
+# Needs cargo (https://rustup.rs) and a C compiler for the bundled SQLite.
+set -euo pipefail
+
+here=$(cd "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
+src="$here/../libexec/slack-tui"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/slack-tui"
+bin="$cache/bin/slack-tui"
+stamp="$cache/source.sha256"
+
+force_rebuild=0
+debug_build=0
+prune_build_cache=0
+verbose=0
+show_help=0
+parse_launcher_flags=1
+application_arguments=()
+
+for argument in "$@"; do
+    if ((parse_launcher_flags)); then
+        case "$argument" in
+            --build-cache-prune)
+                prune_build_cache=1
+                ;;
+            --build-debug)
+                debug_build=1
+                force_rebuild=1
+                verbose=1
+                ;;
+            --build | --rebuild)
+                force_rebuild=1
+                verbose=1
+                ;;
+            --verbose | -v)
+                verbose=1
+                ;;
+            --help | -h)
+                show_help=1
+                ;;
+            --)
+                parse_launcher_flags=0
+                ;;
+            *)
+                application_arguments+=("$argument")
+                ;;
+        esac
+    else
+        application_arguments+=("$argument")
+    fi
+done
+
+if ((show_help)); then
+    cat <<'EOF'
+slack-tui launcher
+
+usage: slack-tui [LAUNCHER_FLAG ...] [APPLICATION_ARGUMENT ...]
+
+launcher flags
+  --build-cache-prune remove Cargo target artifacts and exit; retain published
+                      binaries, checksums and Slack data outside target/.
+                      Reject --build/--rebuild/--build-debug and all application
+                      arguments. --help takes precedence without pruning.
+                      Waits for builds using this launcher's lock; stop builds
+                      from older plugin releases before pruning.
+  --build, --rebuild  synonyms; force a slack-tui release rebuild and imply
+                      --verbose
+  --build-debug      always rebuild the dev profile with full debug symbols,
+                      no stripping or optimization, and unwind panics;
+                      launch with RUST_BACKTRACE=full and imply --verbose
+                      Takes precedence over --build/--rebuild when combined.
+  --verbose, -v       synonyms; also report reuse of a cached binary;
+                      do not force a rebuild
+  --help, -h          show combined help without checking cargo or building
+
+argument boundary
+  --                  stop launcher parsing; the launcher consumes it
+  Launcher flags are recognized anywhere before --. Use -- before an
+  application argument that matches a launcher flag.
+
+environment
+  SLACK_TUI_REBUILD=1  force the build step; builds always show Cargo output
+  XDG_CACHE_HOME       build cache: $XDG_CACHE_HOME/slack-tui;
+                       default: $HOME/.cache/slack-tui
+  Builds announce their reason and show Cargo progress on stderr.
+  Debug binary and checksum are cached separately from release. A plain
+  slack-tui invocation still launches release.
+
+launcher-defined exit codes
+  0  combined help printed or build cache pruned
+  1  application help could not be read
+  2  missing cargo/flock, incompatible prune arguments, or unsafe target
+  Cargo failures and application statuses pass through and may reuse these
+  numbers.
+
+examples
+  slack-tui --build-cache-prune
+  slack-tui --build
+  slack-tui --build-debug
+  SLACK_TUI_REBUILD=1 slack-tui
+  slack-tui --verbose --channel '#team-alpha'
+  slack-tui -- --help
+
+application help
+EOF
+    application_help=$(awk '
+        /^const HELP: &str = "\\$/ { in_help=1; next }
+        in_help && /^";$/ { exit }
+        in_help { print }
+    ' "$src/src/main.rs")
+    if [[ -z "$application_help" ]]; then
+        echo "slack-tui: could not read application help from $src/src/main.rs" >&2
+        exit 1
+    fi
+    printf '%s\n' "$application_help"
+    exit 0
+fi
+
+if ((prune_build_cache)) && ((force_rebuild || ${#application_arguments[@]})); then
+    echo 'slack-tui: --build-cache-prune cannot be combined with build or application arguments' >&2
+    exit 2
+fi
+
+# Serialize build, binary publication and pruning across launcher instances.
+if ! command -v flock >/dev/null 2>&1; then
+    echo 'slack-tui: flock not found; install util-linux' >&2
+    exit 2
+fi
+mkdir --parents "$cache"
+exec {build_lock}>"$cache/build.lock"
+if ! flock --exclusive --nonblock "$build_lock"; then
+    echo "slack-tui: waiting for another build or cache operation..." >&2
+    flock --exclusive "$build_lock"
+fi
+if ((prune_build_cache)); then
+    if [[ -L "$cache/target" || ( -e "$cache/target" && ! -d "$cache/target" ) ]]; then
+        echo "slack-tui: refusing to prune non-directory or symlink $cache/target" >&2
+        exit 2
+    fi
+    if [[ ! -d "$cache/target" ]]; then
+        echo "slack-tui: no build artifacts at $cache/target"
+        exit 0
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo 'slack-tui: cargo not found; cannot prune build artifacts' >&2
+        exit 2
+    fi
+    cargo clean --locked --manifest-path "$src/Cargo.toml" --target-dir "$cache/target"
+    echo "slack-tui: pruned $cache/target; kept binaries, checksums and Slack data"
+    exit 0
+fi
+
+profile_arguments=(--release)
+build_directory=release
+if ((debug_build)); then
+    profile_arguments=(--profile dev)
+    build_directory=debug
+    bin="$cache/bin/slack-tui-debug"
+    stamp="$cache/source-debug.sha256"
+    export CARGO_PROFILE_DEV_DEBUG=2
+    export CARGO_PROFILE_DEV_STRIP=none
+    export CARGO_PROFILE_DEV_OPT_LEVEL=0
+    export CARGO_PROFILE_DEV_PANIC=unwind
+    export RUST_BACKTRACE=full
+fi
+
+# What /version shows: the plugin manifest beside this launcher, so a plugin
+# update is visible in the TUI without a rebuild.
+if [[ -z "${SLACK_TUI_VERSION:-}" && -r "$here/../.claude-plugin/plugin.json" ]]; then
+    SLACK_TUI_VERSION=$(sed --quiet \
+        's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$here/../.claude-plugin/plugin.json" | head -1)
+    export SLACK_TUI_VERSION
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "slack-tui: cargo not found; install a Rust toolchain from https://rustup.rs" >&2
+    exit 2
+fi
+sum=$(cat "$src/Cargo.toml" "$src/Cargo.lock" "$src"/src/*.rs | sha256sum | cut --delimiter=' ' --fields=1)
+cached_sum=$(cat "$stamp" 2>/dev/null || true)
+needs_build=0
+build_reason="cached binary is current"
+
+if ((force_rebuild)); then
+    needs_build=1
+    build_reason="forced by --build/--rebuild"
+    if ((debug_build)); then
+        build_reason="forced by --build-debug; debug symbols, RUST_BACKTRACE=full"
+    fi
+elif [[ "${SLACK_TUI_REBUILD:-0}" == 1 ]]; then
+    needs_build=1
+    build_reason="forced by SLACK_TUI_REBUILD=1"
+elif [[ ! -x "$bin" ]]; then
+    needs_build=1
+    build_reason="first run"
+elif [[ "$cached_sum" != "$sum" ]]; then
+    needs_build=1
+    build_reason="source changed"
+fi
+
+if ((needs_build)); then
+    echo "slack-tui: building ($build_reason)..." >&2
+elif ((verbose)); then
+    echo "slack-tui: $build_reason; using $bin" >&2
+fi
+
+if ((needs_build)); then
+    mkdir --parents "$cache/bin"
+    if ((force_rebuild)); then
+        cargo clean \
+            "${profile_arguments[@]}" \
+            --package slack-tui \
+            --locked \
+            --manifest-path "$src/Cargo.toml" \
+            --target-dir "$cache/target"
+    fi
+    cargo_arguments=(
+        build
+        "${profile_arguments[@]}"
+        --locked
+        --manifest-path "$src/Cargo.toml"
+        --target-dir "$cache/target"
+    )
+    cargo "${cargo_arguments[@]}"
+    # A running instance keeps the old file busy; a rename replaces the entry
+    # under it instead of failing with "Text file busy".
+    cp "$cache/target/$build_directory/slack-tui" "$bin.new.$$"
+    mv --force "$bin.new.$$" "$bin"
+    printf '%s\n' "$sum" > "$stamp"
+fi
+
+flock --unlock "$build_lock"
+exec {build_lock}>&-
+exec "$bin" "${application_arguments[@]}"

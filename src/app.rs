@@ -1,0 +1,13695 @@
+//! Application state and key handling. Views stack on top of the timeline:
+//! thread, search hits, raw JSON. Esc pops.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::text::Line;
+
+use serde_json::Value;
+
+use crate::api::Client;
+use crate::archive::{ts_to_id, Archive, Conv, Corpus, Counterpart, Kind, Msg, PAGE, SEARCH_CAP, SLACKBOT};
+use crate::complete;
+use crate::edit::Editor;
+use crate::keys::{Action, Chord, Keymap, DEFAULTS};
+use crate::live::{self, Done, Job, JobKind};
+use crate::palette::PRESETS;
+use crate::palette::{Palette, Role, ROLES};
+use crate::render::{self, CardFit, Ctx, ImageSlot, Tz};
+use image::DynamicImage;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::{Protocol, StatefulProtocol};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    Convs,
+    Msgs,
+}
+
+/// The `Ctrl-B` state lives with the file it is saved in, beside the picker's
+/// own preferences.
+pub use crate::conversations_pane::ConversationsPaneVisibility;
+
+/// Said when the focus would be on a pane the hidden state does not draw.
+pub const PANE_HIDDEN_HINT: &str = "conversations pane hidden; Ctrl-B cycles it back";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sort {
+    /// Where the archive's owner wrote the most, first.
+    Mine,
+    Name,
+    Recent,
+    Size,
+    /// Grouped by Slack's conversation types, newest message first inside a
+    /// type. The pane names each type on a line under it.
+    Type,
+}
+
+impl Sort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Mine => "my activity",
+            Sort::Name => "name",
+            Sort::Recent => "recent",
+            Sort::Size => "size",
+            Sort::Type => "type",
+        }
+    }
+    fn next(self) -> Sort {
+        match self {
+            Sort::Mine => Sort::Name,
+            Sort::Name => Sort::Recent,
+            Sort::Recent => Sort::Size,
+            Sort::Size => Sort::Type,
+            Sort::Type => Sort::Mine,
+        }
+    }
+}
+
+pub struct FlatLine {
+    pub msg: Option<usize>,
+    pub line: Line<'static>,
+    /// An image starts on this line and takes the rows below it.
+    pub image: Option<ImageSlot>,
+}
+
+/// The line that stands for what a collapsed message does not show.
+pub fn collapse_elision(hidden: usize) -> Line<'static> {
+    Line::from(format!("  ... ({hidden} more lines)"))
+}
+
+/// How many rows a preview keeps from the top of a message: its header and
+/// its first body line, so the preview says who wrote it *and* what they
+/// wrote. A system message (a join, a purpose change, a deleted message)
+/// draws no header, and its first row is already its content.
+fn collapse_head(rendered: &render::Rendered) -> usize {
+    if rendered.tags.first() == Some(&"message_header") {
+        2
+    } else {
+        1
+    }
+}
+
+/// A message rendered and then, when it is taller than `budget`, cut down to
+/// its opening rows, a count of what is hidden and its last line. The return
+/// says whether it was cut.
+fn collapse(rendered: &mut render::Rendered, ctx: &Ctx, budget: Option<usize>) -> bool {
+    let head = collapse_head(rendered);
+    // A message only one row taller than the preview would be is left whole:
+    // the elision would cost the row it saved and say less than the line it
+    // replaced.
+    let collapsed = budget.is_some_and(|budget| rendered.lines.len() + 2 > budget)
+        && rendered.lines.len() > head + 2;
+    if collapsed {
+        // Keep the message's own opening and last rows around the elision, so
+        // a preview shows how the message ends as well as how it starts.
+        // Everything between them is the count.
+        let last_row = rendered.lines.len() - 1;
+        let hidden = last_row - head;
+        let mut tail = rendered.lines.pop().expect("a collapsed message has lines");
+        // A message ending inside a taller-than-one-row image keeps one of that
+        // image's blank reserved rows as the preview's last line, and the
+        // retain below drops the image itself: the preview would end on
+        // nothing. Name the file there instead, with the label an uncollapsed
+        // render puts above those rows.
+        if let Some(slot) = rendered.images.iter().find(|slot| {
+            slot.rows > 1 && (slot.line..slot.line + usize::from(slot.rows)).contains(&last_row)
+        }) {
+            let render::ImageSource::File(f) = &slot.source;
+            // Through the same highlight pass `message_lines` gives its file
+            // lines, so a configured word colors the name here too.
+            tail = ctx.palette.highlight_line(render::file_label(f));
+        }
+        let tail_tag = rendered.tags.pop().unwrap_or("");
+        rendered.lines.truncate(head);
+        rendered.lines.push(collapse_elision(hidden));
+        rendered.lines.push(tail);
+        rendered.tags.truncate(head);
+        rendered.tags.push("collapse_elision");
+        rendered.tags.push(tail_tag);
+        // Slot lines index the truncated vec, so the surviving last row has to
+        // be readdressed to the row past the elision. Only a one-row image on
+        // that row survives: anything taller reaches rows the preview dropped,
+        // and would paint over the elision or the next message. The kept
+        // opening rows can hold no slot of their own: a picture is reserved
+        // below the file line that names it, which is itself below the header.
+        rendered.images.retain_mut(|slot| {
+            let keep = slot.line == last_row && slot.rows == 1;
+            if keep {
+                slot.line = head + 1;
+            }
+            keep
+        });
+    }
+    collapsed
+}
+
+/// One message's lines appended to `flat`, every one of them tagged as
+/// belonging to item `index`; a THREADS card calls this twice, for its root
+/// and for its last reply. A message taller than `budget` is collapsed, and
+/// the return says whether it was. The render's element tags stop here: a
+/// list holds lines only.
+#[allow(clippy::too_many_arguments)]
+fn push_message(
+    flat: &mut Vec<FlatLine>,
+    index: usize,
+    m: &Msg,
+    ctx: &Ctx,
+    width: usize,
+    in_thread: bool,
+    today: i64,
+    budget: Option<usize>,
+) -> bool {
+    let mut rendered = render::message_lines(m, ctx, width, in_thread, today);
+    let collapsed = collapse(&mut rendered, ctx, budget);
+    let base = flat.len();
+    for line in rendered.lines {
+        flat.push(FlatLine {
+            msg: Some(index),
+            line,
+            image: None,
+        });
+    }
+    for slot in rendered.images {
+        if let Some(fl) = flat.get_mut(base + slot.line) {
+            fl.image = Some(slot);
+        }
+    }
+    collapsed
+}
+
+/// A scrollable list of messages rendered into lines. The cursor is a
+/// message; the viewport is lines.
+#[derive(Default)]
+pub struct MsgList {
+    /// Channel requested for an empty thread, so a failed fetch can be retried.
+    pub source_channel: Option<String>,
+    pub msgs: Vec<Msg>,
+    /// THREADS and UNREADS only: what each item draws around `msgs[i]` — the
+    /// header, the elided count and the tail. Empty in every other list, and
+    /// index-aligned with `msgs` when it is not: build one with `with_cards`
+    /// and drop items with `remove`, which is what keeps the two aligned.
+    cards: Vec<render::Card>,
+    pub cursor: usize,
+    pub scroll: usize,
+    /// Read the selected message by screen line, without moving its cursor.
+    pub line_scroll: bool,
+    pub flat: Vec<FlatLine>,
+    pub first: Vec<usize>,
+    pub last: Vec<usize>,
+    collapsed: Vec<bool>,
+    flat_w: usize,
+    flat_date: Option<(Tz, i64)>,
+    pane_height: Option<usize>,
+    unread_count: Option<i64>,
+    dirty: bool,
+    pub in_thread: bool,
+    pub top_note: Option<String>,
+    pub bottom_note: Option<String>,
+    /// After the next rebuild, put the cursor's message near the top of the
+    /// view so what follows it is on screen (a jump target, a focused reply).
+    pub align_top: bool,
+}
+
+impl MsgList {
+    pub fn new(msgs: Vec<Msg>, in_thread: bool) -> MsgList {
+        MsgList {
+            msgs,
+            dirty: true,
+            in_thread,
+            ..Default::default()
+        }
+    }
+
+    /// A card list: one card per item, and the message the cursor selects —
+    /// a thread root in THREADS, a conversation's first unread message in
+    /// UNREADS. Taking the pairs is what makes a misaligned card impossible
+    /// to build. `in_thread` is set, so the item's rendered footer does not
+    /// repeat the reply count the card's own elision line carries.
+    pub fn with_cards(cards: Vec<(Msg, render::Card)>) -> MsgList {
+        let (msgs, cards) = cards.into_iter().unzip();
+        MsgList {
+            msgs,
+            cards,
+            dirty: true,
+            in_thread: true,
+            ..Default::default()
+        }
+    }
+
+    /// The shortest pane `ui::draw_msgs` will draw an item into. The blank
+    /// row above the item, the item's shortest form — a collapsed message,
+    /// which keeps its header, its first body line, the elision and its last
+    /// line — and the blank row below. A card spends one more row on its own
+    /// header, which `CardFit::Root` is the last to shed.
+    pub fn min_pane_height(&self) -> usize {
+        if self.cards.is_empty() { 6 } else { 7 }
+    }
+
+    pub fn len(&self) -> usize {
+        self.msgs.len()
+    }
+
+    /// Drop a deleted reply from the card of the thread `cid`/`root`: neither
+    /// the reply the card draws nor the ones it only counts live in `msgs`,
+    /// so removing an item does not reach either.
+    ///
+    /// A drawn reply is folded into the elision rather than replaced by the
+    /// next one down: the archive deliberately keeps messages that vanish
+    /// from Slack, so re-asking it for the newest reply hands back the one
+    /// just deleted, and excluding that id resurfaces it the moment a second
+    /// reply in the same thread is deleted. `hidden` then stays as it was —
+    /// it counted the replies the card did not draw, and one fewer thread
+    /// reply is matched by one fewer drawn. A reply the card only counted is
+    /// the other case, and there `hidden` is what has to come down.
+    ///
+    /// A reply the card never counted moves neither. The counts are a
+    /// snapshot taken when the view opened, so a reply written since — read
+    /// in the thread the card opens, and deleted from there — is past
+    /// `counted_through` and leaves the card alone. Nor does anything at or
+    /// below the item the card leads with: a thread's replies are all past
+    /// its root, and an UNREADS card counts only messages past its first
+    /// unread one, so an older message deleted from another view is a message
+    /// this card never stood for.
+    pub fn drop_reply(&mut self, cid: &str, root: i64, id: i64) {
+        for i in 0..self.cards.len() {
+            let Some(parent) = self.msgs.get(i) else { break };
+            if parent.id != root || parent.channel_id != cid {
+                continue;
+            }
+            let card = &mut self.cards[i];
+            if let Some(at) = card.tail.iter().position(|message| message.id == id) {
+                card.tail.remove(at);
+            } else if id > card.counted_from && id <= card.counted_through {
+                // Signed saturation lands at i64::MIN, and a count below
+                // zero would draw as one: clamp it here.
+                card.hidden = (card.hidden - 1).max(0);
+            } else {
+                continue;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// The lead message of card `at` is gone: hand the lead to the next
+    /// message the card drew and report the card's new total, or `None` when
+    /// the card drew no other. `None` is not "drop the card": a card that
+    /// still counts messages it did not draw is rebuilt from the archive by
+    /// `refill_unread_card`, and only an empty one goes.
+    ///
+    /// An UNREADS card stands for a conversation, not for the one message it
+    /// leads with, so losing that message must not take the conversation out
+    /// of the view while it still has unread messages.
+    ///
+    /// Rebuilt from what the card already holds rather than re-read from the
+    /// archive: the archive deliberately keeps messages Slack no longer has,
+    /// so asking it for the conversation's first unread message hands back
+    /// the one just deleted. `hidden` is untouched — it counts the messages
+    /// the card does not draw, and the promoted one leaves that set exactly
+    /// as the deleted one leaves the drawn set, so the total falls by the one
+    /// message deleted and by no more.
+    pub fn promote_card(&mut self, at: usize) -> Option<i64> {
+        let card = self.cards.get_mut(at)?;
+        if card.tail.is_empty() {
+            return None;
+        }
+        self.msgs[at] = card.tail.remove(0);
+        self.dirty = true;
+        Some(card.hidden + card.tail.len() as i64 + 1)
+    }
+
+    /// Put a rebuilt card in place of item `at`. Taking the pair is what
+    /// keeps `msgs` and `cards` aligned, the same reason `with_cards` takes
+    /// pairs; the cursor stays where it is, the item standing for the same
+    /// conversation before and after.
+    pub fn replace_card(&mut self, at: usize, lead: Msg, card: render::Card) {
+        if at >= self.msgs.len() || at >= self.cards.len() {
+            return;
+        }
+        self.msgs[at] = lead;
+        self.cards[at] = card;
+        self.mark_dirty();
+    }
+
+    /// Put a card into the list at `at`, its item with it. The pair keeps
+    /// `msgs` and `cards` aligned, as `with_cards` and `replace_card` do.
+    ///
+    /// The cursor keeps its index rather than the card it was on. The one
+    /// caller inserts under a modal progress box, so the reader has not moved
+    /// it: index 0 is the newest card before the insertion and after it, and
+    /// following the old card down would leave the reader looking at the
+    /// middle of a list whose new cards are all above them.
+    pub fn insert_card(&mut self, at: usize, lead: Msg, card: render::Card) {
+        let at = at.min(self.msgs.len()).min(self.cards.len());
+        self.msgs.insert(at, lead);
+        self.cards.insert(at, card);
+        self.mark_dirty();
+    }
+
+    /// Drop item `at`, its card with it, and keep the cursor in range.
+    pub fn remove(&mut self, at: usize) {
+        self.msgs.remove(at);
+        if at < self.cards.len() {
+            self.cards.remove(at);
+        }
+        self.cursor = self.cursor.min(self.len().saturating_sub(1));
+        self.mark_dirty();
+    }
+
+    pub fn selected(&self) -> Option<&Msg> {
+        self.msgs.get(self.cursor)
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Refresh the divider when a live unread count arrives.
+    pub fn set_unread_count(&mut self, count: Option<i64>) {
+        if self.unread_count != count {
+            self.unread_count = count;
+            self.dirty = true;
+        }
+    }
+
+    /// Render at the current pane size, keeping the selected message visible.
+    pub fn rebuild_for_pane(&mut self, ctx: &Ctx, width: usize, height: usize) {
+        let height = if self.line_scroll { None } else { Some(height) };
+        if self.pane_height != height {
+            self.pane_height = height;
+            self.dirty = true;
+        }
+        self.rebuild(ctx, width);
+    }
+
+    pub fn rebuild(&mut self, ctx: &Ctx, width: usize) {
+        self.rebuild_on_day(ctx, width, ctx.tz.day(chrono::Utc::now().timestamp()));
+    }
+
+    fn rebuild_on_day(&mut self, ctx: &Ctx, width: usize, today: i64) {
+        if !self.dirty && self.flat_w == width && self.flat_date == Some((ctx.tz, today)) {
+            return;
+        }
+        let inside = self
+            .scroll
+            .saturating_sub(self.first.get(self.cursor).copied().unwrap_or(0));
+        let offset = self
+            .first
+            .get(self.cursor)
+            .map(|f| f.saturating_sub(self.scroll))
+            .unwrap_or(0);
+        self.flat.clear();
+        self.first.clear();
+        self.last.clear();
+        self.collapsed.clear();
+        if let Some(note) = &self.top_note {
+            self.flat.push(FlatLine {
+                msg: None,
+                line: render::divider(note, width),
+                image: None,
+            });
+        }
+        let mut prev_day = None;
+        let mut new_marked = false;
+        let count = match self.unread_count {
+            Some(count) if count > 9 => "9+".to_string(),
+            Some(count) if count > 0 => count.to_string(),
+            _ => "—".to_string(),
+        };
+        let unread_label = format!("new ({count})");
+        // A card stacks messages under a header, so each gets a third of the
+        // pane where a lone message gets a half.
+        let cards = !self.cards.is_empty();
+        let budget = self
+            .pane_height
+            .map(|height| if cards { height / 3 } else { height / 2 });
+        for (i, m) in self.msgs.iter().enumerate() {
+            // Slack's Threads screen has no day dividers, and the cards carry
+            // their own timestamps: one between cards would be noise.
+            if !cards {
+                let day = ctx.tz.day(m.secs());
+                // The first message past the read marker opens the unread part:
+                // its day divider lights up, or a "new" line stands in for one.
+                let new_here = !new_marked && ctx.last_read.is_some_and(|lr| m.id > lr);
+                if prev_day != Some(day) {
+                    let text = ctx.tz.date_label(m.secs(), today);
+                    let line = if new_here {
+                        render::divider_new(&format!("{text} · {unread_label}"), width, ctx.palette)
+                    } else {
+                        render::divider(&text, width)
+                    };
+                    self.flat.push(FlatLine {
+                        msg: None,
+                        line,
+                        image: None,
+                    });
+                    prev_day = Some(day);
+                } else if new_here {
+                    self.flat.push(FlatLine {
+                        msg: None,
+                        line: render::divider_new(&unread_label, width, ctx.palette),
+                        image: None,
+                    });
+                }
+                if new_here {
+                    new_marked = true;
+                }
+            }
+            let start = self.flat.len();
+            self.first.push(start);
+            let mut collapsed = false;
+            // An item taller than the pane makes `whole_message_viewport`
+            // draw nothing at all, so a card that does not fit sheds its last
+            // reply, then its elision line, rather than blanking the view.
+            // The first fit that fits wins; without a card there is only one.
+            for fit in [CardFit::Whole, CardFit::Folded, CardFit::Root] {
+                self.flat.truncate(start);
+                self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
+                let card = self.cards.get(i);
+                if let Some(card) = card {
+                    let in_header = if fit == CardFit::Root { card.elided(fit) } else { 0 };
+                    self.flat.push(FlatLine {
+                        msg: Some(i),
+                        line: render::card_header(card, ctx.palette, in_header, width),
+                        image: None,
+                    });
+                }
+                collapsed =
+                    push_message(&mut self.flat, i, m, ctx, width, self.in_thread, today, budget);
+                if let Some(card) = card {
+                    let elided = card.elided(fit);
+                    if fit != CardFit::Root && elided > 0 {
+                        self.flat.push(FlatLine {
+                            msg: Some(i),
+                            line: render::card_elision(card.elision, elided),
+                            image: None,
+                        });
+                    }
+                    if fit == CardFit::Whole {
+                        for message in &card.tail {
+                            collapsed |= push_message(
+                                &mut self.flat, i, message, ctx, width, self.in_thread, today, budget,
+                            );
+                        }
+                    }
+                }
+                // One more row for the trailing blank below.
+                let rows = self.flat.len() + 1 - start;
+                let fits = self.pane_height.is_none_or(|height| rows <= height);
+                if fits || fit == CardFit::Root || self.cards.is_empty() {
+                    break;
+                }
+            }
+            self.collapsed.push(collapsed);
+            self.flat.push(FlatLine { msg: Some(i), line: Line::default(), image: None });
+            self.last.push(self.flat.len().saturating_sub(1));
+        }
+        if let Some(note) = &self.bottom_note {
+            self.flat.push(FlatLine {
+                msg: None,
+                line: render::divider(note, width),
+                image: None,
+            });
+        }
+        self.flat_w = width;
+        self.flat_date = Some((ctx.tz, today));
+        self.dirty = false;
+        let first = self.first.get(self.cursor).copied().unwrap_or(0);
+        // A fresh list, or a jump, keeps the line above the cursor on screen:
+        // that is the day divider.
+        let back = if self.align_top || offset == 0 {
+            1
+        } else {
+            offset
+        };
+        self.scroll = if self.line_scroll {
+            first.saturating_add(inside)
+        } else {
+            first.saturating_sub(back)
+        };
+        self.align_top = false;
+    }
+
+    /// What each row of item `index` draws, named after the code that draws
+    /// it, from the blank row above the item to the blank row below it. A row
+    /// no tag belongs on is empty.
+    ///
+    /// Recomputed from the messages here rather than kept beside the lines:
+    /// `/labels` is a draw-time mode and the list stores nothing for it. The
+    /// card layout that fits is found the way `rebuild_on_day` found it, by
+    /// trying them in order; the one whose rows match the rows the item
+    /// actually occupies is the one that was drawn.
+    pub fn item_tags(&self, ctx: &Ctx, width: usize, index: usize, today: i64) -> Vec<&'static str> {
+        let (Some(root), Some(top), Some(bottom)) =
+            (self.msgs.get(index), self.first.get(index), self.last.get(index))
+        else {
+            return Vec::new();
+        };
+        let rows = bottom - top + 1;
+        let cards = !self.cards.is_empty();
+        let budget = self
+            .pane_height
+            .map(|pane| if cards { pane / 3 } else { pane / 2 });
+        let card = self.cards.get(index);
+        let message_tags = |m: &Msg| {
+            let mut rendered = render::message_lines(m, ctx, width, self.in_thread, today);
+            collapse(&mut rendered, ctx, budget);
+            rendered.tags
+        };
+        for fit in [CardFit::Whole, CardFit::Folded, CardFit::Root] {
+            // The blank row above the item, which carries the focus outline.
+            let mut tags = vec![""];
+            if card.is_some() {
+                tags.push("card_header");
+            }
+            tags.extend(message_tags(root));
+            if let Some(card) = card {
+                if fit != CardFit::Root && card.elided(fit) > 0 {
+                    tags.push("card_elision");
+                }
+                if fit == CardFit::Whole {
+                    for message in &card.tail {
+                        tags.extend(message_tags(message));
+                    }
+                }
+            }
+            tags.push("");
+            if tags.len() == rows || !cards {
+                return tags;
+            }
+        }
+        Vec::new()
+    }
+
+    /// Select a contiguous viewport containing complete message blocks only.
+    pub fn whole_message_viewport(&mut self, height: usize) -> usize {
+        if self.first.is_empty() || height == 0 { return 0; }
+        self.cursor = self.cursor.min(self.first.len() - 1);
+        self.line_scroll = false;
+        self.scroll = self.scroll.min(self.first[self.cursor]);
+        if let Some(index) = self.flat.get(self.scroll).and_then(|line| line.msg) {
+            self.scroll = self.first[index];
+        }
+        while self.last[self.cursor] >= self.scroll + height {
+            let Some(index) = (self.scroll..self.flat.len()).find_map(|row| self.flat[row].msg) else { break };
+            if index == self.cursor {
+                self.scroll = self.first[index];
+                break;
+            }
+            self.scroll = self.last[index] + 1;
+        }
+        let mut end = self.scroll;
+        while end < self.flat.len() {
+            let next = self.flat[end].msg.map_or(end + 1, |index| self.last[index] + 1);
+            if next > self.scroll + height { break; }
+            end = next;
+        }
+        // Near the end of history, use spare rows for preceding whole messages.
+        while self.scroll > 0 {
+            let previous = self.scroll - 1;
+            let start = self.flat[previous].msg.map_or(previous, |index| self.first[index]);
+            if end - start > height { break; }
+            self.scroll = start;
+        }
+        end
+    }
+
+    pub fn ensure_visible(&mut self, height: usize) {
+        if height == 0 || self.first.is_empty() {
+            return;
+        }
+        self.cursor = self.cursor.min(self.first.len() - 1);
+        let first = self.first[self.cursor];
+        let last = self.last[self.cursor];
+        if self.line_scroll {
+            self.scroll = self
+                .scroll
+                .clamp(first, (last + 1).saturating_sub(height).max(first));
+            return;
+        }
+        if first < self.scroll {
+            self.scroll = first;
+        } else if last >= self.scroll + height {
+            self.scroll = (last + 1 - height).min(first);
+        }
+        let max_scroll = self.flat.len().saturating_sub(height);
+        self.scroll = self.scroll.min(max_scroll);
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        self.line_scroll = false;
+        if self.msgs.is_empty() {
+            return;
+        }
+        let n = self.msgs.len() as isize;
+        self.cursor = (self.cursor as isize + delta).clamp(0, n - 1) as usize;
+    }
+
+    /// Move the cursor to the message `delta` screen lines away.
+    pub fn move_lines(&mut self, delta: isize) {
+        if self.flat.is_empty() || self.first.is_empty() {
+            return;
+        }
+        let from = self.first.get(self.cursor).copied().unwrap_or(0) as isize;
+        let target = (from + delta).clamp(0, self.flat.len() as isize - 1) as usize;
+        let found = if delta >= 0 {
+            (target..self.flat.len()).find_map(|i| self.flat[i].msg)
+        } else {
+            (0..=target).rev().find_map(|i| self.flat[i].msg)
+        };
+        if let Some(i) = found {
+            self.cursor = i;
+        } else {
+            self.cursor = if delta >= 0 { self.msgs.len() - 1 } else { 0 };
+        }
+        self.scroll =
+            (self.scroll as isize + delta).clamp(0, self.flat.len() as isize - 1) as usize;
+    }
+}
+
+/// An unsent message and where it was meant to go.
+pub struct Draft {
+    pub cid: String,
+    pub thread: Option<i64>,
+    pub text: String,
+}
+
+/// A delete asked for and not confirmed yet: the same key again carries it
+/// out, anything else drops it.
+pub struct PendingDelete {
+    pub cid: String,
+    pub id: i64,
+    /// The thread this message is a reply in, taken from the message while it
+    /// is still selected: a THREADS card counts the replies it does not draw,
+    /// and after the delete there is nothing left to read the thread off.
+    pub root: Option<i64>,
+}
+
+/// Where `c` sends: a conversation, and a thread in it when replying.
+pub struct Compose {
+    pub conv: usize,
+    pub cid: String,
+    pub thread: Option<i64>,
+    /// What the prompt says it is writing to.
+    pub label: String,
+}
+
+pub struct Open {
+    pub conv: usize,
+    pub list: MsgList,
+    pub total: i64,
+    pub has_older: bool,
+    pub has_newer: bool,
+    /// Paged from Slack: no archive behind it.
+    pub api_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopSection { Saved, Sent, Mentions, Threads, Unreads }
+
+impl TopSection {
+    pub const ALL: [Self; 5] = [Self::Saved, Self::Sent, Self::Mentions, Self::Threads, Self::Unreads];
+    pub fn label(self) -> &'static str { match self { Self::Saved => "SAVED", Self::Sent => "SENT", Self::Mentions => "MENTIONS", Self::Threads => "THREADS", Self::Unreads => "UNREADS" } }
+    pub fn row(self) -> usize { match self { Self::Saved => 0, Self::Sent => 1, Self::Mentions => 2, Self::Threads => 3, Self::Unreads => 4 } }
+}
+
+/// How a search view's hits divide between Slack and the local archives,
+/// once Slack has answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveHits {
+    /// Hits Slack returned that the archive scan had not found.
+    pub added: usize,
+    /// Archive hits Slack did not return.
+    pub cache_only: usize,
+    /// Slack ran out of results on its own within the cap, so what it
+    /// returned is its whole answer for the query.
+    pub complete: bool,
+}
+
+impl LiveHits {
+    /// The clause a title or a progress line adds for the cache-only count,
+    /// empty when there is none to report.
+    ///
+    /// Never "only in cache", even when Slack's answer is complete: Slack
+    /// search collapses near-duplicate matches and applies its own matching,
+    /// while this side is a substring scan, so the two are asking different
+    /// questions. That a message came back from one and not the other is the
+    /// fact; that Slack no longer holds it would be an inference.
+    /// The caveat is not "not in Slack's first 500": paging also stops short
+    /// on a repeated cursor, a spent budget, or a page that failed, and then
+    /// far fewer than 500 were ever compared against.
+    pub fn cache_only_label(self) -> String {
+        match (self.cache_only, self.complete) {
+            (0, _) => String::new(),
+            (n, true) => format!("{n} not returned by Slack"),
+            (n, false) => format!("{n} not returned by Slack (partial answer)"),
+        }
+    }
+}
+
+/// What the archive scan needs its result handled with: the decisions
+/// `run_archive_search` made before dispatching, kept until the hits land.
+pub struct ArchiveSearch {
+    query: String,
+    /// "author" or "message", as the status line names the search.
+    kind: &'static str,
+    /// The one conversation searched, when the search started inside one.
+    cid: Option<String>,
+    /// The query for `search.messages`, without any `in:` filter.
+    slack: String,
+    /// `from:@name` named someone no archive resolves.
+    author_unresolved: bool,
+    /// Started from the conversation list, which replaces what is on screen.
+    from_list: bool,
+    /// Where the reader was when they asked. A different generation at
+    /// landing means they have gone elsewhere since.
+    nav_generation: u64,
+    /// The progress end of a scan that draws no box. The worker treats a
+    /// dropped receiver as cancellation, so a scan nobody is narrating still
+    /// needs one held for as long as it runs. Held, never read: dropping it
+    /// with this struct is exactly what cancels such a scan.
+    #[allow(dead_code)]
+    unwatched: Option<std::sync::mpsc::Receiver<crate::live::ScanLine>>,
+}
+
+/// The Slack half of UNREADS: the fallback cards whose unread messages are
+/// still to come from Slack, one conversation at a time.
+pub struct UnreadFetch {
+    /// Conversations not asked about yet, in the order the cards are drawn.
+    queue: std::collections::VecDeque<live::UnreadTarget>,
+    /// Where the reader was when the phase started. A different generation
+    /// when a page lands means they have gone elsewhere, and it lands nowhere.
+    nav_generation: u64,
+    /// Cloned into every call's worker, which narrates through it. The box
+    /// holds the other end, so dropping the box ends the call in flight.
+    progress: std::sync::mpsc::Sender<crate::live::ScanLine>,
+    /// Fallback cards replaced so far, out of the conversations asked about.
+    replaced: usize,
+    asked: usize,
+}
+
+/// The Slack half of THREADS: the owner's recent threads the archive does
+/// not hold, one thread at a time. It starts with the search out and an
+/// empty queue; the search's answer fills the queue.
+pub struct ThreadFetch {
+    /// Threads not asked about yet, newest match first.
+    queue: std::collections::VecDeque<live::ThreadTarget>,
+    /// The thread the call in flight is about: the card's header names the
+    /// conversation, and only the target carries the name the search gave.
+    current: Option<live::ThreadTarget>,
+    /// Where the reader was when the phase started. A different generation
+    /// when an answer lands means they have gone elsewhere, and it lands
+    /// nowhere.
+    nav_generation: u64,
+    /// Cloned into every call's worker, which narrates through it. The box
+    /// holds the other end, so dropping the box ends the call in flight.
+    progress: std::sync::mpsc::Sender<crate::live::ScanLine>,
+    /// Cards added so far, out of the threads asked about.
+    added: usize,
+    asked: usize,
+    /// Threads the search found past the per-run cap, which this run leaves
+    /// for the next one and the status line counts.
+    over_cap: usize,
+}
+
+/// The `/find` progress box: what the archive scan has said so far, and
+/// whether a Slack search for the same query is still out. It is drawn while
+/// it exists and dropped when the last phase lands.
+/// One conversation's unread messages as Slack handed them over, kept for as
+/// long as the UNREADS view lives. The card draws four of them; the rest are
+/// here, because the archive cannot be asked for them — the fetch exists
+/// exactly because it does not hold them — and a delete that takes the drawn
+/// ones off has to come back for the next.
+pub struct UnreadRun {
+    /// Oldest first, as the fetch collected them.
+    pub msgs: Vec<Msg>,
+    /// The walk reached the read marker, so `msgs` is the whole unread run.
+    pub complete: bool,
+    /// What Slack said was unread when the fetch ran.
+    pub claimed: Option<i64>,
+}
+
+/// Which phase a progress box belongs to. A job that lands after its own box
+/// is gone must not write into, or close, the box a later phase opened: the
+/// two share one slot, and closing another phase's box drops the channel its
+/// worker narrates through, which stops that phase mid-call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanOwner {
+    /// `/find`, across both its halves: the archive scan and the Slack search.
+    Search,
+    /// The UNREADS live phase.
+    UnreadFetch,
+    /// The THREADS live phase.
+    ThreadFetch,
+}
+
+pub struct ScanOverlay {
+    /// The phase that opened the box, and the navigation generation it was
+    /// opened under. Both have to match for a landing job to touch it.
+    pub owner: ScanOwner,
+    pub nav_generation: u64,
+    /// The command as typed, shown as the box's title.
+    pub label: String,
+    pub lines: Vec<crate::live::ScanLine>,
+    pub started: Instant,
+    /// The Slack half of the same search has not answered yet.
+    pub live_pending: bool,
+    /// Every phase has landed. The box is drawn once more, so its last line
+    /// is seen, and the next tick drops it.
+    pub finished: bool,
+    progress: std::sync::mpsc::Receiver<crate::live::ScanLine>,
+}
+
+impl ScanOverlay {
+    /// A box with the lines already in it and no worker behind it, for a test
+    /// that only draws one.
+    #[cfg(test)]
+    pub(crate) fn for_test(label: &str, lines: Vec<crate::live::ScanLine>) -> ScanOverlay {
+        let (_sender, progress) = std::sync::mpsc::channel();
+        ScanOverlay {
+            owner: ScanOwner::Search,
+            nav_generation: 0,
+            label: label.to_string(),
+            lines,
+            started: Instant::now(),
+            live_pending: false,
+            finished: false,
+            progress,
+        }
+    }
+
+    /// Take whatever the worker has said since the last frame.
+    fn drain(&mut self) {
+        while let Ok(line) = self.progress.try_recv() {
+            self.lines.push(line);
+        }
+    }
+}
+
+pub enum View {
+    Feed { section: TopSection, list: MsgList, next_cursor: Option<String>, generation: u64 },
+    Saved { list: MsgList },
+    Thread {
+        root: i64,
+        list: MsgList,
+        /// The archive the thread was fetched into, when slackdump fetched it.
+        live: Option<Box<Archive>>,
+        /// Where the thread lives when that is not the open conversation.
+        place: Option<String>,
+    },
+    Search {
+        query: String,
+        list: MsgList,
+        capped: bool,
+        /// What Slack's answer added and what it left to the cache alone,
+        /// once it answered.
+        live_hits: Option<LiveHits>,
+        live_pending: bool,
+    },
+    Raw {
+        title: String,
+        browser: crate::raw::Browser,
+        /// The pane the view was opened from, restored when it is popped.
+        /// `h` out of a raw view opened on a conversation row returns to
+        /// the list even when a different conversation is open behind it,
+        /// and a link followed out of the view does not change that.
+        entry_focus: Focus,
+    },
+    Reactions { title: String, lines: Vec<String>, scroll: usize },
+    /// Roots of the threads the owner wrote in or was mentioned in, across
+    /// every archive.
+    Threads { list: MsgList },
+    /// One card per conversation with unread messages, newest unread first.
+    Unreads {
+        list: MsgList,
+        /// `(channel, id)` of every message deleted from Slack while this
+        /// view has been open. The archive is read-only and deliberately
+        /// keeps what Slack no longer has, so a card rebuilt from it would
+        /// hand these back; every rebuild leaves them out.
+        deleted: Vec<(String, i64)>,
+        /// What the live phase fetched, by channel. A card rebuilt after a
+        /// delete is built from this before the archive is tried; a refresh
+        /// clears it and fetches again.
+        fetched: HashMap<String, UnreadRun>,
+    },
+    /// `/colorpalette`: edit semantic UI colors with a live preview.
+    ColorPalette {
+        highlights: Option<crate::word_highlights::Menu>,
+        cursor: usize,
+        original: Palette,
+        return_focus: Focus,
+    },
+    /// `/keys`: rebind what the lists' keys do.
+    Keys {
+        cursor: usize,
+        original: Keymap,
+        return_focus: Focus,
+        /// Waiting for the key to bind; true keeps the action's other keys.
+        capture: Option<bool>,
+    },
+    /// One message's images, full pane, one at a time.
+    Image {
+        files: Vec<crate::archive::FileInfo>,
+        index: usize,
+        zoom: u16,
+        /// The fitted encoding of the current image, built on first draw.
+        shown: Option<(String, StatefulProtocol)>,
+    },
+}
+
+/// What is known about one file's pixels.
+pub enum ImageState {
+    /// Waiting for the one file download slot.
+    Queued {
+        url: String,
+        dest: PathBuf,
+    },
+    Loading,
+    Ready(DynamicImage),
+    Failed(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PromptKind {
+    /// `/`: `find`/`search TEXT` or `leave [#name]`.
+    Command,
+    Date,
+    Archive,
+    Compose,
+    /// A color for the role under the palette's cursor.
+    PaletteColor,
+}
+
+pub enum Mode {
+    Normal,
+    Prompt {
+        kind: PromptKind,
+        buf: Editor,
+        /// What Esc restores or compares against: the list filter in force
+        /// before a `/` command, the text `>` prefilled into a compose box,
+        /// the archive prompt's own value, and empty everywhere else.
+        previous: String,
+    },
+}
+
+pub struct App {
+    pub last_key: Option<(String, Instant)>,
+    pub channel_browser: Option<crate::canvas::Browser>,
+    pub corpus: Corpus,
+    pub tz: Tz,
+    pub focus: Focus,
+    pub conversations_pane: ConversationsPaneVisibility,
+    pub sort: Sort,
+    pub filter: String,
+    pub filtered: Vec<usize>,
+    pub conv_cursor: usize,
+    pub top_section: Option<TopSection>,
+    sent_generation: u64,
+    pub saved_messages: Vec<Msg>,
+    pub open: Option<Open>,
+    pub stack: Vec<View>,
+    browser_jobs: Vec<live::Job>,
+    sent_return: Option<(Option<Open>, Vec<View>, usize)>,
+    pub mode: Mode,
+    pub help: bool,
+    pub status: String,
+    pub quit: bool,
+    /// Inner height of the messages pane at the last draw.
+    pub msgs_height: usize,
+    /// First conversation row drawn, kept across frames so the cursor moves
+    /// inside the pane instead of the pane moving under it.
+    pub conv_offset: usize,
+    /// Days after which one of the owner's messages counts half, in the
+    /// activity order.
+    pub half_life_days: f64,
+    /// The one slackdump run in flight, if any.
+    pub job: Option<Job>,
+    /// The cross-conversation archive scan, in a slot of its own: it never
+    /// competed for the fetch slot when it ran inline, so a busy client must
+    /// not be able to refuse a search.
+    pub scan: Option<Job>,
+    /// The progress box a running `/find` draws over everything else.
+    pub scan_overlay: Option<ScanOverlay>,
+    /// The UNREADS live phase, while it has conversations left to fetch.
+    unread_fetch: Option<UnreadFetch>,
+    /// The THREADS live phase, while it has a search out or threads left.
+    thread_fetch: Option<ThreadFetch>,
+    /// The archive scan in flight and what to do with what it finds.
+    pending_search: Option<ArchiveSearch>,
+    /// Holds the next scan's worker until a test lets it run.
+    #[cfg(test)]
+    pub scan_gate: Option<std::sync::mpsc::Receiver<()>>,
+    /// Bumped by every primitive that takes the reader somewhere else, so a
+    /// background result can tell whether the place it was asked for is still
+    /// the place on screen. Moving the focus between panes is not leaving, so
+    /// Tab does not bump it.
+    nav_generation: u64,
+    pub spinner: usize,
+    /// Slack may be consulted when the cache cannot answer.
+    pub live: bool,
+    /// Fetched threads and search results land here.
+    pub cache_dir: PathBuf,
+    /// The lock the hourly refresh takes; a refresh from here takes it too.
+    pub lock: PathBuf,
+    /// The Web API, once the background sign-in succeeded.
+    pub api: Option<Arc<Client>>,
+    /// Quiet background work: sign-in, conversation list, counts, tails.
+    pub bg: Option<Job>,
+    profile_job: Option<Job>,
+    unread_count_job: Option<Job>,
+    counts_pending: bool,
+    group_job: Option<Job>,
+    dm_users: HashMap<String, String>,
+    /// A slackdump binary answers; the fallback engine.
+    pub slackdump: bool,
+    pub poll_every: Duration,
+    pub last_poll: Instant,
+    pub last_counts: Instant,
+    /// The terminal's image protocol, when images are on at all.
+    pub picker: Option<Picker>,
+    pub inline_images: bool,
+    /// Decoded files by key: the file id for a thumbnail, `id:full` for the original.
+    pub images: HashMap<String, ImageState>,
+    /// Encoded inline thumbnails, by file id, with the cell size they were made for.
+    pub inline: HashMap<String, (u16, u16, Protocol)>,
+    pub file_job: Option<Job>,
+    /// `/cache highlight on|off`: cached public and private channels in
+    /// the palette's cached color.
+    pub highlight_cached: bool,
+    /// `/version`: the version in the status line's right corner.
+    pub show_version: bool,
+    /// `/labels`: every element on screen tagged with the code that draws it.
+    /// A debug mode, off at every start and never written anywhere.
+    pub labels: bool,
+    /// `U`: unread conversations at the top of the list.
+    /// Epoch seconds a drawn-buffer test pins, so what the age dividers say
+    /// does not depend on when the suite runs. `None` is the wall clock.
+    pub clock: Option<i64>,
+    /// The target of the open compose prompt.
+    pub compose: Option<Compose>,
+    /// The file the next send carries, from /upload or the clipboard.
+    pub attachment: Option<PathBuf>,
+    /// Why the last attach attempt gave nothing, shown in the prompt: the
+    /// status line is where the prompt itself is drawn.
+    pub attach_note: Option<String>,
+    /// What an upload left to fetch: the conversation, and the thread when
+    /// the file went into one.
+    tail_pending: Option<(usize, Option<i64>)>,
+    /// A delete waiting for its second key press.
+    pub pending_delete: Option<PendingDelete>,
+    /// The last confirmed server snapshot; old local overrides are no longer read.
+    pub muted: HashSet<String>,
+    pub starred: HashSet<String>,
+    starred_generation: u64,
+    starred_pending: bool,
+    muted_generation: u64,
+    /// Slack's muted set still to fetch.
+    pub muted_pending: bool,
+    /// A message typed and not sent: Esc keeps it for the next `c` on the
+    /// same target, so it cannot go to another conversation by reflex.
+    pub draft: Option<Draft>,
+    /// Bumped by every mark; a counts result from before it is stale.
+    pub counts_gen: u64,
+    /// Semantic UI colors, loaded from and saved to `palette_path`.
+    pub palette: Palette,
+    pub palette_path: Option<PathBuf>,
+    /// What the keys do, loaded from and saved to `keys_path`.
+    pub keymap: Keymap,
+    pub keys_path: Option<PathBuf>,
+    pub pane_menu: Option<crate::conversations_pane::Menu>,
+    pub pane_settings: crate::conversations_pane::Settings,
+    pane_path: Option<PathBuf>,
+    pane_workspace: String,
+}
+
+impl App {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        corpus: Corpus,
+        tz: Tz,
+        half_life_days: f64,
+        live: bool,
+        slackdump: bool,
+        cache_dir: PathBuf,
+        lock: PathBuf,
+        poll_secs: u64,
+        palette_path: Option<PathBuf>,
+        keys_path: Option<PathBuf>,
+    ) -> App {
+        let (palette, palette_status) = match Palette::load(palette_path.as_deref()) {
+            Ok(palette) => (palette, String::new()),
+            Err(error) => (
+                Palette::default(),
+                format!("palette: {error}; using defaults"),
+            ),
+        };
+        let (keymap, keys_status) = match Keymap::load(keys_path.as_deref()) {
+            Ok(keymap) => (keymap, palette_status),
+            Err(error) => (
+                Keymap::default(),
+                format!("keys: {error}; using the default keys"),
+            ),
+        };
+        let pane_path = keys_path
+            .as_ref()
+            .or(palette_path.as_ref())
+            .and_then(|p| p.parent())
+            .map(|p| p.join("conversations-pane.json"));
+        let pane_workspace = corpus.workspace_url.clone();
+        let (pane_settings, keys_status) = match crate::conversations_pane::Settings::load(
+            pane_path.as_deref(),
+            &pane_workspace,
+        ) {
+            Ok(settings) => (settings, keys_status),
+            Err(e) => (
+                Default::default(),
+                format!("conversations-pane: {e}; showing everything"),
+            ),
+        };
+        let conversations_pane =
+            crate::conversations_pane::load_visibility(pane_path.as_deref(), &pane_workspace);
+        let mut app = App {
+            last_key: None,
+            channel_browser: None,
+            pane_menu: None,
+            pane_settings,
+            pane_path,
+            pane_workspace,
+            corpus,
+            tz,
+            focus: Focus::Convs,
+            conversations_pane,
+            sort: Sort::Recent,
+            filter: String::new(),
+            filtered: Vec::new(),
+            conv_cursor: 0,
+            top_section: None,
+            sent_generation: 0,
+            saved_messages: Vec::new(),
+            open: None,
+            stack: Vec::new(),
+            browser_jobs: Vec::new(),
+            sent_return: None,
+            mode: Mode::Normal,
+            help: false,
+            status: keys_status,
+            quit: false,
+            msgs_height: 0,
+            half_life_days,
+            job: None,
+            scan: None,
+            scan_overlay: None,
+            unread_fetch: None,
+            thread_fetch: None,
+            pending_search: None,
+            #[cfg(test)]
+            scan_gate: None,
+            nav_generation: 0,
+            spinner: 0,
+            live,
+            cache_dir,
+            lock,
+            api: None,
+            bg: None,
+            profile_job: None,
+            unread_count_job: None,
+            counts_pending: false,
+            group_job: None,
+            dm_users: HashMap::new(),
+            slackdump,
+            poll_every: Duration::from_secs(poll_secs),
+            last_poll: Instant::now(),
+            last_counts: Instant::now(),
+            picker: None,
+            inline_images: false,
+            images: HashMap::new(),
+            inline: HashMap::new(),
+            file_job: None,
+            conv_offset: 0,
+            highlight_cached: false,
+            show_version: false,
+            labels: false,
+            clock: None,
+            compose: None,
+            attachment: None,
+            attach_note: None,
+            tail_pending: None,
+            pending_delete: None,
+            muted: HashSet::new(),
+            starred: HashSet::new(),
+            starred_generation: 0,
+            starred_pending: false,
+            muted_generation: 0,
+            muted_pending: false,
+            draft: None,
+            counts_gen: 0,
+            palette,
+            palette_path,
+            keymap,
+            keys_path,
+        };
+        app.apply_filter();
+        if live {
+            app.bg = Some(live::sign_in(
+                app.corpus.workspace_url.clone(),
+                app.cache_dir.join("tmp"),
+            ));
+        }
+        app
+    }
+
+    /// Where `c` writes: the open thread replies in that thread, a search or
+    /// threads hit replies in the hit's thread, a timeline posts to its
+    /// conversation, the list posts to the highlighted conversation.
+    fn compose_target(&self) -> Result<Compose, String> {
+        if self.focus == Focus::Convs {
+            if self.top_section.is_some() { return Err("Select a message or conversation first".into()); }
+            let conv = *self.filtered.get(self.conv_cursor).ok_or("nothing highlighted")?;
+            let channel = &self.corpus.convs[conv];
+            return Ok(Compose { conv, cid: channel.id.clone(), thread: None, label: format!("message to {}",channel.name) });
+        }
+        let known = |cid: &str| -> Result<usize, String> {
+            self.corpus
+                .conv_by_channel(cid)
+                .ok_or_else(|| format!("{cid} is not a conversation this tool knows"))
+        };
+        match self.stack.last() {
+            Some(View::Thread { root, list, .. }) => {
+                let cid = match list.msgs.first() {
+                    Some(m) => m.channel_id.clone(),
+                    None => self
+                        .open
+                        .as_ref()
+                        .map(|o| self.corpus.convs[o.conv].id.clone())
+                        .ok_or("no conversation")?,
+                };
+                let conv = known(&cid)?;
+                let name = self.corpus.convs[conv].name.clone();
+                Ok(Compose {
+                    conv,
+                    cid,
+                    thread: Some(*root),
+                    label: format!("reply in this thread in {name}"),
+                })
+            }
+            Some(View::Search { .. }) | Some(View::Threads { .. }) | Some(View::Unreads { .. }) | Some(View::Saved { .. }) | Some(View::Feed { .. }) => {
+                let m = self.selected().ok_or("no message selected")?;
+                let conv = known(&m.channel_id)?;
+                let name = self.corpus.convs[conv].name.clone();
+                let who = m
+                    .user
+                    .as_deref()
+                    .and_then(|u| self.corpus.user_name(u))
+                    .unwrap_or_else(|| "?".to_string());
+                Ok(Compose {
+                    conv,
+                    cid: m.channel_id.clone(),
+                    thread: Some(m.parent_id.unwrap_or(m.id)),
+                    label: format!("reply in {who}'s thread in {name}"),
+                })
+            }
+            Some(View::Raw { .. })
+            | Some(View::Image { .. })
+            | Some(View::Reactions { .. })
+            | Some(View::ColorPalette { .. })
+            | Some(View::Keys { .. }) => Err("close this view first".to_string()),
+            None => {
+                let conv = match (self.focus, self.open.as_ref()) {
+                    (Focus::Msgs, Some(o)) => o.conv,
+                    _ => *self
+                        .filtered
+                        .get(self.conv_cursor)
+                        .ok_or("nothing highlighted")?,
+                };
+                let c = &self.corpus.convs[conv];
+                Ok(Compose {
+                    conv,
+                    cid: c.id.clone(),
+                    thread: None,
+                    label: format!("message to {}", c.name),
+                })
+            }
+        }
+    }
+
+    /// `/`: an empty command prompt; `find` alone clears the list filter.
+    fn open_command(&mut self) {
+        self.mode = Mode::Prompt {
+            kind: PromptKind::Command,
+            buf: Editor::default(),
+            previous: self.filter.clone(),
+        };
+    }
+
+    /// The list follows a `find`/`search` command as it is typed.
+    fn filter_live(&mut self, line: &str) {
+        if self.focus != Focus::Convs {
+            return;
+        }
+        if let Some(Command::Find(text)) = parse_command(line) {
+            // A search half-typed is not a name filter: neither `from:@` nor
+            // `message:` says anything about the conversation names. Either
+            // prefix counts only once it is complete, so the letters of
+            // `message` filter the list until the `:` lands and restores it,
+            // exactly as `from:` does until its `@` arrives.
+            if crate::author_search::has_author(&text) || crate::author_search::message_needle(&text).is_some() {
+                if let Mode::Prompt { previous, .. } = &self.mode { self.filter = previous.clone(); }
+                self.apply_filter(); return;
+            }
+            self.filter = text;
+            self.apply_filter();
+        }
+    }
+
+    /// Enter in the command prompt.
+    fn run_command(&mut self, line: &str, filter_before: &str) {
+        let name = line.split_whitespace().next().unwrap_or("").trim_start_matches('/');
+        crate::session_log::record("command", serde_json::json!({"name":complete::COMMANDS.iter().find(|c|c.name == name).map(|c|c.name).unwrap_or("unknown")}));
+        match parse_command(line) {
+            None => {
+                if self.focus == Focus::Convs {
+                    self.filter = filter_before.to_string();
+                    self.apply_filter();
+                }
+                if !line.trim().is_empty() {
+                    let names: Vec<&str> = complete::COMMANDS.iter().map(|c| c.name).collect();
+                    self.status = format!(
+                        "unknown command: {}; Tab completes, and the commands are {}",
+                        line.split_whitespace().next().unwrap_or(""),
+                        names.join(", ")
+                    );
+                }
+            }
+            Some(Command::Find(text)) => {
+                // `message: TEXT` from the list searches every archive's text
+                // instead of the conversation names; inside a conversation the
+                // prefix is redundant and drops to the ordinary search.
+                let needle = crate::author_search::message_needle(&text);
+                let across = needle.is_some() && self.focus == Focus::Convs;
+                let text = needle.unwrap_or(text);
+                if crate::author_search::has_author(&text) {
+                    self.restore_filter(filter_before);
+                    self.run_archive_search(&text, line);
+                } else if across {
+                    self.restore_filter(filter_before);
+                    // A needle of blanks would scan every archive for nothing
+                    // and ask Slack for nothing; it is an empty needle.
+                    if text.trim().is_empty() {
+                        self.status = "search what?".to_string();
+                    } else {
+                        self.run_archive_search(&text, line);
+                    }
+                } else if self.focus == Focus::Convs {
+                    self.filter = text;
+                    self.apply_filter();
+                } else if text.is_empty() {
+                    self.status = "search what?".to_string();
+                } else {
+                    self.run_search(&text);
+                }
+            }
+            Some(Command::Leave(name)) => {
+                self.restore_filter(filter_before);
+                self.leave_conv(&name);
+            }
+            Some(Command::Cache(op, name)) => {
+                self.restore_filter(filter_before);
+                self.cache_cmd(&op, &name);
+            }
+            Some(Command::Save(on)) => {
+                self.restore_filter(filter_before);
+                self.change_saved(on);
+            }
+            Some(Command::Star(on, name)) => {
+                self.restore_filter(filter_before);
+                self.star_cmd(on, &name);
+            }
+            Some(Command::Mute(on, name)) => {
+                self.restore_filter(filter_before);
+                self.mute_cmd(on, &name);
+            }
+            Some(Command::ColorPalette(preset)) => {
+                self.restore_filter(filter_before);
+                self.open_color_palette(&preset);
+            }
+            Some(Command::ConversationsPane) => {
+                self.restore_filter(filter_before);
+                self.open_conversations_pane();
+            }
+            Some(Command::Keys) => {
+                self.restore_filter(filter_before);
+                self.open_keys();
+            }
+            Some(Command::Version) => {
+                self.restore_filter(filter_before);
+                self.toggle_version();
+            }
+            Some(Command::Labels) => {
+                self.restore_filter(filter_before);
+                self.toggle_labels();
+            }
+            Some(Command::Upload(path)) => {
+                self.restore_filter(filter_before);
+                self.attach(&path);
+            }
+        }
+    }
+
+    /// `/colorpalette [name]`: the editor, over a named palette when one is
+    /// given. Esc puts back the colors it opened with.
+    fn open_color_palette(&mut self, preset: &str) {
+        // Leaving for color palette.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        let applied = if preset.trim().is_empty() {
+            None
+        } else {
+            match Palette::preset(preset) {
+                Some(palette) => Some(palette),
+                None => {
+                    let names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+                    self.status = format!(
+                        "no palette named {}; the palettes are {}",
+                        preset.trim(),
+                        names.join(", ")
+                    );
+                    return;
+                }
+            }
+        };
+        let return_focus = self.focus;
+        self.stack.push(View::ColorPalette {
+            highlights: None,
+            cursor: 0,
+            original: self.palette.clone(),
+            return_focus,
+        });
+        self.focus = Focus::Msgs;
+        let status = match applied {
+            Some(mut palette) => {
+                palette.highlights = self.palette.highlights.clone();
+                self.palette = palette;
+                self.mark_all_dirty();
+                format!(
+                    "{} applied; Enter saves it, Esc puts the old colors back",
+                    preset.trim().to_lowercase()
+                )
+            }
+            None => "j/k a role; h/l a color; e types one (name or #rrggbb); d resets it, D resets all; Enter saves; Esc cancels"
+                .to_string(),
+        };
+        self.status = status;
+    }
+
+    /// `/version`: the version in the corner of the status line, or not.
+    fn toggle_version(&mut self) {
+        self.show_version = !self.show_version;
+        self.status = if self.show_version {
+            format!("version {}", crate::version())
+        } else {
+            String::new()
+        };
+    }
+
+    /// `/labels`: name every element on screen after the code that draws it,
+    /// or stop. Nothing is written: the next start has it off again.
+    fn toggle_labels(&mut self) {
+        self.labels = !self.labels;
+        self.status = if self.labels { "labels on" } else { "labels off" }.to_string();
+    }
+
+    /// `/keys`: the key editor over the messages pane.
+    fn open_keys(&mut self) {
+        // Leaving for keys editor.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        if matches!(self.stack.last(), Some(View::Keys { .. })) {
+            return;
+        }
+        let return_focus = self.focus;
+        self.stack.push(View::Keys {
+            cursor: 0,
+            original: self.keymap.clone(),
+            return_focus,
+            capture: None,
+        });
+        self.focus = Focus::Msgs;
+        self.status = "j/k an action; e binds the next key you press, A adds one, d resets the action, D resets all; Enter saves; Esc cancels".to_string();
+    }
+
+    fn keys_action(&self) -> Option<Action> {
+        match self.stack.last() {
+            Some(View::Keys { cursor, .. }) => DEFAULTS.get(*cursor).map(|(action, _)| *action),
+            _ => None,
+        }
+    }
+
+    fn on_keys_key(&mut self, key: KeyEvent, control: bool) {
+        let capture = match self.stack.last() {
+            Some(View::Keys { capture, .. }) => *capture,
+            _ => return,
+        };
+        if let Some(keep) = capture {
+            if key.code == KeyCode::Esc {
+                self.set_keys_capture(None);
+                self.status = "nothing bound".to_string();
+                return;
+            }
+            let Some(chord) = Chord::of(key) else {
+                self.status = "that key cannot carry a binding".to_string();
+                return;
+            };
+            let Some(action) = self.keys_action() else {
+                return;
+            };
+            let stolen = self.keymap.bind(action, chord, keep);
+            self.set_keys_capture(None);
+            self.status = match stolen {
+                Some(other) => format!(
+                    "{} is now {:?}, no longer {:?}",
+                    chord.text(),
+                    action.label(),
+                    other.label()
+                ),
+                None => format!("{} is now {:?}", chord.text(), action.label()),
+            };
+            return;
+        }
+        match (key.code, control) {
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
+                if let Some(View::Keys { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = (*cursor + 1).min(DEFAULTS.len() - 1);
+                }
+            }
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
+                if let Some(View::Keys { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => {
+                if let Some(View::Keys { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = 0;
+                }
+            }
+            (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
+                if let Some(View::Keys { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = DEFAULTS.len() - 1;
+                }
+            }
+            (KeyCode::Char('e'), false) => {
+                self.set_keys_capture(Some(false));
+                self.status = "press the key to bind, Esc to leave it alone".to_string();
+            }
+            (KeyCode::Char('A'), false) => {
+                self.set_keys_capture(Some(true));
+                self.status = "press the key to add, Esc to leave it alone".to_string();
+            }
+            (KeyCode::Char('d'), false) => {
+                if let Some(action) = self.keys_action() {
+                    self.keymap.reset(action);
+                    self.status = format!("{}: {}", action.label(), self.keymap.text(action));
+                }
+            }
+            (KeyCode::Char('D'), false) => {
+                self.keymap = Keymap::default();
+                self.status = "every key back to its default".to_string();
+            }
+            (KeyCode::Enter, _) => self.save_keys(),
+            (KeyCode::Esc, _) => {
+                let (original, return_focus) = match self.stack.pop() {
+                    Some(View::Keys {
+                        original,
+                        return_focus,
+                        ..
+                    }) => (original, return_focus),
+                    _ => return,
+                };
+                self.keymap = original;
+                self.focus = return_focus;
+                self.status = "keys unchanged".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    fn set_keys_capture(&mut self, next: Option<bool>) {
+        if let Some(View::Keys { capture, .. }) = self.stack.last_mut() {
+            *capture = next;
+        }
+    }
+
+    fn save_keys(&mut self) {
+        let return_focus = match self.stack.pop() {
+            Some(View::Keys { return_focus, .. }) => return_focus,
+            _ => return,
+        };
+        self.focus = return_focus;
+        self.status = match self.keymap.save(self.keys_path.as_deref()) {
+            Ok(path) => format!("keys saved to {}", path.display()),
+            Err(error) => format!("keys: {error}"),
+        };
+    }
+
+    /// `e` in the palette: a color typed as a name or as `#rrggbb`.
+    fn set_palette_color(&mut self, text: &str) {
+        let Some(role) = self.palette_role() else {
+            return;
+        };
+        match crate::palette::parse_color(text) {
+            Some(color) => {
+                self.palette.set(role, color);
+                self.mark_all_dirty();
+                self.status = format!("{}: {}", role.label(), self.palette.color_name(role));
+            }
+            None => {
+                self.status = format!("{text:?} is not a color name or #rrggbb");
+            }
+        }
+    }
+
+    fn palette_role(&self) -> Option<Role> {
+        match self.stack.last() {
+            Some(View::ColorPalette { cursor, .. }) => ROLES.get(*cursor).copied(),
+            _ => None,
+        }
+    }
+
+    fn on_palette_key(&mut self, key: KeyEvent, control: bool) {
+        let editing_word = matches!(self.stack.last(), Some(View::ColorPalette { highlights: Some(menu), .. }) if menu.editing());
+        if (control && key.code == KeyCode::Char('c')) || (!control && !editing_word && key.code == KeyCode::Char('q')) { self.quit = true; return; }
+        if let Some(View::ColorPalette { highlights: Some(menu), .. }) = self.stack.last_mut() {
+            let back = menu.key(key, &mut self.palette);
+            if back {
+                if let Some(View::ColorPalette { highlights, cursor, .. }) = self.stack.last_mut() { *highlights = None; *cursor = 0; }
+            }
+            self.mark_all_dirty();
+            return;
+        }
+        let words_selected = matches!(self.stack.last(), Some(View::ColorPalette { cursor, .. }) if *cursor == ROLES.len());
+        if !control && (key.code == KeyCode::Char('W') || (words_selected && matches!(key.code, KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')))) {
+            if let Some(View::ColorPalette { highlights, .. }) = self.stack.last_mut() {
+                *highlights = Some(crate::word_highlights::Menu::default());
+            }
+            return;
+        }
+        match (key.code, control) {
+            (KeyCode::Char('c'), true) | (KeyCode::Char('q'), false) => self.quit = true,
+            (KeyCode::Char('?'), false) | (KeyCode::Char('H'), false) => self.help = true,
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
+                if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = (*cursor + 1).min(ROLES.len());
+                }
+            }
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
+                if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => {
+                if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = 0;
+                }
+            }
+            (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
+                if let Some(View::ColorPalette { cursor, .. }) = self.stack.last_mut() {
+                    *cursor = ROLES.len();
+                }
+            }
+            (KeyCode::Char('h'), false) | (KeyCode::Left, _) => {
+                if let Some(role) = self.palette_role() {
+                    self.palette.cycle(role, -1);
+                    self.mark_all_dirty();
+                }
+            }
+            (KeyCode::Char('l'), false) | (KeyCode::Right, _) => {
+                if let Some(role) = self.palette_role() {
+                    self.palette.cycle(role, 1);
+                    self.mark_all_dirty();
+                }
+            }
+            (KeyCode::Char('d'), false) => {
+                if let Some(role) = self.palette_role() {
+                    self.palette.reset(role);
+                    self.mark_all_dirty();
+                }
+            }
+            (KeyCode::Char('e'), false) => {
+                if let Some(role) = self.palette_role() {
+                    self.mode = Mode::Prompt {
+                        kind: PromptKind::PaletteColor,
+                        buf: Editor::with(self.palette.color_name(role)),
+                        previous: String::new(),
+                    };
+                }
+            }
+            (KeyCode::Char('D'), false) => {
+                self.palette = Palette::default();
+                self.mark_all_dirty();
+            }
+            (KeyCode::Enter, _) => {
+                let path = match self.palette.save(self.palette_path.as_deref()) {
+                    Ok(path) => path,
+                    Err(error) => { self.status = format!("palette: {error}"); return; }
+                };
+                let return_focus = match self.stack.pop() {
+                    Some(View::ColorPalette { return_focus, .. }) => return_focus,
+                    _ => return,
+                };
+                self.focus = return_focus;
+                self.status = format!("color palette saved to {}", path.display());
+            }
+            (KeyCode::Esc, _) => {
+                let (original, return_focus) = match self.stack.pop() {
+                    Some(View::ColorPalette {
+                        original,
+                        return_focus,
+                        ..
+                    }) => (original, return_focus),
+                    _ => return,
+                };
+                self.palette = original;
+                self.focus = return_focus;
+                self.mark_all_dirty();
+                self.status = "color palette unchanged".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    fn restore_filter(&mut self, before: &str) {
+        if self.focus == Focus::Convs && self.filter != before {
+            self.filter = before.to_string();
+            self.apply_filter();
+        }
+    }
+
+    /// The conversation a command acts on: the named one, else the open
+    /// one, else the highlighted one.
+    /// Conversation names for completion, each once, in list order.
+    pub fn conv_names(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.filtered
+            .iter()
+            .copied()
+            .chain(0..self.corpus.convs.len())
+            .filter_map(|i| {
+                let name = self.corpus.convs.get(i)?.name.clone();
+                seen.insert(name.to_lowercase()).then_some(name)
+            })
+            .collect()
+    }
+
+    fn target_conv(&self, name: &str) -> Result<usize, String> {
+        if name.is_empty() && ((self.focus == Focus::Convs && self.top_section.is_some()) || (self.focus == Focus::Msgs && self.open.is_none())) { return Err("Select a conversation first".into()); }
+        if !name.is_empty() {
+            return self
+                .corpus
+                .conv_by_name(name)
+                .ok_or_else(|| format!("no conversation named {name}"));
+        }
+        match (self.focus, self.open.as_ref()) {
+            (Focus::Msgs, Some(o)) => Ok(o.conv),
+            _ => self
+                .filtered
+                .get(self.conv_cursor)
+                .copied()
+                .ok_or_else(|| "nothing highlighted".to_string()),
+        }
+    }
+
+    /// `/leave [#name]`. A direct message has no membership to give up.
+    fn leave_conv(&mut self, name: &str) {
+        let Some(c) = self.api.clone() else {
+            self.status = "leaving needs the Slack sign-in".to_string();
+            return;
+        };
+        let idx = match self.target_conv(name) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let conv = &self.corpus.convs[idx];
+        if conv.kind == Kind::Im {
+            self.status = format!("{} is a direct message; nothing to leave", conv.name);
+            return;
+        }
+        if conv.left {
+            self.status = format!("{} was already left", conv.name);
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "a fetch is already running; try again in a moment".to_string();
+            return;
+        }
+        self.job = Some(live::api_leave(c, idx, conv.id.clone()));
+    }
+
+    /// The archive directory behind a conversation, and whether other
+    /// conversations share it (the multi-channel archive).
+    fn archive_dir(&self, idx: usize) -> Option<(PathBuf, bool)> {
+        let c = &self.corpus.convs[idx];
+        if c.live_only {
+            return None;
+        }
+        let archive = &self.corpus.archives[c.archive];
+        let shared = archive.conn.query_row("SELECT COUNT(DISTINCT CHANNEL_ID) FROM main.MESSAGE", [], |row| row.get::<_,i64>(0))
+            .map(|count| count > 1).unwrap_or(true)
+            || self.corpus.archives.iter().any(|other| other.source_dirs.iter().skip(1).any(|dir| dir == &archive.dir));
+        Some((self.corpus.archives[c.archive].dir.clone(), shared))
+    }
+
+    /// `/cache start|stop|wipe [#name]`: archive a conversation, pause its
+    /// hourly refresh with a `.paused` marker the refresh script honours,
+    /// or delete its archive.
+    fn cache_cmd(&mut self, op: &str, name: &str) {
+        if op == "highlight" {
+            self.highlight_cached = match name.trim().to_lowercase().as_str() {
+                "on" => true,
+                "off" => false,
+                "" => !self.highlight_cached,
+                other => {
+                    self.status = format!("/cache highlight takes on or off, not {other:?}");
+                    return;
+                }
+            };
+            self.status = if self.highlight_cached {
+                "cached channels in the palette's cached color".to_string()
+            } else {
+                "cached channels no longer colored".to_string()
+            };
+            return;
+        }
+        let idx = match self.target_conv(name) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let cname = self.corpus.convs[idx].name.clone();
+        if matches!(op, "stop" | "wipe") && self.corpus.conv_archive(&self.corpus.convs[idx])
+            .is_some_and(|archive| archive.source_dirs.len() > 1) {
+            self.status = format!("{cname} uses multiple archives; stop/wipe needs an explicit source archive");
+            return;
+        }
+        match (op, self.archive_dir(idx)) {
+            ("start", None) => {
+                let id = self.corpus.convs[idx].id.clone();
+                self.archive_new(&id);
+            }
+            ("start", Some((dir, _))) => {
+                let marker = dir.join(".paused");
+                if marker.exists() {
+                    self.status = match std::fs::remove_file(&marker) {
+                        Ok(()) => format!("{cname}: hourly refresh resumed"),
+                        Err(e) => format!("{cname}: {e}"),
+                    };
+                } else {
+                    self.status = format!("{cname} is cached and refreshed hourly already");
+                }
+            }
+            ("stop", None) | ("wipe", None) => self.status = format!("{cname} is not cached"),
+            (_, Some((_, true))) => {
+                self.status = format!(
+                    "{cname} lives in the shared multi-channel archive; stop and wipe apply to a conversation with its own archive"
+                );
+            }
+            ("stop", Some((dir, false))) => {
+                self.status =
+                    match std::fs::write(dir.join(".paused"), b"paused by slack-tui /cache stop\n")
+                    {
+                        Ok(()) => {
+                            format!("{cname}: hourly refresh paused; the archive stays readable")
+                        }
+                        Err(e) => format!("{cname}: {e}"),
+                    };
+            }
+            ("wipe", Some((dir, false))) => {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    self.status = format!("{cname}: {e}");
+                    return;
+                }
+                if self.open.as_ref().map(|o| o.conv) == Some(idx) {
+                    self.open = None;
+                    self.stack.clear();
+                }
+                let c = &mut self.corpus.convs[idx];
+                c.live_only = true;
+                c.msgs = 0;
+                self.apply_filter();
+                self.mark_all_dirty();
+                self.status = format!("{cname}: archive deleted; it is live-only now");
+            }
+            _ => {}
+        }
+    }
+
+    /// Replace the confirmed server snapshot, including conversations unmuted elsewhere.
+    fn take_muted(&mut self, ids: Vec<String>) {
+        self.muted = ids.into_iter().collect();
+        self.apply_filter();
+        self.mark_all_dirty();
+    }
+
+    fn sync_muted(&mut self) {
+        for c in self.corpus.convs.iter_mut() {
+            c.muted = self.muted.contains(&c.id);
+        }
+    }
+
+    fn open_sent(&mut self) { self.open_feed(TopSection::Sent); }
+
+    fn open_feed(&mut self, section: TopSection) {
+        // Leaving for SENT / MENTIONS.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        self.sent_return = None;
+        self.invalidate_thread_jobs();
+        if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
+        self.sent_generation = self.sent_generation.wrapping_add(1);
+        self.open = None;
+        self.stack.clear();
+        self.stack.push(View::Feed { section, list: MsgList::new(Vec::new(), false), next_cursor: None, generation: self.sent_generation });
+        self.top_section = Some(section);
+        self.focus = Focus::Msgs;
+        self.fetch_sent(false);
+    }
+
+    fn fetch_sent(&mut self, append: bool) {
+        if self.job.is_some() { self.status = "A request is running; retry when it finishes".into(); return; }
+        let Some(View::Feed { next_cursor, generation, section, .. }) = self.stack.last_mut() else { return; };
+        let section = *section;
+        let Some(client) = self.api.clone() else { self.status = format!("{} needs a Slack sign-in; r refreshes after signing in", section.label()); return; };
+        let me = self.corpus.me.clone();
+        let cursor = if append {
+            let Some(cursor) = next_cursor.clone() else { return; }; cursor
+        } else { "*".into() };
+        self.sent_generation = self.sent_generation.wrapping_add(1);
+        *generation = self.sent_generation;
+        self.job = Some(live::spawn(JobKind::Sent { generation: *generation, append }, format!("loading {}", section.label()), move || {
+            if section == TopSection::Mentions {
+                let me = match me { Some(id) => id, None => client.auth_test()?.0 };
+                crate::sent::mentions(&client, &cursor, &me).map(Done::SentPage)
+            } else { crate::sent::fetch(&client, &cursor).map(Done::SentPage) }
+        }));
+        self.status = format!("Loading {} from Slack…", section.label());
+    }
+
+    fn apply_sent(&mut self, generation: u64, append: bool, mut page: crate::sent::Page) {
+        for message in &mut page.messages {
+            message.channel_name = self.corpus.conv_by_channel(&message.channel_id).map(|index| self.corpus.convs[index].name.clone())
+                .or_else(|| self.corpus.channel_names.get(&message.channel_id).cloned())
+                .or_else(|| message.channel_name.clone()).or_else(|| Some(message.channel_id.clone()));
+        }
+        let Some(View::Feed { list, next_cursor, section, .. }) = self.stack.iter_mut().find(|view| matches!(view,View::Feed {generation: current,..} if *current == generation)) else { return; };
+        let selected = list.selected().map(|m| (m.channel_id.clone(),m.id));
+        let mut messages = if append { list.msgs.clone() } else { Vec::new() };
+        let mut seen: HashSet<(String,i64)> = messages.iter().map(|m|(m.channel_id.clone(),m.id)).collect();
+        messages.extend(page.messages.into_iter().filter(|m|seen.insert((m.channel_id.clone(),m.id))));
+        messages.sort_by_key(|m|std::cmp::Reverse(m.id));
+        *list = MsgList::new(messages,false);
+        if append { list.cursor = selected.and_then(|(cid,id)|list.msgs.iter().position(|m|m.channel_id==cid && m.id==id)).unwrap_or(0); }
+        *next_cursor = page.next_cursor;
+        self.status = format!("{}: {} messages loaded{}",section.label(),list.len(),if next_cursor.is_some() { "; j at end loads older" } else { "" });
+    }
+
+    fn open_saved(&mut self) {
+        // Leaving for SAVED.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        self.sent_return = None;
+        self.invalidate_thread_jobs();
+        if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
+        self.refresh_saved(None);
+        self.open = None;
+        self.stack.clear();
+        self.stack.push(View::Saved { list: MsgList::new(self.saved_messages.clone(), false) });
+        self.focus = Focus::Msgs;
+        self.top_section = Some(TopSection::Saved);
+    }
+
+    fn change_saved(&mut self, save: bool) {
+        if self.focus != Focus::Msgs { self.status = "Select a message first".into(); return; }
+        let Some(message) = self.selected().cloned() else { self.status = "No message selected".into(); return; };
+        if save && message.data["saved_unavailable"] == true { self.status = "Message content unavailable; refresh SAVED first".into(); return; }
+        self.refresh_saved(Some((message, save)));
+    }
+
+    fn refresh_saved(&mut self, change: Option<(Msg, bool)>) {
+        if self.job.is_some() { self.status = "A request is running; retry when it finishes".into(); return; }
+        let Some(client) = self.api.clone() else { self.status = "Saved messages need a Slack sign-in; r refreshes SAVED after signing in".into(); return; };
+        let mut known = self.saved_messages.clone();
+        if let Some(open) = &self.open { known.extend(open.list.msgs.clone()); }
+        for view in &self.stack {
+            if let View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Unreads { list, .. } | View::Saved { list } | View::Feed { list, .. } = view { known.extend(list.msgs.clone()); }
+        }
+        if let Some((message, _)) = &change { known.push(message.clone()); }
+        let sources = self.corpus.convs.iter().filter(|conv| !conv.live_only).map(|conv| {
+            let archive = &self.corpus.archives[conv.archive];
+            let mut dirs = archive.source_dirs.clone();
+            if !dirs.contains(&archive.dir) { dirs.push(archive.dir.clone()); }
+            (conv.id.clone(), dirs)
+        }).collect();
+        let cache = self.cache_dir.clone();
+        self.job = Some(live::spawn(JobKind::Saved, if change.is_some() { "updating saved message" } else { "loading saved messages" }.into(), move || {
+            let changed = change.is_some();
+            if let Some((message, save)) = change { crate::saved::change(&client, &message, save)?; }
+            crate::saved::fetch(&client, known, sources, cache).map(Done::Saved).map_err(|error| {
+                if changed { format!("Saved state verified, but list refresh failed: {error}; r refreshes SAVED") } else { error }
+            })
+        }));
+        self.status = "Loading Slack Later…".into();
+    }
+
+    fn apply_saved(&mut self, mut messages: Vec<Msg>) {
+        for message in &mut messages {
+            message.channel_name = self.corpus.conv_by_channel(&message.channel_id).map(|index| self.corpus.convs[index].name.clone())
+                .or_else(|| self.corpus.channel_names.get(&message.channel_id).cloned())
+                .or_else(|| Some(message.channel_id.clone()));
+        }
+        self.saved_messages = messages;
+        for view in &mut self.stack {
+            if let View::Saved { list } = view {
+                let selected = list.selected().map(|m| (m.channel_id.clone(), m.id));
+                let cursor = list.cursor;
+                *list = MsgList::new(self.saved_messages.clone(), false);
+                list.cursor = selected.and_then(|(cid, id)| list.msgs.iter().position(|m| m.channel_id == cid && m.id == id))
+                    .unwrap_or(cursor).min(list.len().saturating_sub(1));
+            }
+        }
+        self.status = format!("{} saved messages from Slack", self.saved_messages.len());
+    }
+
+    fn star_cmd(&mut self, on: bool, name: &str) {
+        let index = match self.target_conv(name) {
+            Ok(index) => index,
+            Err(error) => { self.status = error; return; }
+        };
+        let Some(client) = self.api.clone().filter(|_| self.live) else {
+            self.status = "Star/unstar needs a Slack sign-in".into();
+            return;
+        };
+        if self.job.is_some() {
+            self.status = "Wait for the current Slack operation".into();
+            return;
+        }
+        self.starred_generation = self.starred_generation.wrapping_add(1);
+        self.job = Some(live::api_set_starred(client, self.conv(index).id.clone(), on));
+    }
+    fn take_starred_snapshot(&mut self, generation: u64, ids: Vec<String>) {
+        if generation == self.starred_generation {
+            self.starred = ids.into_iter().collect();
+            self.apply_filter();
+        }
+    }
+    fn finish_star(&mut self, cid: &str, starred: bool, ids: Vec<String>) {
+        self.starred_generation = self.starred_generation.wrapping_add(1);
+        self.take_starred_snapshot(self.starred_generation, ids);
+        let name = self.corpus.convs.iter().find(|c| c.id == cid).map(|c| c.name.as_str()).unwrap_or(cid);
+        self.status = format!("{} {} in Slack (verified)", name, if starred { "starred" } else { "unstarred" });
+    }
+
+    /// `/mute` and `/unmute` update Slack; local state changes only after verification.
+    fn mute_cmd(&mut self, on: bool, name: &str) {
+        let idx = match self.target_conv(name) {
+            Ok(i) => i,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let Some(client) = self.api.clone().filter(|_| self.live) else {
+            self.status = "Mute/unmute needs a Slack sign-in; no local override was changed".into();
+            return;
+        };
+        if self.job.is_some() {
+            self.status = "Wait for the current Slack operation before changing mute state".into();
+            return;
+        }
+        let c = &self.corpus.convs[idx];
+        self.status = format!(
+            "{} {} in Slack…",
+            if on { "Muting" } else { "Unmuting" },
+            c.name
+        );
+        self.muted_generation = self.muted_generation.wrapping_add(1);
+        self.job = Some(live::api_set_muted(client, c.id.clone(), on));
+    }
+
+    fn finish_mute(&mut self, cid: &str, muted: bool, ids: Vec<String>) {
+        self.muted_generation = self.muted_generation.wrapping_add(1);
+        self.take_muted(ids);
+        let name = self
+            .corpus
+            .convs
+            .iter()
+            .find(|c| c.id == cid)
+            .map(|c| c.name.as_str())
+            .unwrap_or(cid);
+        self.status = format!(
+            "{name} {} in Slack (verified)",
+            if muted { "muted" } else { "unmuted" }
+        );
+    }
+
+    fn take_muted_snapshot(&mut self, gen: u64, ids: Vec<String>) {
+        if gen == self.muted_generation {
+            self.take_muted(ids);
+        }
+    }
+
+    /// `D`: arm a delete of the selected message, or carry out the one
+    /// already armed. Slack only lets the author withdraw a message, so a
+    /// message written by someone else is refused before the round trip.
+    fn delete_selected(&mut self) {
+        if let Some(pending) = self.pending_delete.take() {
+            let Some(c) = self.api.clone() else {
+                self.status = "deleting needs the Slack sign-in".to_string();
+                return;
+            };
+            if self.job.is_some() {
+                self.status = "a fetch is already running; press D again in a moment".to_string();
+                return;
+            }
+            self.job = Some(live::api_delete(c, pending.cid, pending.id, pending.root));
+            return;
+        }
+        if self.api.is_none() {
+            self.status = "deleting needs the Slack sign-in".to_string();
+            return;
+        }
+        let Some(m) = self.selected() else {
+            self.status = "no message selected".to_string();
+            return;
+        };
+        let Some(me) = self.corpus.me.as_deref() else {
+            self.status = "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
+            return;
+        };
+        if m.user.as_deref() != Some(me) {
+            let who = m
+                .user
+                .as_deref()
+                .and_then(|u| self.corpus.user_name(u))
+                .unwrap_or_else(|| "someone else".to_string());
+            self.status = format!("that message is {who}'s; Slack only deletes your own");
+            return;
+        }
+        let first = m.text.lines().next().unwrap_or("").trim().to_string();
+        let shown: String = first.chars().take(40).collect();
+        self.pending_delete = Some(PendingDelete {
+            cid: m.channel_id.clone(),
+            id: m.id,
+            root: m.parent_id.filter(|root| *root != m.id),
+        });
+        self.status = if shown.is_empty() {
+            "delete this message? D again confirms, any other key cancels".to_string()
+        } else {
+            format!("delete \u{201c}{shown}\u{201d}? D again confirms, any other key cancels")
+        };
+    }
+
+    /// Drop a deleted message from every list holding it, and from the
+    /// THREADS card of the thread it was a reply in. `root` is None for a
+    /// message that is not a reply; deleting a thread's root drops that
+    /// card whole, through `remove`.
+    ///
+    /// An UNREADS card is the exception: its item is one unread message of a
+    /// conversation that has others, so it is promoted rather than removed.
+    fn drop_message(&mut self, cid: &str, root: Option<i64>, id: i64) {
+        let mut lists: Vec<&mut MsgList> = Vec::new();
+        if let Some(o) = self.open.as_mut() {
+            lists.push(&mut o.list);
+        }
+        for view in self.stack.iter_mut() {
+            match view {
+                View::Unreads { .. } => {}
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Saved { list } | View::Feed { list, .. } => {
+                    lists.push(list)
+                }
+                _ => {}
+            }
+        }
+        for list in lists {
+            // A THREADS card draws, and counts, replies that are in no
+            // list's `msgs`.
+            if let Some(root) = root {
+                list.drop_reply(cid, root, id);
+            }
+            // Message ids are Slack timestamps, so two conversations can
+            // carry the same one; a cross-conversation list has to match on
+            // both or it drops another conversation's message.
+            let Some(at) = list.msgs.iter().position(|m| m.id == id && m.channel_id == cid) else {
+                continue;
+            };
+            list.remove(at);
+        }
+        let views: Vec<usize> = self
+            .stack
+            .iter()
+            .enumerate()
+            .filter(|(_, view)| matches!(view, View::Unreads { .. }))
+            .map(|(at, _)| at)
+            .collect();
+        for view in views {
+            self.drop_from_unreads(view, cid, id);
+        }
+    }
+
+    /// The delete, applied to one UNREADS view. A card there stands for a
+    /// conversation rather than for the message it leads with, so the message
+    /// comes off whichever part of the card held it and the card stays: off
+    /// the tail, off the elided count, or — the lead itself — by promotion,
+    /// and by a rebuild from the archive when the card drew nothing else but
+    /// still counts messages it did not draw.
+    fn drop_from_unreads(&mut self, view: usize, cid: &str, id: i64) {
+        let Some(View::Unreads { list, deleted, .. }) = self.stack.get_mut(view) else { return };
+        deleted.push((cid.to_string(), id));
+        let skip = Self::deleted_in(deleted, cid);
+        // What each card stood for before the delete: the header carries that
+        // number, and whichever part of the card held the message, the card
+        // loses one.
+        let before: Vec<(String, i64, i64)> = list
+            .msgs
+            .iter()
+            .zip(&list.cards)
+            .map(|(m, card)| {
+                (m.channel_id.clone(), m.id, card.hidden + card.tail.len() as i64 + 1)
+            })
+            .collect();
+        // Off the tail, or off the count, keyed by each card's own lead. The
+        // channel is part of the key: two conversations can lead with the
+        // same id.
+        for (channel, lead, _) in &before {
+            if channel == cid && *lead != id {
+                list.drop_reply(cid, *lead, id);
+            }
+        }
+        let lost_lead = list.msgs.iter().position(|m| m.id == id && m.channel_id == cid);
+        let mut refill = None;
+        if let Some(at) = lost_lead {
+            if list.promote_card(at).is_none() {
+                // Nothing drawn left to lead with. Messages the card only
+                // counted are still unread, so go back to the archive for
+                // them; a card counting none at all has nothing left to say.
+                refill = Some(at);
+            }
+        }
+        // The header's count is the card's own total, so it is renumbered
+        // only where it still says what that card said. A card whose unread
+        // messages the archive never held says something else and is left
+        // alone. Done while the indices still line up with the snapshot.
+        for (i, (_, _, was)) in before.iter().enumerate() {
+            let Some(card) = list.cards.get_mut(i) else { break };
+            let now = card.hidden + card.tail.len() as i64 + 1;
+            if now != *was && card.participants == Self::unread_label(*was) {
+                card.participants = Self::unread_label(now);
+            }
+        }
+        let Some(at) = refill else { return };
+        let Some(index) = self.corpus.conv_by_channel(cid) else { return };
+        // What the live phase fetched first. The archive is what could not
+        // build this card in the first place, so asking it for the messages
+        // the card still counts drops a card that has unread messages left.
+        let name = self.corpus.convs[index].name.clone();
+        let last_id = self.corpus.convs[index].last_id;
+        let rebuilt = match self.stack.get(view) {
+            Some(View::Unreads { fetched, .. }) => fetched
+                .get(cid)
+                .and_then(|run| Self::fetched_unread_card(name, run, &skip, last_id)),
+            _ => None,
+        }
+        .or_else(|| self.refill_unread_card(index, &skip));
+        let Some(View::Unreads { list, .. }) = self.stack.get_mut(view) else { return };
+        match rebuilt {
+            Some((lead, card)) => {
+                list.msgs[at] = lead;
+                list.cards[at] = card;
+                list.mark_dirty();
+            }
+            None => list.remove(at),
+        }
+    }
+
+    fn view_reactions(&mut self) {
+        let Some(message) = self.selected() else {
+            self.status = "no message selected".into();
+            return;
+        };
+        let conversation = self.corpus.conv_by_channel(&message.channel_id)
+            .map(|index| &self.corpus.convs[index]);
+        let archive = match self.stack.last() {
+            Some(View::Thread { live: Some(archive), .. }) => Some(archive.as_ref()),
+            _ => conversation.and_then(|conv| self.corpus.conv_archive(conv)),
+        };
+        let context = Ctx { archive, corpus: &self.corpus, tz: self.tz,
+            image_font: None, last_read: None, palette: &self.palette };
+        let channel = conversation.map(|conv| conv.name.clone())
+            .or_else(|| message.channel_name.as_ref().map(|name| format!("#{}", name.trim_start_matches('#'))))
+            .unwrap_or_else(|| message.channel_id.clone());
+        let title = format!("{channel} · Reactions · {} {} · {}",
+            self.tz.fmt(message.id / 1_000_000, "%Y-%m-%d %H:%M:%S"), self.tz.label(), context.author(message));
+        let lines = reaction_details(message, &context);
+        self.pending_delete = None;
+        // Leaving for the reactions view.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        self.stack.push(View::Reactions { title, lines, scroll: 0 });
+    }
+
+    /// `/upload [path]`: hold a file for the next send and open the compose
+    /// prompt, so a comment can go with it. No path means the clipboard.
+    fn attach(&mut self, argument: &str) {
+        let file = if argument.trim().is_empty() {
+            crate::clip::image(&self.cache_dir.join("uploads"))
+        } else {
+            let text = argument.trim().trim_matches(['"', '\'']);
+            let path = match text.strip_prefix("~/") {
+                Some(rest) => match std::env::var_os("HOME") {
+                    Some(home) => PathBuf::from(home).join(rest),
+                    None => PathBuf::from(text),
+                },
+                None => PathBuf::from(text),
+            };
+            match path.is_file() {
+                true => Ok(path),
+                false => Err(format!("{}: not a file", path.display())),
+            }
+        };
+        match file {
+            Ok(path) => {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let name = file_name(&path);
+                self.attachment = Some(path);
+                self.compose();
+                if self.compose.is_some() {
+                    self.status = format!("{name} attached, {}", human_size(size));
+                } else {
+                    // No target took it: nothing to send it with.
+                    self.attachment = None;
+                }
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    /// Lets go of the held file, deleting it when this tool made it: a
+    /// clipboard capture nobody sent has no other owner.
+    fn drop_attachment(&mut self) -> Option<String> {
+        let path = self.attachment.take()?;
+        if path.starts_with(self.cache_dir.join("uploads")) {
+            let _ = std::fs::remove_file(&path);
+        }
+        Some(file_name(&path))
+    }
+
+    /// Ctrl-v in the compose prompt: the clipboard's image, held for the send.
+    fn attach_clipboard(&mut self) {
+        match crate::clip::image(&self.cache_dir.join("uploads")) {
+            Ok(path) => {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                self.drop_attachment();
+                self.status = format!("{} attached, {}", file_name(&path), human_size(size));
+                self.attach_note = None;
+                self.attachment = Some(path);
+            }
+            Err(error) => {
+                self.status = error.clone();
+                self.attach_note = Some(clip_note(&error));
+            }
+        }
+    }
+
+    /// `c`: the compose prompt, with the unsent draft if one was kept.
+    fn compose(&mut self) {
+        if self.api.is_none() {
+            self.status = "sending needs the Slack sign-in".to_string();
+            return;
+        }
+        match self.compose_target() {
+            Ok(t) => {
+                let buf = match &self.draft {
+                    Some(d) if d.cid == t.cid && d.thread == t.thread => d.text.clone(),
+                    _ => String::new(),
+                };
+                self.compose = Some(t);
+                self.attach_note = None;
+                self.mode = Mode::Prompt {
+                    kind: PromptKind::Compose,
+                    buf: Editor::with(buf),
+                    previous: String::new(),
+                };
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// `>`: the selected message quoted, with the answer written under it.
+    ///
+    /// Slack has no quote-reply gesture, so this writes the convention people
+    /// hand-roll: the earlier message as a `>` block, an empty line, and the
+    /// cursor on it. Nothing is sent here — the prompt this opens is an
+    /// ordinary compose draft, and `send_message` is still what posts it.
+    ///
+    /// What is quoted is the message's own `text`, not the terminal's rendering
+    /// of it, so mentions and links post as mentions and links. Where it goes
+    /// is whatever `compose_target` says from this position, so `>` and `c`
+    /// never disagree about the destination.
+    fn quote_reply(&mut self) {
+        if self.api.is_none() {
+            self.status = "sending needs the Slack sign-in".to_string();
+            return;
+        }
+        let Some(source) = self.selected().map(|m| m.text.clone()) else {
+            self.status = "select a message first".to_string();
+            return;
+        };
+        if source.trim().is_empty() {
+            self.status = "nothing to quote".to_string();
+            return;
+        }
+        let target = match self.compose_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let quote = format!("{}\n", crate::edit::quote_block(&source));
+        // A draft already typed for this target is kept, below the quote: the
+        // key adds a quotation, it never discards what was written.
+        let kept = match &self.draft {
+            Some(d) if d.cid == target.cid && d.thread == target.thread => d.text.clone(),
+            _ => String::new(),
+        };
+        // Cleared rather than left alone, so a "nothing to quote" from the
+        // message before this one cannot sit under an open box contradicting it.
+        self.status = if kept.is_empty() {
+            String::new()
+        } else {
+            "quoted above your draft".to_string()
+        };
+        // The answer always gets an empty line of its own. `quote` already ends
+        // in the newline that closes its last quoted line, so a kept draft
+        // needs a second one: without it the draft occupies the row the cursor
+        // is on, and the first character typed joins the answer to it.
+        let body = if kept.is_empty() {
+            quote.clone()
+        } else {
+            format!("{quote}\n{kept}")
+        };
+        // The empty line under the quote, which `Editor::with` would leave the
+        // cursor past when a kept draft follows it.
+        let cursor = quote.len();
+        let mut buf = Editor::with(body.clone());
+        buf.cursor = cursor;
+        self.compose = Some(target);
+        self.attach_note = None;
+        self.mode = Mode::Prompt {
+            kind: PromptKind::Compose,
+            buf,
+            // What was prefilled, so Esc can tell an untouched quote from one
+            // that was written into. Empty for every other prompt.
+            previous: body,
+        };
+    }
+
+    /// The typed text, remembered with the target the prompt was opened for.
+    /// An emptied prompt drops its own draft and leaves another target's alone.
+    fn keep_draft(&mut self, text: String) {
+        let Some(t) = self.compose.as_ref() else {
+            return;
+        };
+        let same = |d: &Draft| d.cid == t.cid && d.thread == t.thread;
+        if text.trim().is_empty() {
+            if self.draft.as_ref().is_some_and(same) {
+                self.draft = None;
+            }
+            return;
+        }
+        self.draft = Some(Draft {
+            cid: t.cid.clone(),
+            thread: t.thread,
+            text,
+        });
+    }
+
+    /// Enter in the compose prompt. The draft stays until Slack confirms, so
+    /// a failed send is not lost.
+    fn send_message(&mut self, text: String) {
+        let Some(t) = self.compose.take() else {
+            return;
+        };
+        if text.trim().is_empty() && self.attachment.is_none() {
+            self.status = "nothing to send".to_string();
+            return;
+        }
+        let Some(c) = self.api.clone() else {
+            self.compose = Some(t);
+            self.keep_draft(text);
+            self.status = "sending needs the Slack sign-in".to_string();
+            return;
+        };
+        if self.job.is_some() {
+            self.compose = Some(t);
+            self.keep_draft(text);
+            self.status = "a fetch is already running; press c again in a moment".to_string();
+            return;
+        }
+        let wire = self.link_mentions(text.trim());
+        self.draft = Some(Draft {
+            cid: t.cid.clone(),
+            thread: t.thread,
+            text,
+        });
+        let uploads = self.cache_dir.join("uploads");
+        self.job = match self.attachment.take() {
+            Some(path) => Some(live::api_upload(
+                c, t.conv, t.cid, t.thread, path, wire, &uploads,
+            )),
+            None => Some(live::api_send(c, t.conv, t.cid, t.thread, wire)),
+        };
+    }
+
+    fn link_mentions(&self, text: &str) -> String {
+        link_mentions(text, |h| self.corpus.user_id(h))
+    }
+
+    pub fn sort_label(&self) -> String {
+        match self.sort {
+            Sort::Mine => format!("my activity ({:.0}d half-life)", self.half_life_days),
+            other => other.label().to_string(),
+        }
+    }
+
+    /// The clock the conversations pane reads once per render, in epoch
+    /// seconds. Pinned by `clock` in a test; the wall clock otherwise.
+    pub fn now_secs(&self) -> i64 {
+        self.clock
+            .unwrap_or_else(|| chrono::Utc::now().timestamp())
+    }
+
+    pub fn conv(&self, i: usize) -> &Conv {
+        &self.corpus.convs[i]
+    }
+
+    /// Which of Slack's conversation types a conversation is: what the `Type`
+    /// sort orders by and what the line under it names.
+    pub fn conv_type(&self, c: &Conv) -> crate::conv_type::ConvType {
+        crate::conv_type::ConvType::of(c.kind, c.archived, c.shared, self.is_app_dm(c))
+    }
+
+    /// A direct message whose counterpart is an app. An app appears in a
+    /// direct message as a bot user, so the counterpart's own record answers
+    /// — except Slackbot, whose record carries no `is_bot`, and which is named
+    /// here instead. A counterpart the archive could not settle, and one with
+    /// no user record at all, is a person: the flag is what makes it an app,
+    /// and nothing else may stand in for it.
+    fn is_app_dm(&self, c: &Conv) -> bool {
+        c.kind == Kind::Im
+            && c.im_counterpart
+                .as_deref()
+                .is_some_and(|user| user == SLACKBOT || self.corpus.user_is_bot(user))
+    }
+
+    pub fn open_conv_ref(&self) -> Option<&Conv> {
+        self.open.as_ref().map(|o| &self.corpus.convs[o.conv])
+    }
+
+    pub fn apply_filter(&mut self) {
+        self.sync_muted();
+        let needle = self.filter.trim_start_matches(['#', '@']).to_lowercase();
+        // Substring first, then the characters in order anywhere in the name.
+        let rank = |name: &str| -> Option<u8> {
+            let n = name.to_lowercase();
+            if needle.is_empty() || n.contains(&needle) {
+                return Some(0);
+            }
+            let mut rest = n.chars();
+            for ch in needle.chars() {
+                if !rest.any(|c| c == ch) {
+                    return None;
+                }
+            }
+            Some(1)
+        };
+        // A live-only entry whose channel an archive also holds (one made by
+        // `a` or `/cache start` this run) stays out of the list.
+        let convs_all = &self.corpus.convs;
+        let mut idx: Vec<usize> = (0..convs_all.len())
+            .filter(|&i| {
+                let c = &convs_all[i];
+                let twin = c.live_only && convs_all.iter().any(|x| !x.live_only && x.id == c.id);
+                !twin
+                    && self.pane_settings.visible(c)
+                    && (rank(&c.name).is_some() || c.id.to_lowercase() == needle)
+            })
+            .collect();
+        let convs = &self.corpus.convs;
+        match self.sort {
+            // Channels first, public and private together; then group DMs, then DMs.
+            Sort::Name => idx.sort_by(|&a, &b| {
+                let class = |c: &Conv| match c.kind {
+                    Kind::Channel | Kind::Private => 0,
+                    Kind::Mpim => 1,
+                    Kind::Im => 2,
+                };
+                (
+                    class(&convs[a]),
+                    convs[a].name.to_lowercase(),
+                    convs[a].archive,
+                )
+                    .cmp(&(
+                        class(&convs[b]),
+                        convs[b].name.to_lowercase(),
+                        convs[b].archive,
+                    ))
+            }),
+            // Recency-weighted score first; ties by raw count, then last activity.
+            Sort::Mine => idx.sort_by(|&a, &b| {
+                convs[b]
+                    .score
+                    .partial_cmp(&convs[a].score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then((convs[b].mine, convs[b].last_id).cmp(&(convs[a].mine, convs[a].last_id)))
+            }),
+            Sort::Recent => idx.sort_by(|&a, &b| convs[b].last_id.cmp(&convs[a].last_id)),
+            Sort::Size => idx.sort_by(|&a, &b| convs[b].msgs.cmp(&convs[a].msgs)),
+            // Slack's conversation types in the order `ConvType` declares
+            // them, and inside a type the `Recent` order, newest first.
+            Sort::Type => idx.sort_by(|&a, &b| {
+                self.conv_type(&convs[a])
+                    .cmp(&self.conv_type(&convs[b]))
+                    .then(convs[b].last_id.cmp(&convs[a].last_id))
+            }),
+        }
+        if !needle.is_empty() {
+            idx.sort_by_key(|&i| rank(&convs[i].name).unwrap_or(2));
+        }
+        // Muted conversations keep their unread color but sink to the end.
+        idx.sort_by_key(|&i| convs[i].muted);
+        // Stars take precedence over unread, mute, search rank and sort mode.
+        idx.sort_by_key(|&i| !self.starred.contains(&convs[i].id));
+        // Keep the highlighted conversation highlighted across a re-sort.
+        let current = self.filtered.get(self.conv_cursor).copied();
+        self.filtered = idx;
+        self.conv_cursor = current
+            .and_then(|c| self.filtered.iter().position(|&i| i == c))
+            .unwrap_or(0)
+            .min(self.filtered.len().saturating_sub(1));
+        // A shorter list must not leave the pane scrolled past its cursor.
+        self.conv_offset = self.conv_offset.min(self.conv_cursor);
+    }
+
+    // ------------------------------------------------------------- loading
+
+    fn ctx_for(&self, conv: usize) -> Ctx<'_> {
+        Ctx {
+            archive: self.corpus.conv_archive(&self.corpus.convs[conv]),
+            corpus: &self.corpus,
+            tz: self.tz,
+            image_font: self.image_font(),
+            last_read: None,
+            palette: &self.palette,
+        }
+    }
+
+    pub fn open_conv(&mut self, idx: usize) -> bool {
+        // Leaving for a conversation.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        if self.open.as_ref().map(|open| open.conv) != Some(idx) { self.sent_return = None; }
+        self.invalidate_thread_jobs();
+        self.top_section = None;
+        let conv = &self.corpus.convs[idx];
+        let cid = conv.id.clone();
+        if conv.live_only {
+            let list = MsgList::new(Vec::new(), false);
+            self.open = Some(Open {
+                conv: idx,
+                list,
+                total: 0,
+                has_older: false,
+                has_newer: false,
+                api_only: true,
+            });
+            self.stack.clear();
+            self.focus = Focus::Msgs;
+            self.counts_pending = true;
+            match self.api.clone() {
+                Some(c) if self.job.is_none() => {
+                    self.job = Some(live::api_older(c, idx, cid, 0));
+                    self.status = "loading from Slack".to_string();
+                }
+                Some(_) => self.status = "a fetch is already running".to_string(),
+                None => {
+                    self.status = "not signed in, and this conversation is not cached".to_string()
+                }
+            }
+            self.update_notes();
+            return true;
+        }
+        let a = &self.corpus.archives[conv.archive];
+        let total = a.timeline_count(&cid).unwrap_or(0);
+        let msgs = match a.timeline_page(&cid, None, None, PAGE) {
+            Ok(m) => m,
+            Err(e) => {
+                self.status = format!("{}: {e}", a.rel);
+                return false;
+            }
+        };
+        let has_older = (msgs.len() as i64) < total;
+        let since = msgs.last().map(|m| m.id).unwrap_or(0);
+        let mut list = MsgList::new(msgs, false);
+        list.cursor = list.len().saturating_sub(1);
+        // Land on the first unread message when the page holds one, with
+        // the highlighted divider above it on screen.
+        let last_read = self.corpus.convs[idx].last_read;
+        if last_read > 0 {
+            if let Some(first_new) = list.msgs.iter().position(|m| m.id > last_read) {
+                list.cursor = first_new;
+                list.align_top = true;
+            }
+        }
+        self.open = Some(Open {
+            conv: idx,
+            list,
+            total,
+            has_older,
+            has_newer: false,
+            api_only: false,
+        });
+        self.stack.clear();
+        self.focus = Focus::Msgs;
+        self.update_notes();
+        self.status.clear();
+        self.counts_pending = true;
+        // Whatever Slack has past the archive's end, quietly.
+        if let Some(c) = self.api.clone() {
+            if self.bg.is_none() && since > 0 {
+                self.bg = Some(live::api_tail(c, idx, cid, since, true));
+                self.last_poll = Instant::now();
+            }
+        }
+        true
+    }
+
+    fn update_notes(&mut self) {
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
+        let loaded = o.list.len() as i64;
+        o.list.top_note = if o.api_only {
+            o.has_older
+                .then(|| "older messages on Slack · k loads more".to_string())
+        } else if o.has_older {
+            Some(format!(
+                "{} older messages not loaded · k loads more, g loads the oldest",
+                o.total - loaded
+            ))
+        } else {
+            None
+        };
+        o.list.bottom_note = if o.has_newer {
+            Some("newer messages not loaded · j loads more, G loads the newest".to_string())
+        } else {
+            None
+        };
+        o.list.mark_dirty();
+    }
+
+    fn load_older(&mut self) {
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
+        if !o.has_older {
+            return;
+        }
+        if o.api_only {
+            let Some(c) = self.api.clone() else {
+                return;
+            };
+            if self.job.is_some() {
+                return;
+            }
+            let idx = o.conv;
+            let before = o.list.msgs.first().map(|m| m.id).unwrap_or(0);
+            let cid = self.corpus.convs[idx].id.clone();
+            self.job = Some(live::api_older(c, idx, cid, before));
+            return;
+        }
+        let conv = &self.corpus.convs[o.conv];
+        let a = &self.corpus.archives[conv.archive];
+        let oldest = o.list.msgs.first().map(|m| m.id);
+        let page = match a.timeline_page(&conv.id, oldest, None, PAGE) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("{e}");
+                return;
+            }
+        };
+        let n = page.len();
+        if n == 0 {
+            o.has_older = false;
+        } else {
+            o.list.msgs.splice(0..0, page);
+            o.list.cursor += n;
+            o.has_older = n >= PAGE;
+            o.list.mark_dirty();
+        }
+        self.status = format!("loaded {n} older");
+        self.update_notes();
+    }
+
+    fn load_newer(&mut self) {
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
+        if !o.has_newer { return; }
+        if o.api_only {
+            if self.job.is_none() {
+                if let Some(client) = self.api.clone() {
+                    let since = o.list.msgs.last().map(|message| message.id).unwrap_or(0);
+                    self.job = Some(live::api_newer(client, o.conv, self.corpus.convs[o.conv].id.clone(), since));
+                }
+            }
+            return;
+        }
+        let conv = &self.corpus.convs[o.conv];
+        let a = &self.corpus.archives[conv.archive];
+        let newest = o.list.msgs.last().map(|m| m.id + 1);
+        let page = match a.timeline_page(&conv.id, None, newest, PAGE) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("{e}");
+                return;
+            }
+        };
+        let n = page.len();
+        if n == 0 {
+            o.has_newer = false;
+        } else {
+            o.list.msgs.extend(page);
+            o.has_newer = n >= PAGE;
+            o.list.mark_dirty();
+        }
+        self.status = format!("loaded {n} newer");
+        self.update_notes();
+    }
+
+    fn open_sent_context(&mut self) {
+        let Some(message) = self.selected().cloned() else { return; };
+        let Some(View::Feed { generation, .. }) = self.stack.last() else { return; };
+        let generation = *generation;
+        if self.job.is_some() { self.status = "A fetch is running; retry when it finishes".into(); return; }
+        if self.corpus.conv_by_channel(&message.channel_id).is_none() {
+            self.status = "Conversation is unavailable; refresh the conversation list".into(); return;
+        }
+        if let Some(client) = self.api.clone() {
+            let channel = message.channel_id.clone();
+            let focus = message.id;
+            self.job = Some(live::spawn(JobKind::SentContext { generation, focus, channel: channel.clone() }, "opening message context".into(), move || {
+                crate::file_message::message_context(&client, &channel, focus, focus).map(Done::MessageContext)
+            }));
+        } else {
+            let Some(archive) = self.corpus.conv_by_channel(&message.channel_id)
+                .and_then(|index| self.corpus.conv_archive(&self.corpus.convs[index])) else {
+                self.status = "Conversation is not cached; sign in to Slack".into(); return;
+            };
+            let mut timeline = match archive.timeline_page(&message.channel_id, Some(message.id), None, PAGE / 2) {
+                Ok(messages) => messages, Err(error) => { self.status = format!("Archive: {error}"); return; }
+            };
+            let has_older = timeline.len() == PAGE / 2;
+            let newer = match archive.timeline_page(&message.channel_id, None, Some(message.id), PAGE / 2) {
+                Ok(messages) => messages, Err(error) => { self.status = format!("Archive: {error}"); return; }
+            };
+            let has_newer = newer.len() == PAGE / 2;
+            timeline.extend(newer);
+            if !timeline.iter().any(|item| item.id == message.id) { timeline.push(message.clone()); }
+            timeline.sort_by_key(|item| item.id);
+            self.apply_sent_context(crate::file_message::Location { channel: message.channel_id, focus: message.id,
+                root: message.id, timeline, replies: vec![], has_older, has_newer }, false);
+        }
+    }
+
+    fn apply_sent_context(&mut self, location: crate::file_message::Location, api_only: bool) {
+        let Some(View::Feed { section, .. }) = self.stack.last() else { return; };
+        let label = section.label();
+        self.sent_return = Some((self.open.take(), std::mem::take(&mut self.stack), self.conv_cursor));
+        self.open_file_message(location);
+        if let Some(open) = &mut self.open { open.api_only = api_only; }
+        self.top_section = None;
+        self.status = format!("Opened message · h: back to {label}");
+    }
+
+    fn open_file_message(&mut self, location: crate::file_message::Location) {
+        let Some(conv) = self.corpus.conv_by_channel(&location.channel) else {
+            if let Some(browser) = &mut self.channel_browser { browser.message_unavailable(); }
+            return;
+        };
+        // Foreground fetches can replace the current view; wait instead of discarding a write.
+        if self.job.is_some() {
+            if let Some(browser) = &mut self.channel_browser { browser.message = Some(location); }
+            return;
+        }
+        if self.bg.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Tail { .. } | JobKind::Thread { .. })) {
+            self.bg = None;
+        }
+        self.last_poll = Instant::now();
+        let mut list = MsgList::new(location.timeline, false);
+        list.cursor = list.msgs.iter().position(|m| m.id == location.root).unwrap_or(0);
+        list.align_top = true;
+        self.open = Some(Open { conv, total: self.corpus.convs[conv].msgs, list,
+            has_older: location.has_older, has_newer: location.has_newer, api_only: true });
+        self.stack.clear();
+        if location.focus != location.root {
+            let mut list = MsgList::new(location.replies, true);
+            list.cursor = list.msgs.iter().position(|m| m.id == location.focus).unwrap_or(0);
+            list.align_top = true;
+            self.stack.push(View::Thread { root: location.root, list, live: None, place: None });
+        }
+        self.focus = Focus::Msgs;
+        if let Some(index) = self.filtered.iter().position(|index| *index == conv) { self.conv_cursor = index; }
+        if let Some(browser) = &mut self.channel_browser { browser.visible = false; }
+        self.status = "Opened file sharing message".into();
+        self.update_notes();
+    }
+
+    /// Re-centre the timeline on a message id: half a page each side.
+    pub fn jump_to(&mut self, id: i64) {
+        let Some(o) = self.open.as_mut() else { return };
+        if o.api_only {
+            self.status =
+                "only a cached conversation can be positioned; a archives this one".to_string();
+            return;
+        }
+        let conv = &self.corpus.convs[o.conv];
+        let a = &self.corpus.archives[conv.archive];
+        let half = PAGE / 2;
+        let older = a
+            .timeline_page(&conv.id, Some(id), None, half)
+            .unwrap_or_default();
+        let newer = a
+            .timeline_page(&conv.id, None, Some(id), half)
+            .unwrap_or_default();
+        let cursor = if newer.is_empty() {
+            older.len().saturating_sub(1)
+        } else {
+            older.len()
+        };
+        o.has_older = older.len() >= half;
+        o.has_newer = newer.len() >= half;
+        let mut msgs = older;
+        msgs.extend(newer);
+        let mut list = MsgList::new(msgs, false);
+        list.cursor = cursor;
+        list.align_top = true;
+        o.list = list;
+        self.update_notes();
+    }
+
+    /// A thread by channel id: the archive first, then the thread cache,
+    /// then Slack in the background.
+    fn invalidate_thread_jobs(&mut self) {
+        // A fetch belongs to the view that requested it, even if a new view has
+        // the same root timestamp. Cancel navigation, never the cache write.
+        for view in &mut self.stack {
+            if let View::Search {live_pending,..}=view { *live_pending=false; }
+        }
+        for slot in [&mut self.job, &mut self.bg] {
+            if slot.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Thread { .. } | JobKind::Sent { .. } | JobKind::SentContext { .. } | JobKind::Search { .. })) { *slot = None; }
+        }
+    }
+
+    /// Abandon a running archive scan and the box narrating it at once.
+    /// Only a new search and Esc do this; navigating away is caught at
+    /// landing instead, through the navigation generation. `invalidate_thread_jobs` deliberately does
+    /// not: it runs on job-completion paths too — a finished refresh
+    /// navigates through `open_conv` — and a fetch landing at the wrong
+    /// moment must not take a search the reader asked for with it. The
+    /// synchronous scan held the UI thread, so no result could land inside
+    /// it; a background one can.
+    fn drop_scan(&mut self) {
+        self.scan = None;
+        self.scan_overlay = None;
+        self.pending_search = None;
+        self.unread_fetch = None;
+        self.thread_fetch = None;
+    }
+
+    pub fn open_thread_in(&mut self, cid: String, root: i64, focus: i64) {
+        // Leaving for a thread.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        self.invalidate_thread_jobs();
+        let here = self
+            .open
+            .as_ref()
+            .map(|o| self.corpus.convs[o.conv].id == cid)
+            .unwrap_or(false);
+        let place = if here {
+            None
+        } else {
+            Some(
+                self.corpus
+                    .channel_names
+                    .get(&cid)
+                    .map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| cid.clone()),
+            )
+        };
+        let msgs = self
+            .corpus
+            .conv_by_channel(&cid)
+            .filter(|&ci| !self.corpus.convs[ci].live_only)
+            .map(|ci| {
+                self.corpus.archives[self.corpus.convs[ci].archive]
+                    .thread(&cid, root)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let wanted = msgs
+            .first()
+            .filter(|m| m.id == root)
+            .map(|m| m.reply_count)
+            .unwrap_or(0);
+        let have = msgs.len().saturating_sub(1) as i64;
+        let complete = !msgs.is_empty() && have >= wanted;
+        let mut list = MsgList::new(msgs, true);
+        list.source_channel = Some(cid.clone());
+        list.cursor = list.msgs.iter().position(|m| m.id == focus).unwrap_or(0);
+        list.align_top = list.cursor > 0;
+        self.stack.push(View::Thread {
+            root,
+            list,
+            live: None,
+            place,
+        });
+        // Slack has the thread's newest replies; the archive's copy is only
+        // what the last archive run saw, and its reply count is that old too.
+        // So a sign-in always re-asks, and the caches answer only without one.
+        if let Some(c) = self.api.clone() {
+            if self.job.is_some() {
+                self.status = "a fetch is already running".to_string();
+                return;
+            }
+            self.job = Some(live::api_thread(c, &self.cache_dir, cid, root, focus));
+            return;
+        }
+        if complete {
+            return;
+        }
+        if let Some(msgs) = live::cached_thread(&self.cache_dir, &cid, root) {
+            self.apply_thread_msgs(msgs, root, focus, "the cache");
+            return;
+        }
+        let dir = live::thread_dir(&self.cache_dir, &cid, root);
+        if dir.join("slackdump.sqlite").is_file() {
+            self.apply_thread_dir(&dir, &cid, root, focus);
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        if self.slackdump && self.live {
+            self.job = Some(live::fetch_thread(
+                &self.cache_dir,
+                &self.corpus.workspace_url,
+                cid,
+                root,
+                focus,
+            ));
+        } else {
+            self.status = if wanted == 0 && have == 0 {
+                "thread root is not in the archive; not signed in".to_string()
+            } else {
+                format!("{have} of {wanted} replies archived; not signed in")
+            };
+        }
+    }
+
+    /// Replies Slack has beyond the open thread, appended in place. The
+    /// cursor and the scroll stay where the reader left them.
+    fn extend_thread(&mut self, msgs: Vec<Msg>, root: i64) {
+        let Some(View::Thread { root: r, list, .. }) = self.stack.last_mut() else {
+            return;
+        };
+        if *r != root {
+            return;
+        }
+        let known: HashSet<i64> = list.msgs.iter().map(|m| m.id).collect();
+        let fresh: Vec<Msg> = msgs
+            .into_iter()
+            .filter(|m| !known.contains(&m.id))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let n = fresh.len();
+        let at_end = list.cursor + 1 >= list.len();
+        list.msgs.extend(fresh);
+        list.msgs.sort_by_key(|m| m.id);
+        if at_end {
+            list.cursor = list.len() - 1;
+        }
+        list.mark_dirty();
+        self.status = format!("{n} new in this thread");
+    }
+
+    /// Show a thread fetched from Slack (or its JSON cache), replacing the
+    /// view of the same thread when it is on top.
+    fn apply_thread_msgs(&mut self, msgs: Vec<Msg>, root: i64, focus: i64, from: &str) {
+        if msgs.is_empty() {
+            self.status = "Slack returned no messages for that thread".to_string();
+            return;
+        }
+        let n = msgs.len() - 1;
+        let mut list = MsgList::new(msgs, true);
+        list.cursor = list.msgs.iter().position(|m| m.id == focus).unwrap_or(0);
+        list.align_top = list.cursor > 0;
+        match self.stack.last_mut() {
+            Some(View::Thread {
+                root: r, list: l, ..
+            }) if *r == root => *l = list,
+            _ => self.stack.push(View::Thread {
+                root,
+                list,
+                live: None,
+                place: None,
+            }),
+        }
+        self.status = format!(
+            "{n} {} from {from}",
+            if n == 1 { "reply" } else { "replies" }
+        );
+    }
+
+    /// Show a thread from a fetched archive directory, replacing the view
+    /// of the same thread when it is on top.
+    fn apply_thread_dir(&mut self, dir: &Path, cid: &str, root: i64, focus: i64) {
+        let rel = format!(
+            "live/{}",
+            dir.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let mut a = match Archive::open(rel, dir) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status = format!("{e}");
+                return;
+            }
+        };
+        let _ = a.scan_convs(
+            usize::MAX,
+            self.corpus.me.as_deref(),
+            self.corpus.half_life_days,
+            None,
+        );
+        let msgs = a.thread(cid, root).unwrap_or_default();
+        if msgs.is_empty() {
+            self.status = "Slack returned no messages for that thread".to_string();
+            return;
+        }
+        let n = msgs.len() - 1;
+        let mut list = MsgList::new(msgs, true);
+        list.cursor = list.msgs.iter().position(|m| m.id == focus).unwrap_or(0);
+        list.align_top = list.cursor > 0;
+        match self.stack.last_mut() {
+            Some(View::Thread {
+                root: r,
+                list: l,
+                live,
+                ..
+            }) if *r == root => {
+                *l = list;
+                *live = Some(Box::new(a));
+            }
+            _ => self.stack.push(View::Thread {
+                root,
+                list,
+                live: Some(Box::new(a)),
+                place: None,
+            }),
+        }
+        self.status = format!(
+            "{n} {} from Slack",
+            if n == 1 { "reply" } else { "replies" }
+        );
+    }
+
+    /// Open a message's thread wherever it lives: this conversation, another
+    /// archived one (switched to underneath the search view), or Slack.
+    fn open_hit(&mut self, cid: String, root: i64, focus: i64) {
+        if matches!(self.stack.last(), Some(View::Saved { .. } | View::Feed { .. } | View::Search { .. } | View::Threads { .. } | View::Unreads { .. })) {
+            self.open_thread_in(cid, root, focus);
+            return;
+        }
+        let here = self
+            .open
+            .as_ref()
+            .map(|o| self.corpus.convs[o.conv].id == cid)
+            .unwrap_or(false);
+        if !here {
+            // A conversation only on Slack is not switched to: its first page
+            // would compete with the thread for the one fetch slot.
+            if let Some(idx) = self
+                .corpus
+                .conv_by_channel(&cid)
+                .filter(|&i| !self.corpus.convs[i].live_only)
+            {
+                let search = match self.stack.last() {
+                    Some(View::Search { .. }) | Some(View::Threads { .. }) | Some(View::Unreads { .. }) => self.stack.pop(),
+                    _ => None,
+                };
+                self.open_conv(idx);
+                self.jump_to(root);
+                if let Some(v) = search {
+                    self.stack.push(v);
+                }
+            }
+        }
+        self.open_thread_in(cid, root, focus);
+    }
+
+    /// A search over the archives themselves: `from:@name`, or the plain text
+    /// of a `message:` query, or both. Every conversation when the list has
+    /// focus, the one being read otherwise; thread replies are included, and
+    /// Slack is asked the same question when a fetch slot is free.
+    ///
+    /// The scan itself runs on a worker thread, because it takes seconds over
+    /// the whole archive and nothing can be drawn while it holds the UI
+    /// thread. `label` is the command as typed, which the progress box shows.
+    fn run_archive_search(&mut self, query: &str, label: &str) {
+        let wants_author = crate::author_search::has_author(query);
+        let kind = if wants_author { "author" } else { "message" };
+        let parsed = if wants_author {
+            match crate::author_search::parse(query, &self.corpus.author_names(), self.corpus.me.as_deref()) {
+                Ok(parsed) => parsed, Err(error) => { self.status = error; return; }
+            }
+        } else { crate::author_search::text_query(query) };
+        let cid = if self.focus == Focus::Msgs {
+            match self.stack.last() {
+                Some(View::Search {list,..}) => list.source_channel.clone(),
+                Some(View::Thread {list,..}) => list.source_channel.clone().or_else(||list.msgs.first().map(|m|m.channel_id.clone()))
+                    .or_else(||self.open.as_ref().map(|o|self.corpus.convs[o.conv].id.clone())),
+                _ => self.open.as_ref().map(|o|self.corpus.convs[o.conv].id.clone()),
+            }
+        } else { None };
+        self.invalidate_thread_jobs();
+        self.drop_scan();
+        // No author resolved and one asked for means nothing can match, so
+        // there is nothing to scan; the empty result still gets built below.
+        let scan_at_all = parsed.user_id.is_some() || !wants_author;
+        let mut targets = Vec::new();
+        let mut conv_names = HashMap::new();
+        if scan_at_all {
+            for conversation in self.corpus.convs.iter().filter(|c| !c.live_only && cid.as_ref().is_none_or(|cid|cid==&c.id)) {
+                targets.push(live::ScanTarget {
+                    cid: conversation.id.clone(),
+                    name: conversation.name.clone(),
+                    archive: conversation.archive,
+                });
+                if let Some(index) = self.corpus.conv_by_channel(&conversation.id) {
+                    conv_names.insert(conversation.id.clone(), self.corpus.convs[index].name.clone());
+                }
+            }
+        }
+        let request = live::ScanRequest {
+            targets,
+            archives: self.corpus.archives.iter().map(Archive::handle).collect(),
+            needle: parsed.text.clone(),
+            author: parsed.user_id.clone(),
+            cap: SEARCH_CAP,
+            kind,
+            conv_names,
+            names: self.corpus.names_snapshot(),
+            palette: self.palette.clone(),
+            tz: self.tz,
+            image_font: self.image_font(),
+            #[cfg(test)]
+            gate: self.scan_gate.take(),
+        };
+        let pending = ArchiveSearch {
+            query: query.to_string(),
+            kind,
+            cid,
+            slack: parsed.slack.clone(),
+            author_unresolved: wants_author && parsed.user_id.is_none(),
+            from_list: self.focus == Focus::Convs,
+            nav_generation: self.nav_generation,
+            unwatched: None,
+        };
+        let (sender, progress) = std::sync::mpsc::channel();
+        let single = pending.cid.is_some();
+        self.scan = Some(live::archive_scan(query.to_string(), request, sender));
+        // One conversation is tens of milliseconds; a box that appears and
+        // goes within a frame is worse than none. The worker still does the
+        // work, it just says nothing about it, and its progress end is parked
+        // so it does not read the silence as a cancellation.
+        if single {
+            self.pending_search = Some(ArchiveSearch { unwatched: Some(progress), ..pending });
+            return;
+        }
+        self.pending_search = Some(pending);
+        // The prompt eats the leading slash the reader typed; the box shows
+        // the command as it was meant, not as the buffer held it.
+        let label = label.trim();
+        let label = if label.starts_with('/') { label.to_string() } else { format!("/{label}") };
+        self.scan_overlay = Some(ScanOverlay {
+            owner: ScanOwner::Search,
+            nav_generation: self.nav_generation,
+            label,
+            lines: Vec::new(),
+            started: Instant::now(),
+            live_pending: false,
+            finished: false,
+            progress,
+        });
+    }
+
+    /// The archive scan landed: show its hits at once, under the box, and
+    /// start the Slack half of the same search when a slot is free.
+    fn finish_archive_search(&mut self, query: &str, hits: Vec<Msg>, capped: bool) {
+        let Some(pending) = self.pending_search.take().filter(|p| p.query == query) else {
+            self.status = format!("{} archive hits arrived after their view closed", hits.len());
+            self.close_scan_overlay(ScanOwner::Search);
+            return;
+        };
+        // The reader navigated while this ran. A search of one conversation
+        // draws no box and so does not swallow keys, and every navigation
+        // primitive bumps the generation, which is what makes this complete
+        // where a list of keys to intercept could not be.
+        if self.nav_generation != pending.nav_generation {
+            self.drop_scan();
+            self.status = "search abandoned: you moved on".to_string();
+            return;
+        }
+        let go_live = self.live && self.job.is_none() && self.api.is_some();
+        let cached = hits.len();
+        if pending.from_list { self.open = None; self.stack.clear(); }
+        let mut list = MsgList::new(hits, false);
+        list.source_channel = pending.cid.clone();
+        self.stack.push(View::Search { query: query.to_string(), list, capped, live_hits: None, live_pending: go_live });
+        self.focus = Focus::Msgs;
+        let kind = pending.kind;
+        self.status = format!("{cached} cached {kind} matches{}", if go_live { "; searching Slack" }
+            else if self.live && self.job.is_some() { "; Slack was not searched: another request is running; retry when it finishes" } else { "" });
+        if go_live {
+            let slack_query = match &pending.cid { Some(cid) => format!("in:<#{cid}> {}", pending.slack), None => pending.slack.clone() };
+            self.say_in_scan(ScanOwner::Search, live::ScanLine::dim(format!("search.messages query={slack_query:?}")));
+            if let Some(overlay) = self.scan_overlay.as_mut() { overlay.live_pending = true; }
+            self.job = Some(live::api_search_labeled(self.api.clone().expect("signed in"), slack_query, query.to_string()));
+            return;
+        }
+        if pending.author_unresolved { self.status = "Own user ID unavailable; sign in to search from:@me".into(); }
+        // Nothing follows the scan, so the box has said everything it will.
+        if !go_live && self.live { self.say_in_scan(ScanOwner::Search, live::ScanLine::dim(self.status.clone())); }
+        self.close_scan_overlay(ScanOwner::Search);
+    }
+
+    /// Mark `owner`'s box done. It is drawn once more, so its last line is
+    /// read, and the next tick takes it off the screen. A box belonging to
+    /// another phase, or to another navigation generation, is left alone:
+    /// see `ScanOwner`.
+    fn close_scan_overlay(&mut self, owner: ScanOwner) {
+        if let Some(overlay) = self.own_scan_overlay(owner) { overlay.finished = true; }
+    }
+
+    /// The open box, when it is `owner`'s and was opened where the reader
+    /// still is.
+    fn own_scan_overlay(&mut self, owner: ScanOwner) -> Option<&mut ScanOverlay> {
+        let generation = self.nav_generation;
+        self.scan_overlay
+            .as_mut()
+            .filter(|overlay| overlay.owner == owner && overlay.nav_generation == generation)
+    }
+
+    /// Drive the UNREADS live phase to its end the way the event loop does,
+    /// and hand back what the progress box said while it ran.
+    #[cfg(test)]
+    pub(crate) fn finish_unread_fetch_for_test(&mut self) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.unread_fetch.is_some() && Instant::now() < deadline {
+            self.tick();
+            if self.unread_fetch.is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(self.unread_fetch.is_none(), "the unread fetch never finished");
+        let lines = self
+            .scan_overlay
+            .as_ref()
+            .map(|overlay| overlay.lines.iter().map(|line| line.text.clone()).collect())
+            .unwrap_or_default();
+        // The box lives one tick past its last line; this is that tick.
+        self.tick();
+        lines
+    }
+
+    /// Drive a running archive scan to its result the way the event loop
+    /// does, so a test can assert on the view the scan pushes.
+    #[cfg(test)]
+    pub(crate) fn finish_archive_scan_for_test(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.pending_search.is_some() && Instant::now() < deadline {
+            self.tick();
+            if self.pending_search.is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(self.pending_search.is_none(), "the archive scan never finished");
+        // One more tick retires a box with nothing left to say. A box still
+        // waiting on Slack is left alone, so a test can look at it before
+        // the live job it started is collected.
+        if self.scan_overlay.as_ref().is_some_and(|overlay| overlay.finished) {
+            self.tick();
+        }
+    }
+
+    /// Take over the user maps the scan read on its own connections. The
+    /// archives here have their own, usually unread, so this is where a
+    /// second scan and every later render stop paying for the tables again.
+    fn adopt_scan_users(&mut self, users: Vec<(usize, std::sync::Arc<HashMap<String, crate::archive::User>>)>) {
+        for (index, map) in users {
+            if let Some(archive) = self.corpus.archives.get(index) {
+                archive.adopt_users(map);
+            }
+        }
+    }
+
+    /// Add a line to `owner`'s progress box, if that is the one open.
+    fn say_in_scan(&mut self, owner: ScanOwner, line: live::ScanLine) {
+        if let Some(overlay) = self.own_scan_overlay(owner) {
+            overlay.drain();
+            overlay.lines.push(line);
+        }
+    }
+
+    /// The box is up while either half of a `/find` is still out.
+    pub fn scan_running(&self) -> bool {
+        self.scan_overlay.as_ref().is_some_and(|overlay| !overlay.finished)
+    }
+
+    /// Esc while the box is up. During the archive scan that cancels it and
+    /// pushes no view; during the Slack half it only dismisses the box, and
+    /// the search that is already showing folds Slack's answer in as ever.
+    fn cancel_scan(&mut self) {
+        // The UNREADS live phase is behind the same box. Abandoning it stops
+        // at the conversation it had reached: every card it had already
+        // replaced holds the messages it fetched, and the rest keep theirs.
+        if let Some(phase) = self.unread_fetch.as_ref() {
+            let replaced = phase.replaced;
+            self.drop_scan();
+            self.status = format!(
+                "unread fetch abandoned; {replaced} card{} filled in from Slack",
+                if replaced == 1 { "" } else { "s" }
+            );
+            return;
+        }
+        // The THREADS live phase, likewise: the cards it has already added
+        // stay, and the threads behind them are left for the next run.
+        if let Some(phase) = self.thread_fetch.as_ref() {
+            let added = phase.added;
+            self.drop_scan();
+            self.status = format!(
+                "thread fetch abandoned; {added} thread{} added from Slack",
+                if added == 1 { "" } else { "s" }
+            );
+            return;
+        }
+        let live_phase = self.scan_overlay.as_ref().is_some_and(|overlay| overlay.live_pending);
+        self.scan_overlay = None;
+        if live_phase { return; }
+        self.drop_scan();
+        self.status = "search cancelled".to_string();
+    }
+
+    pub fn run_search(&mut self, query: &str) {
+        if crate::author_search::has_author(query) {
+            let label = format!("/find {query}");
+            self.run_archive_search(query, &label);
+            return;
+        }
+        let query = query.trim();
+        if query.is_empty() {
+            return;
+        }
+        let Some(o) = self.open.as_ref() else {
+            return;
+        };
+        let conv_idx = o.conv;
+        let ctx = self.ctx_for(conv_idx);
+        let conv = &self.corpus.convs[conv_idx];
+        let candidates = match ctx
+            .archive
+            .map_or_else(|| Ok(Vec::new()), |a| a.search(&conv.id, query, SEARCH_CAP))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("{e}");
+                return;
+            }
+        };
+        let capped = candidates.len() >= SEARCH_CAP;
+        let needle = query.to_lowercase();
+        // Decide on what a reader sees: the rendered text, or a link's URL.
+        let hits: Vec<Msg> = candidates
+            .into_iter()
+            .filter(|m| {
+                render::plain(&render::body(m, &ctx))
+                    .to_lowercase()
+                    .contains(&needle)
+                    || render::message_urls(m)
+                        .iter()
+                        .any(|u| u.to_lowercase().contains(&needle))
+                    || ctx.author(m).to_lowercase().contains(&needle)
+            })
+            .collect();
+        let cached = hits.len();
+        let go_live = self.live && self.job.is_none() && (self.api.is_some() || self.slackdump);
+        if cached == 0 && !go_live {
+            self.status = format!(
+                "no message matching '{query}' in {}{}",
+                conv.name,
+                if self.live {
+                    "; a fetch is already running"
+                } else {
+                    ""
+                }
+            );
+            return;
+        }
+        let plural = if cached == 1 { "" } else { "s" };
+        self.status = if go_live {
+            format!("{cached} cached hit{plural}; searching Slack")
+        } else {
+            format!(
+                "{cached} hit{plural} for '{query}'{}",
+                if capped {
+                    " (first 500 candidates only)"
+                } else {
+                    ""
+                }
+            )
+        };
+        // Newest first; the cursor starts on the newest hit.
+        let mut list = MsgList::new(hits, false);
+        list.source_channel=Some(conv.id.clone());
+        self.stack.push(View::Search {
+            query: query.to_string(),
+            list,
+            capped,
+            live_hits: None,
+            live_pending: go_live,
+        });
+        if go_live {
+            self.job = Some(match self.api.clone() {
+                Some(c) => live::api_search(c, query.to_string()),
+                None => live::search(&self.cache_dir, query.to_string()),
+            });
+        }
+    }
+
+    /// Fold what Slack found into the search view still showing that query.
+    fn merge_live_search(&mut self, query: &str, dir: &Path) {
+        let hits = Archive::open("live/search".to_string(), dir).and_then(|a| a.search_hits());
+        let _ = std::fs::remove_dir_all(dir);
+        match hits {
+            // A slackdump search directory is everything that run collected.
+            Ok(h) => self.merge_hits(query, h, true),
+            Err(e) => self.status = format!("live search: {e}"),
+        }
+    }
+
+    /// Fold what Slack found into the search view still showing that query.
+    fn merge_hits(&mut self, query: &str, hits: Vec<Msg>, complete: bool) {
+        let total = hits.len();
+        let mut counts = None;
+        match self
+            .stack
+            .iter_mut()
+            .rev()
+            .find(|v| matches!(v, View::Search { .. }))
+        {
+            Some(View::Search {
+                query: q,
+                list,
+                live_hits,
+                live_pending,
+                ..
+            }) if q == query => {
+                let cursor_id = list.selected().map(|m| (m.channel_id.clone(),m.id));
+                // What Slack returned, so the hits it did not return can be
+                // counted before the two lists are merged into one.
+                let returned: HashSet<(String, i64)> = hits
+                    .iter()
+                    .map(|h| (h.channel_id.clone(), h.id))
+                    .collect();
+                let cache_only = list
+                    .msgs
+                    .iter()
+                    .filter(|m| !returned.contains(&(m.channel_id.clone(), m.id)))
+                    .count();
+                let mut seen: HashSet<(String, i64)> = list
+                    .msgs
+                    .iter()
+                    .map(|m| (m.channel_id.clone(), m.id))
+                    .collect();
+                let mut added = 0;
+                for h in hits {
+                    if seen.insert((h.channel_id.clone(), h.id)) {
+                        list.msgs.push(h);
+                        added += 1;
+                    }
+                }
+                list.msgs.sort_by(|x, y| y.id.cmp(&x.id));
+                if let Some(id) = cursor_id {
+                    list.cursor = list.msgs.iter().position(|m| (m.channel_id.clone(),m.id) == id).unwrap_or(0);
+                }
+                let seen_all = LiveHits { added, cache_only, complete };
+                *live_hits = Some(seen_all);
+                *live_pending = false;
+                list.mark_dirty();
+                counts = Some(seen_all);
+                self.status = format!(
+                    "Slack: {total} hit{}, {added} not in the cache",
+                    if total == 1 { "" } else { "s" }
+                );
+            }
+            _ => self.status = format!("live search finished after its view closed: {total} hits"),
+        }
+        if let Some(counts) = counts {
+            // The cache-only clause already carries the caveat when there is
+            // one; say it separately only when there is no such clause.
+            let cache_only = counts.cache_only_label();
+            let tail = match (cache_only.is_empty(), complete) {
+                (false, _) => format!(" · {cache_only}"),
+                (true, false) => " (partial answer)".to_string(),
+                (true, true) => String::new(),
+            };
+            self.say_in_scan(ScanOwner::Search, live::ScanLine::plain(format!(
+                "Slack: {total} hit{} · +{} new{tail}",
+                if total == 1 { "" } else { "s" },
+                counts.added,
+            )));
+        }
+        // Slack was the last half of the search; the box has nothing left.
+        self.close_scan_overlay(ScanOwner::Search);
+    }
+
+    fn refresh_conversations(&mut self) {
+        if self.job.is_some() { self.status = "a fetch is already running".into(); return; }
+        let Some(client) = self.api.clone() else {
+            self.status = "Refreshing conversations needs a Slack sign-in".into(); return;
+        };
+        self.counts_gen += 1;
+        self.unread_count_job = None;
+        let gen = self.counts_gen;
+        let mut targets = self.unread_count_targets();
+        self.status = "Refreshing conversations and unread counts from Slack…".into();
+        self.job = Some(live::spawn(JobKind::ConversationRefresh { gen }, "Refreshing conversations".into(), move || {
+            let conversations = client.my_conversations()?;
+            for conversation in &conversations {
+                if let Some(id) = conversation["id"].as_str() {
+                    if !targets.iter().any(|target| target == id) { targets.push(id.to_string()); }
+                }
+            }
+            let mut counts = client.counts()?;
+            for chunk in targets.chunks(10) { counts = client.enrich_unread_counts(counts, chunk)?; }
+            Ok(Done::ConversationSnapshot(conversations, counts))
+        }));
+    }
+
+    fn apply_conversation_snapshot(&mut self, gen: u64, conversations: Vec<Value>, counts: Value) {
+        for entry in &conversations {
+            if let Some(index) = entry["id"].as_str().and_then(|id| self.corpus.conv_by_channel(id)) {
+                self.corpus.convs[index].left = false;
+                if let Some(name) = entry["name"].as_str().filter(|_| matches!(self.corpus.convs[index].kind, Kind::Channel | Kind::Private)) {
+                    self.corpus.convs[index].name = format!("#{name}");
+                }
+            }
+        }
+        self.merge_conversations(conversations);
+        self.apply_filter();
+        if gen == self.counts_gen {
+            self.counts_gen += 1; // Retire quiet snapshots launched during this request.
+            self.apply_counts(&counts);
+            self.apply_unread_counts(&counts);
+            self.last_counts = Instant::now();
+            let missing = ["channels", "ims", "mpims"].iter().flat_map(|kind| counts[*kind].as_array().into_iter().flatten())
+                .filter(|entry| entry["has_unreads"] == true && entry["unread_count"].as_i64().is_none()).count();
+            self.status = if missing == 0 { "Conversations and unread counts refreshed from Slack".into() }
+                else { format!("Conversations refreshed; {missing} unread counts unavailable, Shift+R retries") };
+        } else {
+            self.counts_pending = true;
+            self.status = "Conversations refreshed; requesting newer unread counts".into();
+        }
+        self.muted_pending = true;
+        self.starred_pending = true;
+    }
+
+    fn refresh(&mut self) {
+        if let Some(View::Thread { root, list, .. }) = self.stack.last() {
+            let root = *root;
+            let focus = list.selected().map(|m| m.id).unwrap_or(root);
+            let cid = match list.msgs.first() {
+                Some(m) => m.channel_id.clone(),
+                None => match list.source_channel.clone().or_else(|| self.open.as_ref().map(|o| self.corpus.convs[o.conv].id.clone())) {
+                    Some(cid) => cid,
+                    None => return,
+                },
+            };
+            if self.job.is_some() {
+                self.status = "a fetch is already running".to_string();
+                return;
+            }
+            if let Some(c) = self.api.clone() {
+                self.job = Some(live::api_thread(c, &self.cache_dir, cid, root, focus));
+            } else {
+                self.status = "refreshing a thread needs the Slack sign-in".to_string();
+            }
+            return;
+        }
+        let Some(o) = self.open.as_ref() else {
+            return;
+        };
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        let idx = o.conv;
+        let conv = &self.corpus.convs[idx];
+        if let Some(c) = self.api.clone() {
+            let since = o.list.msgs.last().map(|m| m.id).unwrap_or(conv.last_id);
+            if since == 0 {
+                self.job = Some(live::api_older(c, idx, conv.id.clone(), 0));
+            } else {
+                self.job = Some(live::api_tail(c, idx, conv.id.clone(), since, false));
+            }
+            return;
+        }
+        if !self.live || !self.slackdump || o.api_only {
+            self.status = "not signed in, and no slackdump to fall back on".to_string();
+            return;
+        }
+        let dir = self.corpus.archives[conv.archive].dir.clone();
+        let lookback =
+            live::lookback_hours(conv.last_id / 1_000_000, chrono::Utc::now().timestamp());
+        self.job = Some(live::refresh(
+            idx,
+            o.total,
+            dir,
+            self.lock.clone(),
+            lookback,
+        ));
+    }
+
+    /// Messages Slack has after what is loaded, appended in place.
+    fn append_tail(&mut self, conv: usize, mut msgs: Vec<Msg>, quiet: bool) {
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
+        if o.conv != conv || o.has_newer {
+            return;
+        }
+        let known: HashSet<i64> = o.list.msgs.iter().map(|m| m.id).collect();
+        msgs.retain(|m| !known.contains(&m.id));
+        let n = msgs.len();
+        if n == 0 {
+            if !quiet {
+                self.status = "nothing newer on Slack".to_string();
+            }
+            return;
+        }
+        let at_end = o.list.cursor + 1 >= o.list.len();
+        o.list.msgs.extend(msgs);
+        if at_end {
+            o.list.cursor = o.list.len() - 1;
+        }
+        o.list.mark_dirty();
+        if let Some(last) = o.list.msgs.last() {
+            let c = &mut self.corpus.convs[conv];
+            if last.id > c.last_id {
+                c.last_id = last.id;
+                c.unread_count = None;
+                c.unread_snapshot = None;
+            }
+        }
+        self.status = format!("{n} new from Slack");
+    }
+
+    /// An older page from Slack for a conversation with no archive.
+    fn prepend_older(&mut self, conv: usize, mut msgs: Vec<Msg>, more: bool) {
+        let Some(o) = self.open.as_mut() else {
+            return;
+        };
+        if o.conv != conv {
+            return;
+        }
+        let known: HashSet<i64> = o.list.msgs.iter().map(|m| m.id).collect();
+        msgs.retain(|m| !known.contains(&m.id));
+        let n = msgs.len();
+        let was_empty = o.list.msgs.is_empty();
+        o.has_older = more;
+        if n > 0 {
+            o.list.msgs.splice(0..0, msgs);
+            o.list.cursor = if was_empty {
+                o.list.len() - 1
+            } else {
+                o.list.cursor + n
+            };
+            if was_empty {
+                let last_read = self.corpus.convs[conv].last_read;
+                if last_read > 0 {
+                    if let Some(first_new) = o.list.msgs.iter().position(|m| m.id > last_read) {
+                        o.list.cursor = first_new;
+                        o.list.align_top = true;
+                    }
+                }
+            }
+            o.list.mark_dirty();
+        }
+        o.total = o.list.len() as i64;
+        if let (Some(first), Some(last)) = (o.list.msgs.first(), o.list.msgs.last()) {
+            let c = &mut self.corpus.convs[conv];
+            c.first_id = first.id;
+            if last.id > c.last_id {
+                c.last_id = last.id;
+                c.unread_count = None;
+                c.unread_snapshot = None;
+            }
+        }
+        self.status = format!("{n} from Slack");
+        self.update_notes();
+    }
+
+    /// Conversations the user is a member of that no archive holds.
+    fn merge_conversations(&mut self, list: Vec<Value>) {
+        let me = self.corpus.me.clone();
+        let my_handle = me.as_deref().and_then(|m| self.corpus.user_name(m));
+        let mut added = 0;
+        for ch in list {
+            let Some(id) = ch.get("id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            if self.corpus.conv_by_channel(&id).is_some() {
+                continue;
+            }
+            let s = |k: &str| ch.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            let b = |k: &str| ch.get(k).and_then(Value::as_bool).unwrap_or(false);
+            let raw = s("name");
+            // The counterpart of a live-only direct message is the channel
+            // object's own `user`, the same field the archive reads; an empty
+            // one names nobody rather than a user called "".
+            let mut im_counterpart = None;
+            let (kind, name) = if b("is_im") {
+                let u = s("user");
+                self.dm_users.insert(id.clone(), u.clone());
+                im_counterpart = Some(u.clone()).filter(|u| !u.is_empty());
+                let n = self.corpus.user_name(&u).unwrap_or_else(|| u.clone());
+                (
+                    Kind::Im,
+                    if Some(u.as_str()) == me.as_deref() {
+                        "@me (self)".to_string()
+                    } else {
+                        format!("@{n}")
+                    },
+                )
+            } else if b("is_mpim") {
+                let stripped = raw.trim_start_matches("mpdm-");
+                let stripped = stripped
+                    .rsplit_once('-')
+                    .map(|(a, _)| a)
+                    .unwrap_or(stripped);
+                let mut names: Vec<&str> = stripped.split("--").collect();
+                names.retain(|n| Some(*n) != my_handle.as_deref());
+                (Kind::Mpim, format!("@{}", names.join(",")))
+            } else if b("is_private") {
+                (Kind::Private, format!("#{raw}"))
+            } else {
+                (Kind::Channel, format!("#{raw}"))
+            };
+            let created = ch.get("created").and_then(Value::as_i64).unwrap_or(0) * 1_000_000;
+            self.corpus.convs.push(Conv {
+                archive: 0,
+                id: id.clone(),
+                name,
+                kind,
+                archived: false,
+                shared: b("is_shared") || b("is_ext_shared"),
+                im_counterpart,
+                msgs: 0,
+                mine: 0,
+                score: 0.0,
+                first_id: created,
+                last_id: 0,
+                live_only: true,
+                left: false,
+                muted: false,
+                unread: false,
+                unread_count: None,
+                unread_snapshot: None,
+                mentions: 0,
+                last_read: 0,
+            });
+            if !raw.is_empty() {
+                self.corpus.channel_names.entry(id).or_insert(raw);
+            }
+            added += 1;
+        }
+        if added > 0 {
+            self.apply_filter();
+            self.status = format!(
+                "{}; {added} conversations only on Slack, shown dim",
+                self.status
+            );
+        }
+    }
+
+    fn apply_unread_counts(&mut self, snapshot: &Value) {
+        for kind in ["channels", "ims", "mpims"] {
+            for entry in snapshot[kind].as_array().into_iter().flatten() {
+                let Some(index) = entry["id"].as_str().and_then(|id| self.corpus.conv_by_channel(id)) else { continue };
+                let conversation = &mut self.corpus.convs[index];
+                if conversation.unread && entry["has_unreads"].as_bool() == Some(true)
+                    && conversation.unread_snapshot.is_some()
+                    && crate::api::unread_fingerprint(entry) == conversation.unread_snapshot
+                {
+                    if let Some(count) = entry["unread_count"].as_i64().filter(|count| *count > 0) {
+                        conversation.unread_count = Some(count);
+                    }
+                }
+            }
+        }
+    }
+
+    fn pump_requested_counts(&mut self) {
+        if matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::ConversationRefresh { .. })) { return; }
+        if self.counts_pending && self.bg.is_none() && self.unread_count_job.is_none() {
+            if let Some(client) = self.api.clone() {
+                self.counts_pending = false;
+                self.bg = Some(live::api_counts(client, self.counts_gen));
+            }
+        }
+    }
+
+    fn unread_count_targets(&self) -> Vec<String> {
+        let mut targets: Vec<String> = if self.pane_settings.number == crate::conversations_pane::NumberColumn::Unread {
+            self.filtered.iter().map(|&index| self.corpus.convs[index].id.clone()).collect()
+        } else { Vec::new() };
+        if let Some(open) = &self.open {
+            let id = &self.corpus.convs[open.conv].id;
+            if !targets.contains(id) { targets.push(id.clone()); }
+        }
+        targets
+    }
+
+    /// Unread markers from `client.counts`, and last activity for
+    /// conversations no archive holds. Lists re-render only on a change.
+    fn apply_counts(&mut self, v: &Value) {
+        let mut changed = false;
+        for key in ["channels", "ims", "mpims"] {
+            for c in v.get(key).and_then(Value::as_array).into_iter().flatten() {
+                let Some(id) = c.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(idx) = self.corpus.conv_by_channel(id) else {
+                    continue;
+                };
+                let conv = &mut self.corpus.convs[idx];
+                let before = (conv.unread, conv.unread_count, conv.mentions, conv.last_read, conv.last_id);
+                conv.unread = c
+                    .get("has_unreads")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                conv.mentions = c.get("mention_count").and_then(Value::as_i64).unwrap_or(0);
+                if let Some(lr) = c
+                    .get("last_read")
+                    .and_then(Value::as_str)
+                    .and_then(ts_to_id)
+                {
+                    conv.last_read = lr;
+                }
+                if let Some(latest) = c.get("latest").and_then(Value::as_str).and_then(ts_to_id) {
+                    if latest > conv.last_id {
+                        conv.last_id = latest;
+                    }
+                }
+                let fingerprint = crate::api::unread_fingerprint(c);
+                if conv.unread_snapshot != fingerprint || before.0 != conv.unread {
+                    conv.unread_count = None;
+                }
+                conv.unread_snapshot = fingerprint;
+                changed |= before != (conv.unread, conv.unread_count, conv.mentions, conv.last_read, conv.last_id);
+            }
+        }
+        if changed {
+            self.apply_filter();
+            self.mark_all_dirty();
+        }
+    }
+
+    fn refresh_conv_stats(&mut self, idx: usize) {
+        let conv = &self.corpus.convs[idx];
+        let stats = self.corpus.archives[conv.archive].channel_stats(&conv.id);
+        if let Ok((msgs, first, last)) = stats {
+            let c = &mut self.corpus.convs[idx];
+            c.msgs = msgs;
+            if first > 0 {
+                c.first_id = first;
+            }
+            if last > 0 && last != c.last_id {
+                c.last_id = last;
+                c.unread_count = None;
+                c.unread_snapshot = None;
+            }
+        }
+    }
+
+    /// Every thread the owner took part in or was mentioned in, newest reply
+    /// first, one card per thread: the conversation and its participants, the
+    /// root, the replies between elided, and the newest reply. Archive-wide:
+    /// it opens no conversation, and the conversation cursor stays where it
+    /// was.
+    ///
+    /// Two phases, as UNREADS has: the archive builds every card it can, and
+    /// then a signed-in session asks Slack for the owner's recent threads the
+    /// archive does not hold. `r` runs both again.
+    fn open_my_threads(&mut self) {
+        // Leaving for THREADS.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        let Some(me) = self.corpus.me.clone() else {
+            self.status = "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
+            return;
+        };
+        let mut cards: Vec<(Msg, render::Card)> = Vec::new();
+        let mut seen: HashSet<(String, i64)> = HashSet::new();
+        for (ai, a) in self.corpus.archives.iter().enumerate() {
+            let Ok(msgs) = a.my_threads(&me) else {
+                continue;
+            };
+            let ctx = Ctx {
+                archive: Some(a),
+                corpus: &self.corpus,
+                tz: self.tz,
+                image_font: None,
+                last_read: None,
+                palette: &self.palette,
+            };
+            for mut root in msgs {
+                if !seen.insert((root.channel_id.clone(), root.id)) {
+                    continue;
+                }
+                let conversation = self
+                    .corpus
+                    .convs
+                    .iter()
+                    .find(|c| c.archive == ai && c.id == root.channel_id && !c.live_only)
+                    .map(|c| c.name.clone())
+                    .or_else(|| a.channel_name(&root.channel_id).map(|n| format!("#{n}")))
+                    .unwrap_or_else(|| root.channel_id.clone());
+                let participants = render::participants(&root, &ctx);
+                let mut last = a.last_reply(&root.channel_id, root.id).ok().flatten();
+                // The card's header names the conversation; a message header
+                // would say it again under it.
+                root.channel_name = None;
+                if let Some(last) = last.as_mut() {
+                    last.channel_name = None;
+                }
+                // Slack's count where it has one, the archive's where it is
+                // ahead, minus the one reply the card draws.
+                let total = root.reply_count.max(root.archived_replies);
+                let hidden = (total - i64::from(last.is_some())).max(0);
+                let counted_through = last.as_ref().map_or(root.id, |last| last.id);
+                let counted_from = root.id;
+                cards.push((
+                    root,
+                    render::Card {
+                        conversation,
+                        participants,
+                        hidden,
+                        counted_from,
+                        counted_through,
+                        tail: last.into_iter().collect(),
+                        elision: render::Elision::Replies,
+                    },
+                ));
+            }
+        }
+        cards.sort_by_key(|(root, _)| Self::thread_card_order(root));
+        let n = cards.len();
+        let list = MsgList::with_cards(cards);
+        match self.stack.last_mut() {
+            // A rerun replaces the view in place rather than stacking a
+            // second copy of it over the first.
+            Some(View::Threads { list: open }) => *open = list,
+            _ => self.stack.push(View::Threads { list }),
+        }
+        self.focus = Focus::Msgs;
+        self.status = format!("{n} threads you took part in or were mentioned in, newest reply first");
+        self.start_thread_fetch();
+    }
+
+    /// Where a THREADS card sorts: by its newest reply, and by the root for a
+    /// thread that has none. One function for both halves of the view, so a
+    /// card the archive built and a card Slack built are ordered by the same
+    /// measure and the merged list is one list.
+    fn thread_card_order(root: &Msg) -> std::cmp::Reverse<i64> {
+        std::cmp::Reverse(root.latest_reply_id.unwrap_or(root.id))
+    }
+
+    /// Threads fetched from Slack in one run of the phase. Fifty threads is
+    /// a hundred `conversations.replies` calls, which is as much of a
+    /// workspace's rate limit as one keystroke should spend; what the search
+    /// found past it is counted in the status line and left for the next run.
+    const THREAD_FETCH_CAP: usize = 50;
+
+    /// How far back the search looks, in seconds. A week of the owner's own
+    /// messages and mentions is what an hourly archive job can be behind by
+    /// after a weekend of failures, and it is the window
+    /// `slackdump-my-threads` walks.
+    const THREAD_FETCH_WINDOW: i64 = 7 * 24 * 60 * 60;
+
+    /// The live half of THREADS: ask Slack which threads the owner has been
+    /// in this week, and fetch the ones the archive does not hold, behind the
+    /// progress box `/find` uses. Only when signed in; nothing fetched here
+    /// reaches an archive, and a rerun of the view runs the phase again.
+    fn start_thread_fetch(&mut self) {
+        // A rerun replaces the phase, and the call in flight belongs to the
+        // generation just left behind: its answer would land nowhere anyway.
+        if self.thread_fetch.take().is_some() {
+            self.scan = None;
+            self.scan_overlay = None;
+        }
+        let Some(client) = self.api.clone().filter(|_| self.live) else { return };
+        let Some(me) = self.corpus.me.clone() else { return };
+        // The one scan slot is the archive search's while it holds it, and
+        // taking it from under a running `/find` would strand its view.
+        if self.scan.is_some() || self.pending_search.is_some() {
+            return;
+        }
+        let (sender, progress) = std::sync::mpsc::channel();
+        self.scan_overlay = Some(ScanOverlay {
+            owner: ScanOwner::ThreadFetch,
+            nav_generation: self.nav_generation,
+            label: "THREADS".to_string(),
+            lines: Vec::new(),
+            started: Instant::now(),
+            live_pending: false,
+            finished: false,
+            progress,
+        });
+        self.thread_fetch = Some(ThreadFetch {
+            queue: std::collections::VecDeque::new(),
+            current: None,
+            nav_generation: self.nav_generation,
+            progress: sender.clone(),
+            added: 0,
+            asked: 0,
+            over_cap: 0,
+        });
+        let since = self.now_secs() - Self::THREAD_FETCH_WINDOW;
+        self.scan = Some(live::api_thread_search(client, me, since, sender));
+    }
+
+    /// The search answered: everything the archive already holds is dropped,
+    /// what is left is capped, and the first of them goes out.
+    ///
+    /// What the archive holds is the view's own cards — the archive pass has
+    /// just built one per thread it has — so a thread already on screen is
+    /// never fetched and nothing is shown twice.
+    fn apply_thread_candidates(&mut self, targets: Vec<live::ThreadTarget>) {
+        let Some(phase) = self.thread_fetch.as_ref() else { return };
+        if phase.nav_generation != self.nav_generation {
+            self.thread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        }
+        let Some(client) = self.api.clone() else {
+            self.thread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        };
+        let held: HashSet<(String, i64)> = match self.stack.last() {
+            Some(View::Threads { list }) => list
+                .msgs
+                .iter()
+                .map(|root| (root.channel_id.clone(), root.id))
+                .collect(),
+            // The reader is not on THREADS any more, generation or no.
+            _ => {
+                self.thread_fetch = None;
+                self.scan_overlay = None;
+                return;
+            }
+        };
+        let found = targets.len();
+        let mut wanted: Vec<live::ThreadTarget> = targets
+            .into_iter()
+            .filter(|target| !held.contains(&(target.cid.clone(), target.root)))
+            .collect();
+        let over_cap = wanted.len().saturating_sub(Self::THREAD_FETCH_CAP);
+        wanted.truncate(Self::THREAD_FETCH_CAP);
+        let said = format!(
+            "{found} thread{} in the last week · {} the archive does not hold{}",
+            if found == 1 { "" } else { "s" },
+            wanted.len(),
+            if over_cap > 0 {
+                format!(" · {over_cap} older not fetched (cap {})", Self::THREAD_FETCH_CAP)
+            } else {
+                String::new()
+            },
+        );
+        self.say_in_scan(ScanOwner::ThreadFetch, live::ScanLine::dim(said));
+        if let Some(phase) = self.thread_fetch.as_mut() {
+            phase.asked = wanted.len();
+            phase.over_cap = over_cap;
+            phase.queue = wanted.into();
+        }
+        self.next_thread_fetch(&client);
+    }
+
+    /// Send the next thread's calls, or close the phase when the queue is
+    /// empty.
+    fn next_thread_fetch(&mut self, client: &Arc<Client>) {
+        let Some(phase) = self.thread_fetch.as_mut() else { return };
+        let Some(target) = phase.queue.pop_front() else {
+            let (added, asked, over_cap) = (phase.added, phase.asked, phase.over_cap);
+            self.thread_fetch = None;
+            self.status = if asked == 0 {
+                "Slack has no thread of yours this week the archive does not hold".to_string()
+            } else {
+                format!(
+                    "{added} of {asked} thread{} fetched from Slack{}",
+                    if asked == 1 { "" } else { "s" },
+                    // Not "left for the next run": every run searches the same
+                    // week and caps the same way, so a rerun fetches these
+                    // fifty again and never reaches the ones behind them.
+                    if over_cap > 0 {
+                        format!(
+                            "; {over_cap} older thread{} not fetched (cap {})",
+                            if over_cap == 1 { "" } else { "s" },
+                            Self::THREAD_FETCH_CAP,
+                        )
+                    } else {
+                        String::new()
+                    },
+                )
+            };
+            let said = self.status.clone();
+            self.say_in_scan(ScanOwner::ThreadFetch, live::ScanLine::dim(said));
+            self.close_scan_overlay(ScanOwner::ThreadFetch);
+            return;
+        };
+        let progress = phase.progress.clone();
+        // The target goes to the worker; the copy is what the answer's card
+        // takes the conversation's name from.
+        phase.current = Some(target.clone());
+        self.scan = Some(live::api_thread_card(client.clone(), target, progress));
+    }
+
+    /// One thread arrived: its card goes into the list in reply order, among
+    /// the archive's own, and the next thread goes out.
+    ///
+    /// The card is built the way the archive pass builds one — conversation,
+    /// participants, root, the replies between elided, the newest reply — so
+    /// a live card and an archived card are one kind of card. Nothing here
+    /// writes to an archive: slackdump is its only writer, and the fetch
+    /// exists exactly because the archive does not hold these threads.
+    fn apply_thread_card(&mut self, cid: &str, root_id: i64, root: Option<Msg>, last: Option<Msg>) {
+        let Some(phase) = self.thread_fetch.as_ref() else { return };
+        // The reader left THREADS while this was out. Every navigation
+        // primitive bumps the generation, which is what makes the check
+        // complete where a list of keys to intercept could not be.
+        if phase.nav_generation != self.nav_generation {
+            self.thread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        }
+        let Some(client) = self.api.clone() else {
+            self.thread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        };
+        let searched = phase
+            .current
+            .as_ref()
+            .filter(|target| target.cid == cid && target.root == root_id)
+            .map(|target| target.name.clone());
+        if let Some(mut root) = root {
+            // The conversation as this session names it, and the name the
+            // search gave where the session has none: a thread in a channel
+            // no archive holds is the case the phase is for.
+            let conversation = self
+                .corpus
+                .conv_by_channel(cid)
+                .map(|index| self.corpus.convs[index].name.clone())
+                .or_else(|| self.corpus.channel_names.get(cid).map(|name| format!("#{name}")))
+                .or(searched)
+                .unwrap_or_else(|| cid.to_string());
+            let ctx = Ctx {
+                archive: None,
+                corpus: &self.corpus,
+                tz: self.tz,
+                image_font: None,
+                last_read: None,
+                palette: &self.palette,
+            };
+            let participants = render::participants(&root, &ctx);
+            let mut last = last;
+            // The card's header names the conversation; a message header
+            // would say it again under it.
+            root.channel_name = None;
+            if let Some(last) = last.as_mut() {
+                last.channel_name = None;
+            }
+            let total = root.reply_count.max(i64::from(last.is_some()));
+            let hidden = (total - i64::from(last.is_some())).max(0);
+            let counted_from = root.id;
+            let counted_through = last.as_ref().map_or(root.id, |last| last.id);
+            let card = render::Card {
+                conversation,
+                participants,
+                hidden,
+                counted_from,
+                counted_through,
+                tail: last.into_iter().collect(),
+                elision: render::Elision::Replies,
+            };
+            if let Some(View::Threads { list }) = self.stack.last_mut() {
+                let order = Self::thread_card_order(&root);
+                let at = list
+                    .msgs
+                    .iter()
+                    .position(|other| Self::thread_card_order(other) > order)
+                    .unwrap_or(list.msgs.len());
+                list.insert_card(at, root, card);
+                if let Some(phase) = self.thread_fetch.as_mut() {
+                    phase.added += 1;
+                }
+            }
+        }
+        self.next_thread_fetch(&client);
+    }
+
+    /// A call failed — a rate-limit reply is the one this is written for — so
+    /// the phase stops where it stands. The cards it has added stay; the
+    /// threads it had not reached are left for the next run.
+    fn stop_thread_fetch(&mut self, error: String) {
+        let Some(phase) = self.thread_fetch.take() else {
+            self.status = error;
+            return;
+        };
+        let left = phase.queue.len() + usize::from(phase.current.is_some()) + phase.over_cap;
+        self.status = format!(
+            "Slack: {error}; {left} thread{} left unfetched",
+            if left == 1 { "" } else { "s" }
+        );
+        let said = self.status.clone();
+        self.say_in_scan(ScanOwner::ThreadFetch, live::ScanLine::plain(said));
+        self.close_scan_overlay(ScanOwner::ThreadFetch);
+    }
+
+    /// Drive the THREADS live phase to its end the way the event loop does,
+    /// and hand back what the progress box said while it ran.
+    #[cfg(test)]
+    pub(crate) fn finish_thread_fetch_for_test(&mut self) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.thread_fetch.is_some() && Instant::now() < deadline {
+            self.tick();
+            if self.thread_fetch.is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(self.thread_fetch.is_none(), "the thread fetch never finished");
+        let lines = self
+            .scan_overlay
+            .as_ref()
+            .map(|overlay| overlay.lines.iter().map(|line| line.text.clone()).collect())
+            .unwrap_or_default();
+        // The box lives one tick past its last line; this is that tick.
+        self.tick();
+        lines
+    }
+
+    /// The messages an UNREADS card draws under its first one: at most this
+    /// many, the newest of the conversation's unread run. Four drawn
+    /// messages a card is what a pane of ordinary height fits without the
+    /// card shedding parts of itself.
+    const UNREAD_CARD_TAIL: usize = 3;
+
+    /// One card per conversation with unread messages, newest unread message
+    /// first: the conversation and its unread count, then the first unread
+    /// message, the ones between elided, and the newest of them.
+    ///
+    /// The conversations are the ones the pane is showing, muted ones aside:
+    /// the visibility settings and a typed `/find` needle apply here too, so
+    /// the view never holds a row the list has been told to hide. Muted
+    /// conversations are left out whatever the settings say — the muted block
+    /// is where the alert channels sit, each with more unread messages than
+    /// everything else put together, and their cards would bury the view.
+    ///
+    /// Where the archive holds no message past the read marker — a
+    /// conversation only Slack has, one whose marker is still unknown, or one
+    /// whose unread messages the last refresh did not reach — the card falls
+    /// back to the newest message the archive does hold and says so beside
+    /// the name, and `Enter` opens the conversation the way the list does:
+    /// the cached page, or a fetch from Slack. A conversation with no
+    /// archived message at all draws a note in place of a message.
+    fn open_unreads(&mut self) {
+        // Leaving for UNREADS. A refresh already out was going to open the
+        // conversation it refreshed when it lands; the reader has gone
+        // elsewhere, so it lands quietly instead — as it does for SAVED and
+        // SENT.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
+        let targets: Vec<usize> = self
+            .filtered
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let conv = &self.corpus.convs[index];
+                conv.unread && !conv.muted
+            })
+            .collect();
+        // Deletes made while the view was open carry over: the archive keeps
+        // what Slack no longer has, so a rebuild that forgot them would put
+        // the deleted messages back on the cards.
+        let deleted = match self.stack.last() {
+            Some(View::Unreads { deleted, .. }) => deleted.clone(),
+            _ => Vec::new(),
+        };
+        let mut cards: Vec<(Msg, render::Card)> = Vec::new();
+        let mut fallbacks: Vec<live::UnreadTarget> = Vec::new();
+        for index in targets {
+            let skip = Self::deleted_in(&deleted, &self.corpus.convs[index].id);
+            cards.push(match self.refill_unread_card(index, &skip) {
+                Some(card) => card,
+                None => {
+                    let conv = &self.corpus.convs[index];
+                    // A read marker Slack has never reported is nothing to
+                    // fetch from: there is no `oldest` to ask from, and the
+                    // card stays on whatever the archive holds.
+                    if conv.last_read > 0 {
+                        fallbacks.push(live::UnreadTarget {
+                            cid: conv.id.clone(),
+                            name: conv.name.clone(),
+                            oldest: conv.last_read,
+                            unread_count: conv.unread_count,
+                        });
+                    }
+                    self.stale_unread_card(index, &skip)
+                }
+            });
+        }
+        // Newest unread message first, and for a card whose unread messages
+        // the archive does not hold, the newest message Slack says the
+        // conversation has: `last_id` is what the live snapshot updates, and
+        // the cached message such a card draws can be days behind it.
+        cards.sort_by_key(|(first, card)| {
+            let drawn = card.tail.last().map_or(first.id, |m| m.id);
+            std::cmp::Reverse(drawn.max(
+                self.corpus
+                    .conv_by_channel(&first.channel_id)
+                    .map_or(0, |index| self.corpus.convs[index].last_id),
+            ))
+        });
+        let n = cards.len();
+        let list = MsgList::with_cards(cards);
+        match self.stack.last_mut() {
+            // A refresh runs both phases again, so what the last one fetched
+            // is stale the moment the archive pass rebuilds the cards.
+            Some(View::Unreads { list: open, fetched, .. }) => {
+                *open = list;
+                fetched.clear();
+            }
+            _ => self.stack.push(View::Unreads { list, deleted, fetched: HashMap::new() }),
+        }
+        self.focus = Focus::Msgs;
+        self.status = format!(
+            "{n} {} with unread messages, newest unread first",
+            if n == 1 { "conversation" } else { "conversations" }
+        );
+        self.start_unread_fetch(fallbacks);
+    }
+
+    /// The live half of UNREADS: ask Slack for the unread messages of every
+    /// card the archive could not fill, one conversation at a time, behind
+    /// the progress box `/find` uses. Only when signed in; nothing fetched
+    /// here reaches an archive, and a rerun of the view runs the phase again.
+    fn start_unread_fetch(&mut self, targets: Vec<live::UnreadTarget>) {
+        self.unread_fetch = None;
+        let Some(client) = self.api.clone().filter(|_| self.live) else { return };
+        // The one scan slot is the archive search's while it holds it, and
+        // taking it from under a running `/find` would strand its view.
+        if targets.is_empty() || self.scan.is_some() || self.pending_search.is_some() {
+            return;
+        }
+        let (sender, progress) = std::sync::mpsc::channel();
+        self.scan_overlay = Some(ScanOverlay {
+            owner: ScanOwner::UnreadFetch,
+            nav_generation: self.nav_generation,
+            label: "UNREADS".to_string(),
+            lines: Vec::new(),
+            started: Instant::now(),
+            live_pending: false,
+            finished: false,
+            progress,
+        });
+        let asked = targets.len();
+        self.unread_fetch = Some(UnreadFetch {
+            queue: targets.into(),
+            nav_generation: self.nav_generation,
+            progress: sender,
+            replaced: 0,
+            asked,
+        });
+        self.next_unread_fetch(&client);
+    }
+
+    /// Send the next conversation's call, or close the phase when the queue
+    /// is empty.
+    fn next_unread_fetch(&mut self, client: &Arc<Client>) {
+        let Some(phase) = self.unread_fetch.as_mut() else { return };
+        let Some(target) = phase.queue.pop_front() else {
+            let (replaced, asked) = (phase.replaced, phase.asked);
+            self.unread_fetch = None;
+            self.status = format!(
+                "{replaced} of {asked} card{} filled in from Slack",
+                if asked == 1 { "" } else { "s" }
+            );
+            let said = self.status.clone();
+            self.say_in_scan(ScanOwner::UnreadFetch, live::ScanLine::dim(said));
+            self.close_scan_overlay(ScanOwner::UnreadFetch);
+            return;
+        };
+        let progress = phase.progress.clone();
+        self.scan = Some(live::api_unread_history(client.clone(), target, progress));
+    }
+
+    /// One conversation's unread messages arrived: its fallback card becomes
+    /// an ordinary one — the oldest message fetched leading, the newest three
+    /// as the tail, the rest elided — and the next conversation goes out.
+    ///
+    /// `complete` says the walk reached the read marker. Only then is the
+    /// lead the conversation's first unread message and the fetched count the
+    /// whole unread run; a walk the page cap stopped short holds a window of
+    /// the newest unread messages, and the header says so rather than
+    /// presenting the oldest of that window as the first unread one.
+    ///
+    /// The messages live on the card and nowhere else. Nothing here writes to
+    /// an archive: slackdump is its only writer, and the fetch exists exactly
+    /// because the archive does not hold these messages.
+    fn apply_unread_history(&mut self, cid: &str, msgs: Vec<Msg>, complete: bool) {
+        let Some(phase) = self.unread_fetch.as_ref() else { return };
+        // The reader left UNREADS while this was out. Every navigation
+        // primitive bumps the generation, which is what makes the check
+        // complete where a list of keys to intercept could not be.
+        if phase.nav_generation != self.nav_generation {
+            self.unread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        }
+        let Some(client) = self.api.clone() else {
+            self.unread_fetch = None;
+            self.scan_overlay = None;
+            return;
+        };
+        let named = self.corpus.conv_by_channel(cid).map(|index| {
+            let conv = &self.corpus.convs[index];
+            (conv.name.clone(), conv.last_id, conv.unread_count)
+        });
+        if let Some((name, last_id, claimed)) = named {
+            let run = UnreadRun { msgs, complete, claimed };
+            // A message deleted from Slack while the call was out: the view's
+            // ledger has it, and Slack answered from before the delete.
+            // Without this it is drawn and counted a second time, the ledger
+            // being the only record that it went.
+            let skip = match self.stack.last() {
+                Some(View::Unreads { deleted, .. }) => Self::deleted_in(deleted, cid),
+                _ => Vec::new(),
+            };
+            let built = Self::fetched_unread_card(name, &run, &skip, last_id);
+            if let Some(View::Unreads { list, fetched, .. }) = self.stack.last_mut() {
+                // The whole run is kept whatever the card draws of it: four
+                // messages are drawn, and a delete that takes those off comes
+                // back here for the next one.
+                fetched.insert(cid.to_string(), run);
+                if let Some((lead, card)) = built {
+                    if let Some(at) = list.msgs.iter().position(|message| message.channel_id == cid) {
+                        list.replace_card(at, lead, card);
+                        if let Some(phase) = self.unread_fetch.as_mut() {
+                            phase.replaced += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.next_unread_fetch(&client);
+    }
+
+    /// A call failed — a rate-limit reply is the one this is written for — so
+    /// the phase stops where it stands. The conversation it was asking about
+    /// and every one behind it keep the fallback cards they already have.
+    fn stop_unread_fetch(&mut self, error: String) {
+        let Some(phase) = self.unread_fetch.take() else {
+            self.status = error;
+            return;
+        };
+        let left = phase.queue.len() + 1;
+        self.status = format!(
+            "Slack: {error}; {left} card{} left as {} {}",
+            if left == 1 { "" } else { "s" },
+            if left == 1 { "it" } else { "they" },
+            if left == 1 { "was" } else { "were" },
+        );
+        let said = self.status.clone();
+        self.say_in_scan(ScanOwner::UnreadFetch, live::ScanLine::plain(said));
+        self.close_scan_overlay(ScanOwner::UnreadFetch);
+    }
+
+    /// The ids of `deleted` that belong to one conversation.
+    fn deleted_in(deleted: &[(String, i64)], cid: &str) -> Vec<i64> {
+        deleted
+            .iter()
+            .filter(|(channel, _)| channel == cid)
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    /// An UNREADS card built from the archive: the conversation's first
+    /// unread message, the ones between elided, and the newest of them.
+    /// `skip` are ids deleted from Slack while the view has been open, which
+    /// the read-only archive still holds and would otherwise hand back.
+    ///
+    /// None when the archive has nothing past the read marker — a
+    /// conversation only Slack has, one whose marker is still unknown, one
+    /// the last archive run did not reach, and one whose unread messages have
+    /// all been deleted. The caller draws `stale_unread_card` instead, or
+    /// drops the card.
+    fn refill_unread_card(&self, index: usize, skip: &[i64]) -> Option<(Msg, render::Card)> {
+        let conv = &self.corpus.convs[index];
+        let archive = self.corpus.conv_archive(conv).filter(|_| conv.last_read > 0)?;
+        let (total, msgs) = archive
+            .unread_page(&conv.id, conv.last_read, Self::UNREAD_CARD_TAIL, skip)
+            .ok()?;
+        if msgs.is_empty() {
+            return None;
+        }
+        Some(Self::unread_card(conv.name.clone(), Self::unread_label(total), total, msgs, conv.last_id))
+    }
+
+    /// An UNREADS card over the messages it draws, oldest first: the first
+    /// unread message leads, the rest are its tail, and the `total - drawn`
+    /// messages between them are elided. `last_id` stands in for the upper
+    /// bound of what the card counts when it draws nothing past its lead.
+    ///
+    /// One function for both halves of the view, so a card the archive filled
+    /// and a card Slack filled carry the same header, the same bounds and the
+    /// same elision, and a deleted message is taken off either the same way.
+    /// `msgs` is never empty: a card with no message to lead with is no card.
+    fn unread_card(
+        conversation: String,
+        header: String,
+        total: i64,
+        mut msgs: Vec<Msg>,
+        last_id: i64,
+    ) -> (Msg, render::Card) {
+        for message in &mut msgs {
+            // The card's header names the conversation; a message header
+            // would say it again under it.
+            message.channel_name = None;
+        }
+        let card = render::Card {
+            conversation,
+            participants: header,
+            hidden: (total - msgs.len() as i64).max(0),
+            counted_from: msgs[0].id,
+            counted_through: msgs.last().map_or(last_id, |m| m.id),
+            tail: Vec::new(),
+            elision: render::Elision::Messages,
+        };
+        let lead = msgs.remove(0);
+        (lead, render::Card { tail: msgs, ..card })
+    }
+
+    /// The card for a fetched unread run, minus whatever the delete ledger
+    /// says is gone. None when nothing is left to lead with, which is the
+    /// only case where the card has stopped standing for anything.
+    ///
+    /// The header depends on how the fetch ended, not on how many messages
+    /// survive: a walk that reached the marker knows the run exactly, and one
+    /// the page cap stopped short holds a window of it and says so.
+    fn fetched_unread_card(
+        conversation: String,
+        run: &UnreadRun,
+        skip: &[i64],
+        last_id: i64,
+    ) -> Option<(Msg, render::Card)> {
+        let msgs: Vec<Msg> = run
+            .msgs
+            .iter()
+            .filter(|message| !skip.contains(&message.id))
+            .cloned()
+            .collect();
+        if msgs.is_empty() {
+            return None;
+        }
+        let fetched = msgs.len() as i64;
+        // Never below what the card holds: `hidden` is the difference between
+        // the total and the messages drawn, so a total under the fetched
+        // count would draw an elision line that lies.
+        let total = if run.complete { fetched } else { run.claimed.unwrap_or(fetched).max(fetched) };
+        let header = if run.complete {
+            Self::unread_label(total)
+        } else {
+            Self::unread_window_label(total, fetched)
+        };
+        let drawn = if msgs.len() > Self::UNREAD_CARD_TAIL + 1 {
+            let mut drawn = vec![msgs[0].clone()];
+            drawn.extend_from_slice(&msgs[msgs.len() - Self::UNREAD_CARD_TAIL..]);
+            drawn
+        } else {
+            msgs
+        };
+        Some(Self::unread_card(conversation, header, total, drawn, last_id))
+    }
+
+    /// The card for a conversation Slack calls unread and the archive has no
+    /// unread message of: the newest message it does hold, and a header
+    /// saying the unread ones are not there. `skip` keeps a message deleted
+    /// from Slack off the card, the read-only archive still holding it.
+    fn stale_unread_card(&self, index: usize, skip: &[i64]) -> (Msg, render::Card) {
+        let conv = &self.corpus.convs[index];
+        let mut msgs: Vec<Msg> = self
+            .corpus
+            .conv_archive(conv)
+            .and_then(|a| a.timeline_page(&conv.id, None, None, 1 + skip.len()).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| !skip.contains(&m.id))
+            .collect();
+        if msgs.len() > 1 {
+            msgs.drain(..msgs.len() - 1);
+        }
+        if msgs.is_empty() {
+            msgs.push(Self::unread_placeholder(conv));
+        }
+        for message in &mut msgs {
+            message.channel_name = None;
+        }
+        let card = render::Card {
+            conversation: conv.name.clone(),
+            // Slack's count where a snapshot has one; the archive cannot
+            // supply it, having none of the messages it would count.
+            participants: match conv.unread_count {
+                Some(n) => format!("{n} unread · not in the archive"),
+                None => "unread · not in the archive".to_string(),
+            },
+            hidden: 0,
+            counted_from: msgs[0].id,
+            counted_through: msgs.last().map_or(conv.last_id, |m| m.id),
+            tail: Vec::new(),
+            elision: render::Elision::Messages,
+        };
+        let lead = msgs.remove(0);
+        (lead, render::Card { tail: msgs, ..card })
+    }
+
+    /// The count an UNREADS card's header carries for a conversation whose
+    /// unread messages the archive holds. One function so that a card whose
+    /// lead message is deleted can be renumbered without guessing at the
+    /// string it already carries.
+    fn unread_label(total: i64) -> String {
+        format!("{total} unread")
+    }
+
+    /// The header of a card whose fetch stopped short of the read marker: the
+    /// count, and how many of them the card holds. Every such card says so,
+    /// whatever the two numbers are — the message it leads with is not the
+    /// conversation's first unread one, and only the clause says that.
+    ///
+    /// `400 unread · newest 300 fetched` where Slack's count is the larger.
+    /// `100+ unread · newest 100 fetched` where the fetch covered that count
+    /// and stopped on it: the count was reached, the marker was not, so the
+    /// run is at least that long and the `+` is the only honest form.
+    ///
+    /// Deliberately not the plain `unread_label` form, so that
+    /// `drop_from_unreads`, which renumbers a header only where it still
+    /// reads as the count that card was built with, leaves this one alone.
+    fn unread_window_label(total: i64, fetched: i64) -> String {
+        let more = if total > fetched { "" } else { "+" };
+        format!("{total}{more} unread · newest {fetched} fetched")
+    }
+
+    /// The one line an UNREADS card draws for a conversation no archive holds
+    /// a message of. A card's item has to be a message, and there is none.
+    fn unread_placeholder(conv: &Conv) -> Msg {
+        let id = if conv.last_id > 0 { conv.last_id } else { 1 };
+        Msg::from_api(
+            conv.id.clone(),
+            serde_json::json!({
+                "ts": format!("{}.{:06}", id / 1_000_000, id % 1_000_000),
+                "username": "slack-tui",
+                "text": "not cached; open the conversation to load it from Slack",
+            }),
+        )
+        .expect("a placeholder message")
+    }
+
+    /// `Enter` on an UNREADS card: open that conversation, at its first
+    /// unread message when the card knows which one that is.
+    fn open_unread_card(&mut self) {
+        let Some(message) = self.selected().cloned() else { return };
+        let Some(index) = self.corpus.conv_by_channel(&message.channel_id) else {
+            self.status = "Conversation is unavailable; refresh the conversation list".into();
+            return;
+        };
+        // The card led with a real unread message only when the archive was
+        // the one that found it: a fallback card leads with a read message or
+        // with the placeholder, and neither is a position to claim.
+        let conv = &self.corpus.convs[index];
+        let unread = !conv.live_only && conv.last_read > 0 && message.id > conv.last_read;
+        self.stack.clear();
+        if !self.open_conv(index) {
+            return;
+        }
+        if let Some(at) = self.filtered.iter().position(|&i| i == index) {
+            self.conv_cursor = at;
+        }
+        if !unread {
+            // Nothing was positioned, so whatever `open_conv` had to say —
+            // that the conversation is not cached and there is no sign-in to
+            // fetch it with, say — is the news, and stands.
+            return;
+        }
+        // `open_conv` already lands on the first message past the marker of
+        // the page it loaded. A longer unread run than that page leaves the
+        // first unread off it, and only then is a jump needed.
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|open| !open.api_only && !open.list.msgs.iter().any(|m| m.id == message.id))
+        {
+            self.jump_to(message.id);
+        }
+        let name = self.corpus.convs[index].name.clone();
+        self.status = format!("{name} at the first unread message · h: back");
+    }
+
+    pub fn image_font(&self) -> Option<(u16, u16)> {
+        if !self.inline_images {
+            return None;
+        }
+        self.picker
+            .as_ref()
+            .map(|p| (p.font_size().width, p.font_size().height))
+    }
+
+    fn mark_all_dirty(&mut self) {
+        if let Some(o) = self.open.as_mut() {
+            o.list.mark_dirty();
+        }
+        for v in &mut self.stack {
+            match v {
+                View::Thread { list, .. } | View::Search { list, .. } | View::Threads { list } | View::Unreads { list, .. } | View::Saved { list } | View::Feed { list, .. } => {
+                    list.mark_dirty()
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A local copy of a file: the upload directory of the archive holding
+    /// the file's conversation first, then the cache.
+    fn local_file(&self, f: &crate::archive::FileInfo, full: bool) -> Option<PathBuf> {
+        if let Some(idx) = self.corpus.conv_by_channel(&f.channel) {
+            let conv = &self.corpus.convs[idx];
+            if !conv.live_only {
+                for source in &self.corpus.archives[conv.archive].source_dirs {
+                    let dir = source.join("__uploads").join(&f.id);
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        if let Some(entry) = rd.flatten().find(|entry| entry.path().is_file()) {
+                            return Some(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+        let name = if full {
+            format!("{}.{}", f.id, f.ext())
+        } else {
+            format!("{}.thumb.{}", f.id, f.ext())
+        };
+        let cached = self.cache_dir.join("files").join(name);
+        cached.is_file().then_some(cached)
+    }
+
+    fn release_picture(&mut self, key: &str) {
+        self.images.remove(key);
+        if self.file_job.as_ref().is_some_and(|job| matches!(&job.kind, JobKind::File { id } if id == key)) {
+            self.file_job = None;
+        }
+    }
+
+    /// Have a file's pixels ready or on their way. `full` wants the original.
+    /// A download waits in the queue until a sign-in provides the client, so
+    /// an image first seen before sign-in still arrives.
+    pub fn ensure_image(&mut self, f: &crate::archive::FileInfo, full: bool) {
+        let key = if full {
+            format!("{}:full", f.id)
+        } else {
+            f.id.clone()
+        };
+        if self.images.contains_key(&key) {
+            return;
+        }
+        if let Some(path) = self.local_file(f, full) {
+            let state = match image::open(&path) {
+                Ok(img) => ImageState::Ready(img),
+                Err(e) => ImageState::Failed(format!("{e}")),
+            };
+            self.images.insert(key, state);
+            return;
+        }
+        let url = if full {
+            f.url.clone()
+        } else {
+            f.thumb.clone().or_else(|| f.url.clone())
+        };
+        let state = match url {
+            Some(url) => {
+                let name = if full {
+                    format!("{}.{}", f.id, f.ext())
+                } else {
+                    format!("{}.thumb.{}", f.id, f.ext())
+                };
+                ImageState::Queued {
+                    url,
+                    dest: self.cache_dir.join("files").join(name),
+                }
+            }
+            None => ImageState::Failed("no download URL".to_string()),
+        };
+        self.images.insert(key, state);
+    }
+
+    /// Start the next queued download when the slot is free.
+    fn pump_files(&mut self) {
+        if self.file_job.is_some() {
+            return;
+        }
+        let next = self.images.iter().find_map(|(k, s)| match s {
+            ImageState::Queued { url, dest } if self.api.is_some() => Some((k.clone(), url.clone(), dest.clone())),
+            _ => None,
+        });
+        if let Some((key, url, dest)) = next {
+            self.images.insert(key.clone(), ImageState::Loading);
+            self.file_job = Some(live::fetch_file(self.api.clone().expect("file client"), key, url, dest));
+        }
+    }
+
+    /// The inline encoding of a thumbnail for a cell box, cached by size.
+    pub fn inline_protocol(&mut self, id: &str, cols: u16, rows: u16) -> Option<&Protocol> {
+        self.message_protocol(id, cols, rows, false)
+    }
+
+    pub fn message_protocol(&mut self, id: &str, cols: u16, rows: u16, grayscale: bool) -> Option<&Protocol> {
+        let encoding_key = format!("{id}:{cols}x{rows}{}", if grayscale { ":gray" } else { "" });
+        let fresh = matches!(self.inline.get(&encoding_key), Some((c, r, _)) if *c == cols && *r == rows);
+        if !fresh {
+            let picker = self.picker.as_ref()?;
+            let img = match self.images.get(id) {
+                Some(ImageState::Ready(img)) => img,
+                _ => return None,
+            };
+            let size = ratatui::layout::Size::new(cols, rows);
+            let proto = picker
+                .new_protocol(if grayscale { img.grayscale() } else { img.clone() }, size, ratatui_image::Resize::Fit(None))
+                .ok()?;
+            self.inline.insert(encoding_key.clone(), (cols, rows, proto));
+        }
+        self.inline.get(&encoding_key).map(|(_, _, p)| p)
+    }
+
+    /// What a mark applies to: the highlighted conversation from the list,
+    /// else the conversation of the selected message, which in a search or
+    /// threads view is not necessarily the open one.
+    fn mark_target(&self) -> Result<(usize, Option<Msg>), String> {
+        match self.focus {
+            Focus::Convs => {
+                let idx = *self
+                    .filtered
+                    .get(self.conv_cursor)
+                    .ok_or("nothing highlighted")?;
+                Ok((idx, None))
+            }
+            Focus::Msgs => {
+                let m = self.selected().cloned().ok_or("no message selected")?;
+                let idx = self.corpus.conv_by_channel(&m.channel_id).ok_or_else(|| {
+                    format!("{} is not a conversation this tool knows", m.channel_id)
+                })?;
+                Ok((idx, Some(m)))
+            }
+        }
+    }
+
+    fn mark_with(&mut self, idx: usize, id: i64) {
+        let Some(c) = self.api.clone() else {
+            self.status = "marking needs the Slack sign-in".to_string();
+            return;
+        };
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        if id <= 0 {
+            self.status =
+                "nothing to mark: no message of that conversation is known yet".to_string();
+            return;
+        }
+        let cid = self.corpus.convs[idx].id.clone();
+        self.job = Some(live::api_mark(c, idx, cid, id));
+    }
+
+    /// `m`: the read marker moves to the newest message known of the target
+    /// conversation: the newest loaded when it is the open one, else the
+    /// newest the archive or Slack's counts reported.
+    fn mark_read(&mut self) {
+        let (idx, _) = match self.mark_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let newest_loaded = self
+            .open
+            .as_ref()
+            .filter(|o| o.conv == idx)
+            .and_then(|o| o.list.msgs.last().map(|m| m.id));
+        let id = newest_loaded.unwrap_or(self.corpus.convs[idx].last_id);
+        self.mark_with(idx, id);
+    }
+
+    /// `M`: put the read marker one microsecond before the selected message,
+    /// independent of list order; from the sidebar use the newest known message.
+    fn mark_unread(&mut self) {
+        let (idx, sel) = match self.mark_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let id = match sel {
+            Some(m) => m.id - 1,
+            None => self.corpus.convs[idx].last_id - 1,
+        };
+        self.mark_with(idx, id);
+    }
+
+    /// Esc in the list: the home view, with no filter and nothing open.
+    fn escape_home(&mut self) {
+        // Leaving for home.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        let at_home = self.focus == Focus::Convs && self.open.is_none() && self.stack.is_empty()
+            && self.pane_menu.is_none() && !self.help && self.filter.is_empty()
+            && matches!(self.mode, Mode::Normal)
+            && !self.channel_browser.as_ref().is_some_and(|browser| browser.visible);
+        if matches!(self.mode, Mode::Prompt { .. }) {
+            // Preserve compose drafts and perform the normal prompt cancellation.
+            self.on_prompt_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        if let Some(browser) = &mut self.channel_browser { browser.hide(); }
+        if let Some(job) = &mut self.job { job.navigate_on_completion = false; }
+        for view in self.stack.iter().rev() {
+            match view {
+                View::Keys { original, .. } => self.keymap = original.clone(),
+                View::ColorPalette { original, .. } => self.palette = original.clone(),
+                _ => {}
+            }
+        }
+        self.mark_all_dirty();
+        self.pane_menu = None;
+        self.help = false;
+        self.pending_delete = None;
+        let image_keys: Vec<String> = self.stack.iter().filter_map(|view| match view {
+            View::Image { files, .. } => Some(files.iter().map(|file| format!("{}:full", file.id))),
+            _ => None,
+        }).flatten().collect();
+        for key in image_keys { self.release_picture(&key); }
+        self.go_home();
+        if at_home { self.conv_cursor = 0; self.conv_offset = 0; self.top_section = Some(TopSection::Saved); }
+    }
+
+    fn go_home(&mut self) {
+        // Leaving for home: h from the bare timeline lands here, not in
+        // escape_home.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        self.invalidate_thread_jobs();
+        if !self.filter.is_empty() {
+            self.filter.clear();
+            self.apply_filter();
+        }
+        self.open = None;
+        self.sent_return = None;
+        self.stack.clear();
+        self.status.clear();
+        self.focus = Focus::Convs;
+    }
+
+    /// `i`: the selected message's images, full pane.
+    fn open_images(&mut self) {
+        // Leaving for the image viewer.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        let Some(m) = self.selected() else {
+            return;
+        };
+        let files: Vec<crate::archive::FileInfo> =
+            m.files().into_iter().filter(|f| f.is_image()).collect();
+        if files.is_empty() {
+            self.status = "no image on this message".to_string();
+            return;
+        }
+        if self.picker.is_none() {
+            self.status = "images are off (--no-images)".to_string();
+            return;
+        }
+        self.stack.push(View::Image {
+            files,
+            index: 0,
+            zoom: 100,
+            shown: None,
+        });
+    }
+
+    fn prompt_archive(&mut self) {
+        // A hit from a conversation not cached yet: offer its id.
+        let prefill = self
+            .selected()
+            .filter(|m| self.corpus.conv_by_channel(&m.channel_id).is_none())
+            .map(|m| m.channel_id.clone())
+            .unwrap_or_default();
+        self.mode = Mode::Prompt {
+            kind: PromptKind::Archive,
+            buf: Editor::with(prefill.clone()),
+            previous: prefill,
+        };
+    }
+
+    fn archive_new(&mut self, spec: &str) {
+        let spec = spec.trim().to_string();
+        if spec.is_empty() {
+            return;
+        }
+        if !self.live {
+            self.status = "live fetch is off (--no-live, or no slackdump)".to_string();
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "a fetch is already running".to_string();
+            return;
+        }
+        if !self.slackdump {
+            self.status = "archiving a conversation needs slackdump on PATH".to_string();
+            return;
+        }
+        self.job = Some(live::archive_new(&self.corpus.root, spec, 90));
+    }
+
+    /// Name a freshly written archive after its conversation, as the
+    /// refresh scripts expect, and open it.
+    fn finish_archive(&mut self, dir: &Path, spec: &str, navigate: bool) {
+        let name = match Archive::open("new".to_string(), dir) {
+            Ok(mut a) => a
+                .scan_convs(
+                    usize::MAX,
+                    self.corpus.me.as_deref(),
+                    self.corpus.half_life_days,
+                    None,
+                )
+                .unwrap_or_default()
+                .first()
+                .map(|c| c.name.trim_start_matches(['#', '@']).to_string())
+                .filter(|s| !s.is_empty()),
+            Err(e) => {
+                self.status = format!("{e}");
+                return;
+            }
+        };
+        let Some(name) = name else {
+            let _ = std::fs::remove_dir_all(dir);
+            self.status = format!("slackdump wrote no conversation for {spec}");
+            return;
+        };
+        let slug: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let stamp = chrono::Utc::now().format("%Y%m%d");
+        let final_dir = self
+            .corpus
+            .root
+            .join("full")
+            .join(format!("{slug}_{stamp}"));
+        if final_dir.exists() {
+            let _ = std::fs::remove_dir_all(dir);
+            self.status = format!("already archived: {}", final_dir.display());
+            return;
+        }
+        if let Err(e) = std::fs::rename(dir, &final_dir) {
+            self.status = format!("{e}");
+            return;
+        }
+        match self.corpus.add_archive(&final_dir) {
+            Ok(new) => {
+                self.apply_filter();
+                if let Some(&idx) = new.first().filter(|_| navigate) {
+                    self.conv_cursor = self.filtered.iter().position(|&i| i == idx).unwrap_or(0);
+                    self.open_conv(idx);
+                }
+                self.status = format!("archived {name} into {}", final_dir.display());
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn take_profiles(&mut self, users: Vec<Value>) {
+        self.corpus.merge_profiles(users);
+        let names: Vec<_> = self
+            .corpus
+            .convs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, conv)| {
+                let uid = self.dm_users.get(&conv.id)?;
+                let name = if self.corpus.me.as_deref() == Some(uid) {
+                    "@me (self)".to_string()
+                } else {
+                    format!(
+                        "@{}",
+                        self.corpus.user_name(uid).unwrap_or_else(|| uid.clone())
+                    )
+                };
+                Some((idx, name))
+            })
+            .collect();
+        for (idx, name) in names {
+            self.corpus.convs[idx].name = name;
+        }
+        self.mark_all_dirty();
+        self.apply_filter();
+        self.update_notes();
+    }
+
+    fn take_usergroups(&mut self, groups: Vec<Value>) {
+        self.corpus.usergroups = groups
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v["id"].as_str()?.to_string(),
+                    v["name"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        self.mark_all_dirty();
+    }
+
+    /// Advance the spinner and collect a finished job.
+    pub fn tick(&mut self) {
+        // The box lives one tick past its last line, so that line is drawn.
+        if self.scan_overlay.as_ref().is_some_and(|overlay| overlay.finished) {
+            self.scan_overlay = None;
+        }
+        if let Some(overlay) = self.scan_overlay.as_mut() { overlay.drain(); }
+        let mut browser_status = None;
+        self.browser_jobs.retain(|job| match job.poll() {
+            None => true,
+            Some(Ok(_)) => { browser_status = Some("Opened link in browser".to_string()); false }
+            Some(Err(error)) => { browser_status = Some(error); false }
+        });
+        if let Some(status) = browser_status { self.status = status; }
+
+        if let Some(browser) = &mut self.channel_browser { browser.tick(); }
+        if let Some(location) = self.channel_browser.as_mut().filter(|browser| browser.visible).and_then(|browser| browser.message.take()) {
+            self.open_file_message(location);
+        }
+        self.spinner = self.spinner.wrapping_add(1);
+        if let Some(outcome) = self.group_job.as_ref().and_then(|j| j.poll()) {
+            self.group_job = None;
+            match outcome {
+                Ok(Done::Usergroups(groups, warning)) => {
+                    self.take_usergroups(groups);
+                    if let Some(warning) = warning {
+                        self.status = warning;
+                    }
+                }
+                Err(e) => self.status = format!("user groups: {e}"),
+                _ => {}
+            }
+        }
+        if let Some(outcome) = self.profile_job.as_ref().and_then(|j| j.poll()) {
+            self.profile_job = None;
+            match outcome {
+                Ok(Done::Profiles(users, warning)) => {
+                    self.take_profiles(users);
+                    if let Some(warning) = warning {
+                        self.status = warning;
+                    }
+                }
+                Err(e) => self.status = format!("user profiles: {e}"),
+                _ => {}
+            }
+        }
+        // The file slot: one download at a time, decoded on arrival.
+        if let Some(outcome) = self.file_job.as_ref().and_then(|j| j.poll()) {
+            let job = self.file_job.take().expect("polled");
+            if let JobKind::File { id } = job.kind {
+                let state = match outcome {
+                    Ok(Done::File(path)) => match image::open(&path) {
+                        Ok(img) => ImageState::Ready(img),
+                        Err(e) => ImageState::Failed(format!("{e}")),
+                    },
+                    Ok(_) => ImageState::Failed("unexpected result".to_string()),
+                    Err(e) => ImageState::Failed(e),
+                };
+                self.images.insert(id, state);
+            }
+        }
+        self.pump_files();
+        // Count lookups must not hold up message tails or ordinary unread markers.
+        if let Some(outcome) = self.unread_count_job.as_ref().and_then(|job| job.poll()) {
+            let job = self.unread_count_job.take().expect("polled");
+            if matches!(job.kind, JobKind::Counts { gen } if gen == self.counts_gen) {
+                if let Ok(Done::Counts(snapshot)) = outcome {
+                    self.apply_unread_counts(&snapshot);
+                }
+            }
+        }
+        // The scan's own slot: the archive search, which must never be
+        // refused because the other two are busy.
+        let job_before_scan = self.job.is_some();
+        if let Some(outcome) = self.scan.as_ref().and_then(|job| job.poll()) {
+            let job = self.scan.take().expect("polled");
+            match (job.kind, outcome) {
+                (JobKind::ArchiveScan { query }, Ok(Done::ArchiveHits { hits, capped, users })) => {
+                    self.adopt_scan_users(users);
+                    self.finish_archive_search(&query, hits, capped);
+                }
+                // The UNREADS live phase shares the slot and the box: one
+                // conversation's messages land, and the next call goes out.
+                (JobKind::UnreadHistory { cid }, Ok(Done::UnreadHistory { msgs, complete })) => {
+                    self.apply_unread_history(&cid, msgs, complete);
+                }
+                (JobKind::UnreadHistory { .. }, Err(error)) => self.stop_unread_fetch(error),
+                // The THREADS live phase shares them too: the search
+                // answers, and then one thread at a time.
+                (JobKind::ThreadSearch, Ok(Done::ThreadCandidates(targets))) => {
+                    self.apply_thread_candidates(targets);
+                }
+                (JobKind::ThreadCard { cid, root }, Ok(Done::ThreadCard { root: head, last })) => {
+                    self.apply_thread_card(&cid, root, head.map(|head| *head), last);
+                }
+                (JobKind::ThreadSearch | JobKind::ThreadCard { .. }, Err(error)) => {
+                    self.stop_thread_fetch(error)
+                }
+                (_, Ok(_)) => {}
+                (_, Err(error)) => {
+                    self.pending_search = None;
+                    self.say_in_scan(ScanOwner::Search, live::ScanLine::plain(error.clone()));
+                    self.close_scan_overlay(ScanOwner::Search);
+                    self.status = error;
+                }
+            }
+        }
+        // A Slack search the scan just started is left for the next tick:
+        // polled here it would replace the line the scan wrote before that
+        // line is ever drawn, the same one-tick grace the box gets above.
+        let scan_started_job = !job_before_scan && self.job.is_some();
+        // The quiet slot: sign-in, the conversation list, counts, tails.
+        if let Some(outcome) = self.bg.as_ref().and_then(|j| j.poll()) {
+            let job = self.bg.take().expect("polled");
+            match outcome {
+                Ok(Done::ConversationSnapshot(conversations, counts)) => {
+                    if let JobKind::ConversationRefresh { gen } = job.kind { self.apply_conversation_snapshot(gen, conversations, counts); }
+                }
+                Ok(Done::Auth(client, who)) => {
+                    self.api = Some(client.clone());
+                    self.profile_job =
+                        Some(live::api_profiles(client.clone(), self.cache_dir.clone()));
+                    self.group_job =
+                        Some(live::api_usergroups(client.clone(), self.cache_dir.clone()));
+                    self.status = format!("signed in as {who}");
+                    self.bg = Some(live::api_conversations(client));
+                }
+                Ok(Done::Conversations(list)) => {
+                    self.merge_conversations(list);
+                    if let Some(c) = self.api.clone() {
+                        if !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::ConversationRefresh { .. })) {
+                            self.bg = Some(live::api_counts(c, self.counts_gen));
+                        }
+                        self.muted_pending = true;
+                        self.starred_pending = true;
+                    }
+                }
+                Ok(Done::Counts(v)) => {
+                    // A counts snapshot taken before a mark would undo it.
+                    if matches!(job.kind, JobKind::Counts { gen } if gen == self.counts_gen)
+                        && !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::ConversationRefresh { .. })) {
+                        self.apply_counts(&v);
+                        let targets = self.unread_count_targets();
+                        if self.unread_count_job.is_none() && !targets.is_empty() {
+                            if let Some(client) = self.api.clone() {
+                                self.unread_count_job = Some(live::api_unread_counts(client, self.counts_gen, v, targets));
+                            }
+                        }
+                    }
+                    self.last_counts = Instant::now();
+                    self.muted_pending = true;
+                    self.starred_pending = true;
+                }
+                Ok(Done::StarredChannels(ids)) => {
+                    if let JobKind::StarredChannels { gen } = job.kind { self.take_starred_snapshot(gen, ids); }
+                }
+                Ok(Done::StarChanged { cid, starred, ids }) => self.finish_star(&cid, starred, ids),
+                Ok(Done::MutedChannels(ids)) => {
+                    if let JobKind::MutedChannels { gen } = job.kind {
+                        self.take_muted_snapshot(gen, ids);
+                    }
+                }
+                Ok(Done::MuteChanged { cid, muted, ids }) => self.finish_mute(&cid, muted, ids),
+                Ok(Done::ThreadMsgs(msgs)) => {
+                    if let JobKind::Thread { root, .. } = job.kind {
+                        if job.navigate_on_completion { self.extend_thread(msgs, root); }
+                    }
+                }
+                Ok(Done::Messages(msgs)) => {
+                    if let JobKind::Tail { conv } = job.kind {
+                        self.append_tail(conv, msgs, true);
+                    }
+                }
+                // The scan takes the quiet slot when the fetch slot is busy,
+                // so its result has to be handled here as well.
+                Ok(Done::ArchiveHits { hits, capped, users }) => {
+                    if let JobKind::ArchiveScan { query } = job.kind {
+                        self.adopt_scan_users(users);
+                        self.finish_archive_search(&query, hits, capped);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if matches!(job.kind, JobKind::ArchiveScan { .. }) {
+                        self.pending_search = None;
+                        self.say_in_scan(ScanOwner::Search, live::ScanLine::plain(e.clone()));
+                        self.close_scan_overlay(ScanOwner::Search);
+                    }
+                    self.status = match job.kind {
+                        JobKind::Auth => format!("not signed in: {e}"),
+                        _ => e,
+                    };
+                }
+            }
+        }
+        self.pump_requested_counts();
+        if let Some(c) = self.api.clone() {
+            if self.starred_pending && self.bg.is_none()
+                && !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::SetStarred)) {
+                self.starred_pending = false;
+                self.bg = Some(live::api_starred_channels(c.clone(), self.starred_generation));
+            }
+            if self.muted_pending
+                && self.bg.is_none()
+                && !matches!(self.job.as_ref().map(|j| &j.kind), Some(JobKind::SetMuted))
+            {
+                self.muted_pending = false;
+                self.bg = Some(live::api_muted_channels(c.clone(), self.muted_generation));
+            }
+            if let (Some((conv, thread)), true) = (self.tail_pending, self.bg.is_none()) {
+                let open_here = self.open.as_ref().map(|o| o.conv) == Some(conv);
+                let open_root = match self.stack.last() {
+                    Some(View::Thread { root, .. }) => Some(*root),
+                    _ => None,
+                };
+                let cid = self.corpus.convs[conv].id.clone();
+                match (thread, open_root) {
+                    // A reply lands in the thread pane, which history cannot
+                    // fill; the timeline behind it waits for the next poll.
+                    (Some(root), Some(open)) if open == root => {
+                        self.tail_pending = None;
+                        self.bg = Some(live::api_thread(
+                            c.clone(),
+                            &self.cache_dir,
+                            cid,
+                            root,
+                            root,
+                        ));
+                    }
+                    (None, _) if open_here => {
+                        self.tail_pending = None;
+                        let since = self
+                            .open
+                            .as_ref()
+                            .and_then(|o| o.list.msgs.last().map(|m| m.id))
+                            .unwrap_or(0);
+                        self.bg = Some(live::api_tail(c.clone(), conv, cid, since, true));
+                    }
+                    // Nothing on screen wants it: drop the errand.
+                    _ => self.tail_pending = None,
+                }
+            }
+            if self.bg.is_none() && self.poll_every.as_secs() > 0
+                && !matches!(self.job.as_ref().map(|job| &job.kind), Some(JobKind::ConversationRefresh { .. })) {
+                if self.last_poll.elapsed() >= self.poll_every {
+                    self.last_poll = Instant::now();
+                    // An open thread is what the reader is looking at; the
+                    // timeline behind it waits for the next tick.
+                    let open_thread = match self.stack.last() {
+                        Some(View::Thread { root, list, .. }) => list
+                            .msgs
+                            .first()
+                            .map(|m| m.channel_id.clone())
+                            .or_else(|| {
+                                self.open
+                                    .as_ref()
+                                    .map(|o| self.corpus.convs[o.conv].id.clone())
+                            })
+                            .map(|cid| {
+                                (cid, *root, list.selected().map(|m| m.id).unwrap_or(*root))
+                            }),
+                        _ => None,
+                    };
+                    if let Some((cid, root, focus)) = open_thread {
+                        self.bg = Some(live::api_thread(
+                            c.clone(),
+                            &self.cache_dir,
+                            cid,
+                            root,
+                            focus,
+                        ));
+                    } else if let Some(o) = self.open.as_ref() {
+                        let since = o.list.msgs.last().map(|m| m.id).unwrap_or(0);
+                        if !o.has_newer && since > 0 {
+                            let idx = o.conv;
+                            let cid = self.corpus.convs[idx].id.clone();
+                            self.bg = Some(live::api_tail(c.clone(), idx, cid, since, true));
+                        }
+                    }
+                } else if self.last_counts.elapsed() >= self.poll_every * 2 {
+                    self.last_counts = Instant::now();
+                    self.bg = Some(live::api_counts(c, self.counts_gen));
+                }
+            }
+        }
+        // The user's slot.
+        if scan_started_job {
+            return;
+        }
+        let Some(outcome) = self.job.as_ref().and_then(|j| j.poll()) else {
+            return;
+        };
+        let job = self.job.take().expect("a job was polled");
+        if matches!(job.kind, JobKind::Thread { .. }) && !job.navigate_on_completion { return; }
+        if let JobKind::MessageLink { raw_id, .. } = &job.kind {
+            if !matches!(self.stack.last(), Some(View::Raw { browser, .. }) if browser.id == *raw_id) { return; }
+        }
+        if let JobKind::SentContext { generation, focus, channel } = &job.kind {
+            if !job.navigate_on_completion || !matches!(self.stack.last(), Some(View::Feed { generation: current, list, .. })
+                if current == generation && list.selected().is_some_and(|message| message.id == *focus && message.channel_id == *channel)) { return; }
+        }
+        let done = match outcome {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("Slack: {e}");
+                if matches!(job.kind, JobKind::SetStarred) {
+                    self.starred_generation = self.starred_generation.wrapping_add(1);
+                    self.starred_pending = true;
+                }
+                if matches!(job.kind, JobKind::SetMuted) {
+                    self.muted_generation = self.muted_generation.wrapping_add(1);
+                    self.muted_pending = true;
+                }
+                if let JobKind::Upload { .. } = &job.kind {
+                    // The file left the prompt when the send started; say so,
+                    // rather than let the next conversation inherit it.
+                    self.status = format!("Slack: {e}; the file is not attached any more");
+                }
+                if let JobKind::Search { query } = &job.kind {
+                    if let Some(View::Search {
+                        query: q,
+                        live_pending,
+                        ..
+                    }) = self.stack.last_mut()
+                    {
+                        if q == query {
+                            *live_pending = false;
+                        }
+                    }
+                }
+                if matches!(job.kind, JobKind::Search { .. } | JobKind::ArchiveScan { .. }) {
+                    if matches!(job.kind, JobKind::ArchiveScan { .. }) { self.pending_search = None; }
+                    let said = self.status.clone();
+                    self.say_in_scan(ScanOwner::Search, live::ScanLine::plain(said));
+                    self.close_scan_overlay(ScanOwner::Search);
+                }
+                return;
+            }
+        };
+        match (job.kind, done) {
+            (JobKind::ConversationRefresh { gen }, Done::ConversationSnapshot(conversations, counts)) => self.apply_conversation_snapshot(gen, conversations, counts),
+            (_, Done::StarChanged { cid, starred, ids }) => self.finish_star(&cid, starred, ids),
+            (JobKind::StarredChannels { gen }, Done::StarredChannels(ids)) => self.take_starred_snapshot(gen, ids),
+            (_, Done::MuteChanged { cid, muted, ids }) => self.finish_mute(&cid, muted, ids),
+            (JobKind::MutedChannels { gen }, Done::MutedChannels(ids)) => {
+                self.take_muted_snapshot(gen, ids)
+            }
+            (JobKind::Refresh { conv, before }, Done::Refreshed) => {
+                self.refresh_conv_stats(conv);
+                if job.navigate_on_completion {
+                    // A refresh navigating is the job finishing, not the
+                    // reader going anywhere, so a scan in flight keeps its
+                    // generation. The only site that restores it; every
+                    // other caller of open_conv means what the bump says.
+                    let asked_from = self.nav_generation;
+                    self.open_conv(conv);
+                    self.nav_generation = asked_from;
+                }
+                let conversation = &self.corpus.convs[conv];
+                let new = self.corpus.archives[conversation.archive]
+                    .timeline_count(&conversation.id).unwrap_or(before) - before;
+                self.status = format!(
+                    "refreshed: {new} new top-level message{}",
+                    if new == 1 { "" } else { "s" }
+                );
+            }
+            (JobKind::SentContext { .. }, Done::MessageContext(location)) => self.apply_sent_context(location, true),
+            (JobKind::Saved, Done::Saved(messages)) => self.apply_saved(messages),
+            (JobKind::Sent { generation, append }, Done::SentPage(page)) => self.apply_sent(generation, append, page),
+            (JobKind::MessageLink { raw_id, link }, Done::ThreadMsgs(messages)) => {
+                self.show_linked_message(raw_id, &link, messages);
+            }
+            (JobKind::Thread { cid, root, focus }, Done::Thread(dir)) => {
+                if matches!(self.stack.last(), Some(View::Thread { root: r, .. }) if *r == root) {
+                    self.apply_thread_dir(&dir, &cid, root, focus);
+                } else {
+                    self.status = "thread fetched into the cache".to_string();
+                }
+            }
+            (JobKind::Thread { root, focus, .. }, Done::ThreadMsgs(msgs)) => {
+                if matches!(self.stack.last(), Some(View::Thread { root: r, .. }) if *r == root) {
+                    self.apply_thread_msgs(msgs, root, focus, "Slack");
+                } else {
+                    self.status = "thread fetched into the cache".to_string();
+                }
+            }
+            (JobKind::ArchiveScan { query }, Done::ArchiveHits { hits, capped, users }) => {
+                self.adopt_scan_users(users);
+                self.finish_archive_search(&query, hits, capped);
+            }
+            (JobKind::Search { query }, Done::Search(dir)) => self.merge_live_search(&query, &dir),
+            (JobKind::Search { query }, Done::SearchHits { hits, complete }) => self.merge_hits(&query, hits, complete),
+            (JobKind::ArchiveNew { spec }, Done::Archived(dir)) => self.finish_archive(&dir, &spec, job.navigate_on_completion),
+            (JobKind::Tail { conv }, Done::Messages(msgs)) => self.append_tail(conv, msgs, false),
+            (JobKind::Older { conv }, Done::OlderMessages(msgs, more)) => self.prepend_older(conv, msgs, more),
+            (JobKind::Newer { conv }, Done::NewerMessages(msgs, more)) => {
+                if let Some(open) = self.open.as_mut().filter(|open| open.conv == conv && open.api_only) {
+                    open.has_newer = more;
+                    let known: HashSet<i64> = open.list.msgs.iter().map(|message| message.id).collect();
+                    open.list.msgs.extend(msgs.into_iter().filter(|message| !known.contains(&message.id)));
+                    open.list.mark_dirty();
+                }
+                self.update_notes();
+            }
+            (JobKind::Mark { conv, id }, Done::Marked) => {
+                let c = &mut self.corpus.convs[conv];
+                c.last_read = id;
+                c.unread = c.last_id > id;
+                c.unread_count = None;
+                c.unread_snapshot = None;
+                self.counts_gen += 1;
+                if !c.unread {
+                    c.mentions = 0;
+                }
+                let name = c.name.clone();
+                let what = if c.unread {
+                    "marked unread"
+                } else {
+                    "marked read"
+                };
+                self.apply_filter();
+                self.mark_all_dirty();
+                self.status = format!("{name} {what}");
+            }
+            (JobKind::Upload { conv, thread }, Done::Uploaded(name)) => {
+                self.draft = None;
+                self.attachment = None;
+                let cname = self.corpus.convs[conv].name.clone();
+                self.status = format!("{name} sent to {cname}");
+                // Slack builds the message around the file, so it has to be
+                // fetched; the background slot may still be busy.
+                self.tail_pending = Some((conv, thread));
+            }
+            (JobKind::Send { conv, thread }, Done::Sent(msg)) => {
+                let msg = *msg;
+                self.draft = None;
+                let name = self.corpus.convs[conv].name.clone();
+                let c = &mut self.corpus.convs[conv];
+                if msg.id > c.last_id {
+                    c.last_id = msg.id;
+                    c.unread_count = None;
+                    c.unread_snapshot = None;
+                }
+                match thread {
+                    Some(root) => {
+                        if let Some(View::Thread { root: r, list, .. }) = self.stack.last_mut() {
+                            if *r == root && !list.msgs.iter().any(|m| m.id == msg.id) {
+                                list.msgs.push(msg);
+                                list.cursor = list.len() - 1;
+                                list.mark_dirty();
+                            }
+                        }
+                        self.status = format!("reply sent in {name}");
+                    }
+                    None => {
+                        self.append_tail(conv, vec![msg], true);
+                        self.status = format!("sent to {name}");
+                    }
+                }
+            }
+            (JobKind::Delete { id, cid, root }, Done::Deleted) => {
+                self.drop_message(&cid, root, id);
+                self.status = "message deleted".to_string();
+            }
+            (JobKind::Leave { conv }, Done::Left) => {
+                let c = &mut self.corpus.convs[conv];
+                c.left = true;
+                c.unread = false;
+                c.unread_count = None;
+                c.unread_snapshot = None;
+                c.mentions = 0;
+                let name = c.name.clone();
+                self.apply_filter();
+                self.mark_all_dirty();
+                self.status = format!("left {name}");
+            }
+            _ => {}
+        }
+    }
+
+    pub fn open_raw(&mut self) {
+        // Leaving for raw JSON.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        let Some(m) = self.active_list().and_then(|l| l.selected()).cloned() else {
+            return;
+        };
+        let place = self.corpus.channel_names.get(&m.channel_id).map(|name| format!("#{name}"))
+            .unwrap_or_else(|| m.channel_id.clone());
+        let title = format!("raw · {} · {place}", m.ts);
+        self.stack.push(View::Raw {
+            title,
+            browser: crate::raw::Browser::new(&m.data),
+            entry_focus: Focus::Msgs,
+        });
+    }
+
+    /// `v` on a conversation row: the raw JSON of what the row stands for —
+    /// the `CHANNEL` object for a channel or group message, the
+    /// counterpart's `S_USER` object for a direct message. Read by id from
+    /// the conversation's own archive when the key is pressed, so the same
+    /// id in two archives answers with that archive's row, and `Conv` stays
+    /// as small as it is.
+    fn open_conv_raw(&mut self) {
+        // A top row (SAVED, SENT, MENTIONS, THREADS) stands for no object.
+        if self.top_section.is_some() {
+            return;
+        }
+        let Some(&index) = self.filtered.get(self.conv_cursor) else {
+            return;
+        };
+        let me = self.corpus.me.clone();
+        let conv = &self.corpus.convs[index];
+        let name = conv.name.clone();
+        let found = match self.corpus.conv_archive(conv) {
+            None => Err(format!("{name} is in Slack only; no archive row to show")),
+            Some(archive) if conv.kind == Kind::Im => {
+                match archive.im_counterpart(&conv.id, me.as_deref()) {
+                    Err(error) => Err(format!("{name}: could not read the channel row: {error}")),
+                    Ok(Counterpart::OwnerUnknown(count)) => Err(format!(
+                        "{name}: cannot tell the counterpart from {count} members with no known owner"
+                    )),
+                    Ok(Counterpart::Ambiguous(count)) => Err(format!(
+                        "{name}: cannot tell the counterpart from {count} members"
+                    )),
+                    Ok(Counterpart::User(uid)) => match archive.user_json(&uid) {
+                        Ok(Some(user)) => Ok((format!("raw · {name} · {uid}"), user)),
+                        Ok(None) => {
+                            Err(format!("{name}: {uid} is not in this archive's user table"))
+                        }
+                        Err(error) => Err(format!(
+                            "{name}: could not read the user row for {uid}: {error}"
+                        )),
+                    },
+                }
+            }
+            Some(archive) => match archive.channel_json(&conv.id) {
+                Ok(Some(channel)) => Ok((format!("raw · {name} · {}", conv.id), channel)),
+                Ok(None) => Err(format!("{name}: this archive holds no channel row for it")),
+                Err(error) => Err(format!(
+                    "{name}: could not read this archive's channel row: {error}"
+                )),
+            },
+        };
+        match found {
+            Ok((title, value)) => {
+                // Leaving for raw JSON.
+                self.nav_generation = self.nav_generation.wrapping_add(1);
+                self.stack.push(View::Raw {
+                    title,
+                    browser: crate::raw::Browser::new(&value),
+                    entry_focus: Focus::Convs,
+                });
+            }
+            Err(status) => self.status = status,
+        }
+    }
+
+    fn goto_date(&mut self, text: &str) {
+        // Leaving for a date.
+        self.nav_generation = self.nav_generation.wrapping_add(1);
+        let Ok(date) = chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d") else {
+            self.status = format!("not a date: '{}' (want YYYY-MM-DD)", text.trim());
+            return;
+        };
+        let Some(secs) = self.tz.midnight(date) else {
+            return;
+        };
+        let Some(o) = self.open.as_ref() else { return };
+        let conv = &self.corpus.convs[o.conv];
+        let id = (secs * 1_000_000).clamp(conv.first_id, conv.last_id + 1);
+        self.stack.clear();
+        self.jump_to(id);
+        self.status = format!("{}", date);
+    }
+
+    fn reload(&mut self) {
+        if let Some(o) = self.open.as_ref() {
+            let idx = o.conv;
+            self.open_conv(idx);
+            self.status = "reloaded".to_string();
+        }
+    }
+
+    // ---------------------------------------------------------------- views
+
+    pub fn active_list(&self) -> Option<&MsgList> {
+        match self.stack.iter().rev().find(|v| {
+            !matches!(
+                v,
+                View::Raw { .. }
+                    | View::Image { .. }
+                    | View::Reactions { .. }
+                    | View::ColorPalette { .. }
+            )
+        }) {
+            Some(View::Thread { list, .. })
+            | Some(View::Search { list, .. })
+            | Some(View::Threads { list }) | Some(View::Unreads { list, .. }) | Some(View::Saved { list }) | Some(View::Feed { list, .. }) => Some(list),
+            _ => self.open.as_ref().map(|o| &o.list),
+        }
+    }
+
+    pub fn active_list_mut(&mut self) -> Option<&mut MsgList> {
+        match self.stack.iter_mut().rev().find(|v| {
+            !matches!(
+                v,
+                View::Raw { .. }
+                    | View::Image { .. }
+                    | View::Reactions { .. }
+                    | View::ColorPalette { .. }
+            )
+        }) {
+            Some(View::Thread { list, .. })
+            | Some(View::Search { list, .. })
+            | Some(View::Threads { list }) | Some(View::Unreads { list, .. }) | Some(View::Saved { list }) | Some(View::Feed { list, .. }) => Some(list),
+            _ => self.open.as_mut().map(|o| &mut o.list),
+        }
+    }
+
+    pub fn in_timeline(&self) -> bool {
+        self.stack.is_empty()
+    }
+
+    pub fn selected(&self) -> Option<&Msg> {
+        self.active_list().and_then(|l| l.selected())
+    }
+
+    /// Rows the bottom line needs in a terminal `width` by `height`: one, the
+    /// lines of an open prompt, or a compose box sized to its wrapped draft,
+    /// both of its borders included.
+    pub fn prompt_rows(&self, width: u16, height: u16) -> u16 {
+        match &self.mode {
+            Mode::Prompt {
+                kind: PromptKind::Compose,
+                buf,
+                ..
+            } => {
+                // What is left once the messages pane keeps its Min(3) and the
+                // box spends two rows on borders, so the split can honor it.
+                let room = height.saturating_sub(5).max(1) as usize;
+                crate::ui::compose_layout(buf, width, crate::ui::COMPOSE_ROWS.min(room)).height()
+            }
+            Mode::Prompt { buf, .. } => (buf.text.matches('\n').count() as u16 + 1).min(8),
+            Mode::Normal => 1,
+        }
+    }
+
+    /// Title of the messages pane.
+    pub fn title(&self) -> String {
+        if matches!(self.stack.last(), Some(View::Keys { .. })) {
+            return "keys · what each action answers to".to_string();
+        }
+        if matches!(self.stack.last(), Some(View::ColorPalette { .. })) {
+            return "color palette · live preview".to_string();
+        }
+        let o = self.open.as_ref();
+        let conv = o.map(|o| &self.corpus.convs[o.conv]);
+        match self.stack.last() {
+            Some(View::ColorPalette { .. }) | Some(View::Keys { .. }) => {
+                unreachable!("handled before opening a conversation")
+            }
+            Some(View::Feed { list, next_cursor, section, .. }) => format!("{} · {} loaded{} · r: refresh", section.label(), list.len(), if next_cursor.is_some() { " · j at end: older" } else { "" }),
+            Some(View::Saved { list }) => format!("SAVED · {} messages · r: refresh · /unsave", list.len()),
+            Some(View::Raw { title, .. }) => title.clone(),
+            Some(View::Reactions { title, .. }) => title.clone(),
+            Some(View::Image {
+                files, index, zoom, ..
+            }) => {
+                let f = &files[*index];
+                format!(
+                    "image {}/{} · {} · {}x{} · {} · {zoom}% · +/- zoom · 0 fit",
+                    index + 1,
+                    files.len(),
+                    f.name,
+                    f.width,
+                    f.height,
+                    self.picker
+                        .as_ref()
+                        .map(|p| format!("{:?}", p.protocol_type()).to_lowercase())
+                        .unwrap_or_default()
+                )
+            }
+            Some(View::Threads { list }) => format!(
+                "threads you took part in or were mentioned in · {} · first and last message · newest reply first",
+                list.len()
+            ),
+            Some(View::Unreads { list, .. }) => format!(
+                "UNREADS · {} {} · newest unread first · r: refresh",
+                list.len(),
+                if list.len() == 1 { "conversation" } else { "conversations" }
+            ),
+            Some(View::Thread {
+                list, live, place, ..
+            }) => {
+                let n = list.len().saturating_sub(1);
+                let place = match (live, list.msgs.first()) {
+                    _ if place.is_some() => place.clone().unwrap_or_default(),
+                    (Some(a), Some(m)) => a
+                        .channel_name(&m.channel_id)
+                        .map(|c| format!("#{c}"))
+                        .unwrap_or_else(|| conv.map(|c| c.name.clone()).unwrap_or_default()),
+                    _ => conv.map(|c| c.name.clone()).unwrap_or_default(),
+                };
+                let from = if live.is_some()
+                    || list.msgs.first().is_some_and(|m| m.channel_name.is_some())
+                {
+                    " · from Slack"
+                } else {
+                    ""
+                };
+                if n == 0 {
+                    format!("message in {place} · no replies{from}")
+                } else {
+                    format!(
+                        "thread in {place} · {n} {}{from}",
+                        if n == 1 { "reply" } else { "replies" }
+                    )
+                }
+            }
+            Some(View::Search {
+                query,
+                list,
+                capped,
+                live_hits,
+                live_pending,
+            }) => {
+                let live = if *live_pending {
+                    " · searching Slack".to_string()
+                } else {
+                    live_hits
+                        .map(|n| {
+                            let cache_only = n.cache_only_label();
+                            format!(
+                                " · {} more from Slack{}",
+                                n.added,
+                                if cache_only.is_empty() { String::new() } else { format!(" · {cache_only}") },
+                            )
+                        })
+                        .unwrap_or_else(||" · cached results only".into())
+                };
+                format!(
+                    "search '{query}' · {} hit{}{}{live}",
+                    list.len(),
+                    if list.len() == 1 { "" } else { "s" },
+                    if *capped { " (capped)" } else { "" }
+                )
+            }
+            None if o.is_some_and(|o| o.api_only) => format!(
+                "{} · {} · {} loaded · live from Slack, not cached",
+                conv.unwrap().name,
+                conv.unwrap().kind.label(),
+                o.unwrap().list.len()
+            ),
+            None => {
+                let (Some(o), Some(conv)) = (o, conv) else { return "messages".into() };
+                let span = format!(
+                    "{} → {}",
+                    self.tz.fmt(conv.first_id / 1_000_000, "%Y-%m-%d"),
+                    self.tz.fmt(conv.last_id / 1_000_000, "%Y-%m-%d")
+                );
+                format!(
+                    "{} · {} · {} messages, {} loaded · {span} · {}",
+                    conv.name,
+                    conv.kind.label(),
+                    o.total,
+                    o.list.len(),
+                    self.corpus
+                        .conv_archive(conv)
+                        .map(|a| a.rel.as_str())
+                        .unwrap_or("not cached")
+                )
+            }
+        }
+    }
+
+    fn open_conversations_pane(&mut self) {
+        self.sync_muted();
+        self.pane_menu = Some(crate::conversations_pane::Menu::new(
+            self.pane_settings.clone(),
+            &self.corpus.convs,
+        ));
+        self.status.clear();
+    }
+
+    fn on_conversations_pane_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Esc {
+            self.pane_menu = None;
+            self.status.clear();
+            return;
+        }
+        if self.pane_menu.as_ref().unwrap().cursor == 0 {
+            let menu = self.pane_menu.as_mut().unwrap();
+            match k.code {
+                KeyCode::Enter | KeyCode::Tab | KeyCode::Down => menu.cursor = 1,
+                KeyCode::Backspace => { menu.query.pop(); },
+                KeyCode::Char('u') if ctrl(k) => menu.query.clear(),
+                KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                    menu.query.push(c);
+                }
+                KeyCode::PageDown => menu.cursor = 10.min(menu.rows().len() - 1),
+                KeyCode::End => menu.cursor = menu.rows().len() - 1,
+                _ => {},
+            }
+            return;
+        }
+        if k.code == KeyCode::Enter {
+            let settings = self.pane_menu.as_ref().unwrap().settings.clone();
+            if let Err(e) = settings.save(self.pane_path.as_deref(), &self.pane_workspace) {
+                self.status = format!("conversations-pane: cannot save: {e}");
+                return;
+            }
+            self.pane_settings = settings;
+            self.pane_menu = None;
+            self.apply_filter();
+            if self
+                .open
+                .as_ref()
+                .is_some_and(|o| !self.filtered.contains(&o.conv))
+            {
+                self.open = None;
+                self.stack.clear();
+                self.focus = Focus::Convs;
+            }
+            self.status = format!("conversations-pane: {} visible", self.filtered.len());
+            self.mark_all_dirty();
+            return;
+        }
+        let menu = self.pane_menu.as_mut().unwrap();
+        let last = menu.rows().len().saturating_sub(1);
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => menu.cursor = menu.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => menu.cursor = (menu.cursor + 1).min(last),
+            KeyCode::PageUp => menu.cursor = menu.cursor.saturating_sub(10),
+            KeyCode::PageDown => menu.cursor = (menu.cursor + 10).min(last),
+            KeyCode::Home => menu.cursor = 0,
+            KeyCode::End => menu.cursor = last,
+            KeyCode::Char('h') | KeyCode::Left => menu.set(false),
+            KeyCode::Char('l') | KeyCode::Right => menu.set(true),
+            KeyCode::Char(' ') => menu.toggle(),
+            _ => {}
+        }
+    }
+
+    // ----------------------------------------------------------------- keys
+
+    /// Whether the right-hand pane holds anything: a conversation, a stacked
+    /// view, or one of the home sections.
+    fn messages_pane_occupied(&self) -> bool {
+        self.open.is_some() || !self.stack.is_empty() || self.top_section.is_some()
+    }
+
+    /// Being inside a conversation rather than browsing the list: the messages
+    /// hold the focus and have something to show.
+    pub fn inside_conversation(&self) -> bool {
+        self.focus == Focus::Msgs && self.messages_pane_occupied()
+    }
+
+    /// Whether the pane is drawn at all. The auto-hide state answers from
+    /// where the owner is rather than from anything a key wrote down, so
+    /// opening a conversation hides the pane and leaving it brings it back.
+    pub fn conversations_visible(&self) -> bool {
+        match self.conversations_pane {
+            ConversationsPaneVisibility::AlwaysShown => true,
+            ConversationsPaneVisibility::AlwaysHidden => false,
+            ConversationsPaneVisibility::AutoHideInsideConversation => !self.inside_conversation(),
+        }
+    }
+
+    /// A cursor in a pane nobody draws is lost, so while the pane is hidden
+    /// outright the focus moves to the messages — but only when the messages
+    /// have something to show. With both panes empty there is nowhere better
+    /// to be, and the status line says what happened instead. An open prompt
+    /// keeps the focus it was opened with: `/` searches the workspace from the
+    /// list and the conversation from the messages.
+    fn settle_conversations_focus(&mut self) {
+        if self.conversations_pane != ConversationsPaneVisibility::AlwaysHidden
+            || self.focus != Focus::Convs
+            || matches!(self.mode, Mode::Prompt { .. })
+        {
+            return;
+        }
+        if self.messages_pane_occupied() {
+            self.focus = Focus::Msgs;
+        }
+        if self.status.is_empty() {
+            self.status = PANE_HIDDEN_HINT.to_string();
+        }
+    }
+
+    pub fn on_key(&mut self, k: KeyEvent) {
+        self.dispatch_key(k);
+        self.settle_conversations_focus();
+    }
+
+    fn dispatch_key(&mut self, k: KeyEvent) {
+        self.last_key = Some((crate::keys::received_key(k), Instant::now()));
+        // The progress box is modal: Esc ends what it is narrating, and no
+        // other key reaches a UI the reader cannot see.
+        if self.scan_running() {
+            if k.code == KeyCode::Esc { self.cancel_scan(); }
+            return;
+        }
+        if self.keymap.action(k) == Some(Action::ToggleConversations)
+            && !matches!(self.stack.last(), Some(View::Keys { capture: Some(_), .. })) {
+            self.conversations_pane = self.conversations_pane.next();
+            self.status = self.conversations_pane.label().to_string();
+            // Saved on every press: the client is killed, not exited.
+            if let Err(e) = crate::conversations_pane::save_visibility(
+                self.pane_path.as_deref(),
+                &self.pane_workspace,
+                self.conversations_pane,
+            ) {
+                self.status = format!("{}; not saved: {e}", self.conversations_pane.label());
+            }
+            self.pending_delete = None;
+            return;
+        }
+        if k.code == KeyCode::Esc {
+            if let Some(browser) = self.channel_browser.as_mut().filter(|browser| browser.visible && browser.escape_edits()) {
+                browser.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            } else { self.escape_home(); }
+            return;
+        }
+        if let Some(browser) = self.channel_browser.as_mut().filter(|b| b.visible) {
+            let picture_key = browser.picture.as_ref().map(|picture| format!("{}:full", picture.file.id));
+            if browser.can_toggle() && self.keymap.action(k)==Some(Action::ChannelTabs) {browser.hide();}
+            else {browser.key(k);}
+            if browser.picture.is_none() {
+                if let Some(key) = picture_key { self.release_picture(&key); }
+            }
+            return;
+        }
+
+        if self.pane_menu.is_some() {
+            self.on_conversations_pane_key(k);
+            return;
+        }
+        if self.help {
+            self.help = false;
+            return;
+        }
+        if matches!(self.mode, Mode::Prompt { .. }) {
+            self.on_prompt_key(k);
+            return;
+        }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(View::Keys { .. }) = self.stack.last() {
+            self.on_keys_key(k, ctrl);
+            return;
+        }
+        if let Some(View::ColorPalette { .. }) = self.stack.last() {
+            self.on_palette_key(k, ctrl);
+            return;
+        }
+        if matches!(self.stack.last(), Some(View::Reactions { .. }))
+            && !matches!(self.keymap.action(k), Some(Action::Quit | Action::Help)) {
+            self.on_raw_key(k, ctrl);
+            return;
+        }
+        let action = self.keymap.action(k);
+        if matches!(action, Some(Action::Save | Action::Unsave)) {
+            self.pending_delete = None;
+            self.change_saved(action == Some(Action::Save));
+            return;
+        }
+        if action == Some(Action::ChannelTabs) && self.focus == Focus::Convs && self.top_section.is_some() {
+            self.status = "Select a channel first".into(); return;
+        }
+        if action == Some(Action::ChannelTabs) {
+            let index = if self.focus == Focus::Convs { self.filtered.get(self.conv_cursor).copied() }
+                else { self.open.as_ref().map(|o| o.conv) };
+            let same_channel = index.is_some_and(|index| self.channel_browser.as_ref().is_some_and(|b| b.channel == self.corpus.convs[index].id));
+            if same_channel || self.channel_browser.as_ref().is_some_and(|b| b.busy_or_dirty()) {
+                if let Some(browser) = &mut self.channel_browser { browser.visible = true; }
+            } else if let (Some(client), Some(index)) = (self.api.clone(), index) {
+                if self.focus == Focus::Convs { self.open_conv(index); }
+                if let Some(key) = self.channel_browser.as_ref().and_then(|browser| browser.picture.as_ref())
+                    .map(|picture| format!("{}:full", picture.file.id)) {
+                    self.release_picture(&key);
+                }
+                let conv = &self.corpus.convs[index];
+                self.channel_browser = Some(crate::canvas::Browser::new(client, conv.id.clone(), conv.name.clone()));
+                self.focus = Focus::Msgs;
+            } else { self.status = "Select a channel and sign in to Slack to read its tabs".into(); }
+            return;
+        }
+        // An armed delete lives for exactly one more key, and only in the
+        // pane that armed it.
+        if self.pending_delete.is_some()
+            && (action != Some(Action::Delete) || self.focus != Focus::Msgs)
+        {
+            self.pending_delete = None;
+            self.status = "delete cancelled".to_string();
+        }
+        match action {
+            Some(Action::Quit) => {
+                if self.channel_browser.as_ref().is_some_and(|b| b.busy_or_dirty()) {
+                    self.status = "Channel tabs have pending work or an unsaved draft; press T to return".into();
+                    return;
+                }
+                self.quit = true;
+                return;
+            }
+            Some(Action::Help) => {
+                self.help = true;
+                return;
+            }
+            _ => {}
+        }
+        if let Some(View::Raw { .. }) = self.stack.last() {
+            self.on_json_key(k, ctrl);
+            return;
+        }
+        if let Some(View::Image {
+            files,
+            index,
+            shown,
+            zoom,
+        }) = self.stack.last_mut()
+        {
+            match k.code {
+                KeyCode::Char('+' | '=') => {
+                    *zoom = (*zoom + 25).min(800);
+                    *shown = None;
+                }
+                KeyCode::Char('-' | '_') => {
+                    *zoom = zoom.saturating_sub(25).max(25);
+                    *shown = None;
+                }
+                KeyCode::Char('0') => {
+                    *zoom = 100;
+                    *shown = None;
+                }
+                KeyCode::Char('j')
+                | KeyCode::Down
+                | KeyCode::Char('l')
+                | KeyCode::Right
+                | KeyCode::Char('n') => {
+                    if *index + 1 < files.len() {
+                        *index += 1;
+                        *zoom = 100;
+                        *shown = None;
+                    }
+                }
+                KeyCode::Char('k')
+                | KeyCode::Up
+                | KeyCode::Char('p') => {
+                    if *index > 0 {
+                        *index -= 1;
+                        *zoom = 100;
+                        *shown = None;
+                    }
+                }
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i' | 'h') | KeyCode::Left => {
+                    // The originals are large; keep only thumbnails once the viewer closes.
+                    if let Some(View::Image { files, .. }) = self.stack.pop() {
+                        for f in files {
+                            self.images.remove(&format!("{}:full", f.id));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.focus == Focus::Msgs
+            && action == Some(Action::Open)
+            && matches!(k.code, KeyCode::Char('l') | KeyCode::Right)
+        {
+            if matches!(self.stack.last(), Some(View::Feed { .. })) {
+                self.on_msg_key(Some(Action::Open));
+            } else if !matches!(self.stack.last(), Some(View::Thread { .. }))
+                && self.selected().is_some_and(|message| message.has_thread() || message.parent_id.is_some())
+            {
+                self.on_msg_key(Some(Action::Open));
+            } else if self.active_list().is_some_and(|list|
+                list.line_scroll || !list.collapsed.get(list.cursor).copied().unwrap_or(false)
+            ) {
+                self.open_raw();
+            } else if let Some(list) = self.active_list_mut() {
+                if list.selected().is_some() {
+                    list.line_scroll = true;
+                    list.scroll = list.first.get(list.cursor).copied().unwrap_or(0);
+                    self.status = "read message · j/k or arrows: one line · PgUp/PgDn: page · l: raw · Enter: thread · h: back · Esc: home".into();
+                }
+            }
+            return;
+        }
+        match self.focus {
+            Focus::Convs => self.on_conv_key(action),
+            Focus::Msgs => self.on_msg_key(action),
+        }
+    }
+
+    fn on_json_key(&mut self, key: KeyEvent, control: bool) {
+        let height = self.msgs_height.saturating_sub(2).max(1) as isize;
+        if key.code == KeyCode::Enter && !control {
+            self.follow_raw_link();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) && !control {
+            // The pane the view was opened from takes the focus back,
+            // whatever a followed link did to it and whether or not a
+            // conversation is open behind the view.
+            if let Some(View::Raw { entry_focus, .. }) = self.stack.pop() {
+                self.focus = entry_focus;
+            }
+            return;
+        }
+        let Some(View::Raw { browser, .. }) = self.stack.last_mut() else { return };
+        match (key.code, control) {
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => browser.move_cursor(1),
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => browser.move_cursor(-1),
+            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => browser.move_cursor(isize::MIN),
+            (KeyCode::Char('G'), false) | (KeyCode::End, _) => browser.move_cursor(isize::MAX),
+            (KeyCode::Char('d'), true) | (KeyCode::Char('f'), false) => browser.scroll_lines(height / 2),
+            (KeyCode::Char('u'), true) | (KeyCode::Char('b'), false) => browser.scroll_lines(-height / 2),
+            (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => browser.scroll_lines(height),
+            (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => browser.scroll_lines(-height),
+            _ => {}
+        }
+    }
+
+    fn follow_raw_link(&mut self) {
+        let Some(View::Raw { browser, .. }) = self.stack.last() else { return };
+        let raw_id = browser.id;
+        if let Some(url) = browser.selected().filter(|leaf| leaf.link.is_none()).and_then(|leaf| leaf.web_url.clone()) {
+            self.browser_jobs.push(live::spawn(JobKind::OpenBrowser, "opening browser".into(), move || {
+                crate::raw::open_browser(&url).map(|()| Done::BrowserOpened)
+            }));
+            self.status = "Opening link in browser".into();
+            return;
+        }
+        let Some(link) = browser.selected().and_then(|leaf| leaf.link.clone()) else {
+            self.status = "Select a link with j/k, then Enter".into();
+            return;
+        };
+        if !link.in_workspace(&self.corpus.workspace_url) {
+            self.status = "This link belongs to another Slack workspace".into();
+            return;
+        }
+        if self.job.is_some() {
+            self.status = "A fetch is running; retry Enter when it finishes".into();
+            return;
+        }
+        // Leave the source conversation and view stack intact for h to return to.
+        let mut root = link.root.unwrap_or(link.focus);
+        let archive = self.corpus.conv_by_channel(&link.channel)
+            .and_then(|index| self.corpus.conv_archive(&self.corpus.convs[index]));
+        let mut messages = archive.and_then(|archive| archive.thread(&link.channel, root).ok()).unwrap_or_default();
+        if link.root.is_none() {
+            if let Some(message) = messages.iter().find(|message| message.id == link.focus) {
+                root = message.thread_root();
+                if root != link.focus {
+                    messages = archive.and_then(|archive| archive.thread(&link.channel, root).ok()).unwrap_or_default();
+                }
+            }
+        }
+        if !messages.iter().any(|message| message.id == link.focus) {
+            messages = live::cached_thread(&self.cache_dir, &link.channel, root).unwrap_or_default();
+        }
+        if !messages.iter().any(|message| message.id == link.focus) && link.root.is_none() {
+            messages = crate::raw::cached_reply(&self.cache_dir, &link.channel, link.focus).unwrap_or_default();
+        }
+        if messages.iter().any(|message| message.id == link.focus) {
+            self.show_linked_message(raw_id, &link, messages);
+        } else if let Some(client) = self.api.clone() {
+            let mut link = link;
+            if root != link.focus { link.root = Some(root); }
+            self.job = Some(live::api_message_link(client, raw_id, link));
+        } else {
+            self.status = "Linked message is not cached; sign in to Slack to fetch it".into();
+        }
+    }
+
+    fn show_linked_message(&mut self, raw_id: u64, link: &crate::raw::Link, messages: Vec<Msg>) {
+        if !matches!(self.stack.last(), Some(View::Raw { browser, .. }) if browser.id == raw_id) { return; }
+        let Some(cursor) = messages.iter().position(|message| message.id == link.focus && message.channel_id == link.channel) else {
+            self.status = "Linked message is unavailable".into();
+            return;
+        };
+        self.invalidate_thread_jobs();
+        let root = messages[cursor].thread_root();
+        let mut list = MsgList::new(messages, true);
+        list.cursor = cursor;
+        list.align_top = true;
+        let place = self.corpus.channel_names.get(&link.channel).map(|name| format!("#{name}"))
+            .unwrap_or_else(|| link.channel.clone());
+        self.stack.push(View::Thread { root, list, live: None, place: Some(place) });
+        // A list in the messages pane takes the focus, so its keys reach it:
+        // a raw view opened from a conversation row left the focus on the
+        // list, and `on_conv_key` has no answer for a thread.
+        self.focus = Focus::Msgs;
+        self.status = "Opened linked Slack message · h: back".into();
+    }
+
+    fn on_raw_key(&mut self, k: KeyEvent, ctrl: bool) {
+        let height = self.msgs_height.max(1);
+        let Some(View::Reactions { lines, scroll, .. }) = self.stack.last_mut() else {
+            return;
+        };
+        let max = lines.len().saturating_sub(height);
+        match (k.code, ctrl) {
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => *scroll = (*scroll + 1).min(max),
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => *scroll = scroll.saturating_sub(1),
+            (KeyCode::Char('d'), true) | (KeyCode::Char('f'), false) => *scroll = (*scroll + height / 2).min(max),
+            (KeyCode::Char('u'), true) | (KeyCode::Char('b'), false) => *scroll = scroll.saturating_sub(height / 2),
+            (KeyCode::Char('f'), true) | (KeyCode::PageDown, _) => {
+                *scroll = (*scroll + height).min(max)
+            }
+            (KeyCode::Char('b'), true) | (KeyCode::PageUp, _) => {
+                *scroll = scroll.saturating_sub(height)
+            }
+            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => *scroll = 0,
+            (KeyCode::Char('G'), false) | (KeyCode::End, _) => *scroll = max,
+            (KeyCode::Esc, _)
+            | (KeyCode::Char('h'), false)
+            | (KeyCode::Left, _)
+            | (KeyCode::Enter, _) => {
+                self.stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn on_conv_key(&mut self, action: Option<Action>) {
+        let half_page = (self.msgs_height.max(2) / 2) as isize;
+        let delta = match action {
+            Some(Action::Down) => Some(1), Some(Action::Up) => Some(-1),
+            Some(Action::HalfPageDown) => Some(half_page), Some(Action::HalfPageUp) => Some(-half_page),
+            Some(Action::PageDown) => Some(20), Some(Action::PageUp) => Some(-20),
+            Some(Action::First) => Some(isize::MIN), Some(Action::Last) => Some(isize::MAX), _ => None,
+        };
+        if let Some(delta) = delta {
+            let row = self.top_section.map(TopSection::row).unwrap_or(if self.filtered.is_empty() { 0 } else { self.conv_cursor + TopSection::ALL.len() });
+            let row = row.saturating_add_signed(delta).min(self.filtered.len() + TopSection::ALL.len() - 1);
+            self.top_section = TopSection::ALL.get(row).copied();
+            self.conv_cursor = row.saturating_sub(TopSection::ALL.len()); return;
+        }
+        if action == Some(Action::Open) {
+            match self.top_section.or_else(|| self.filtered.is_empty().then_some(TopSection::Saved)) {
+                Some(TopSection::Saved) => { self.open_saved(); return; }
+                Some(TopSection::Sent) => { self.open_sent(); return; }
+                Some(TopSection::Mentions) => { self.open_feed(TopSection::Mentions); return; }
+                Some(TopSection::Threads) => { self.open_my_threads(); return; }
+                Some(TopSection::Unreads) => { self.open_unreads(); return; }
+                None => {}
+            }
+        }
+        if self.top_section.is_some() && matches!(action, Some(Action::Compose | Action::MarkRead | Action::MarkUnread | Action::React | Action::Archive)) {
+            self.status = "Open a section and select a message first".into(); return;
+        }
+        match action {
+            Some(Action::Open) => {
+                if let Some(&idx) = self.filtered.get(self.conv_cursor) {
+                    if self.open.as_ref().map(|o| o.conv) == Some(idx) {
+                        self.focus = Focus::Msgs;
+                    } else {
+                        self.open_conv(idx);
+                    }
+                }
+            }
+            Some(Action::OtherPane) => {
+                if self.active_list().is_some() {
+                    self.focus = Focus::Msgs;
+                }
+            }
+            Some(Action::Command) => self.open_command(),
+            Some(Action::Close) => self.escape_home(),
+            Some(Action::Archive) => self.prompt_archive(),
+            Some(Action::MyThreads) => self.open_my_threads(),
+            Some(Action::Compose) => self.compose(),
+            // `>` quotes the message under the cursor, and this pane has none.
+            Some(Action::QuoteReply) => self.status = "select a message first".to_string(),
+            Some(Action::RawJson) => self.open_conv_raw(),
+            Some(Action::React) => self.view_reactions(),
+            Some(Action::MarkRead) => self.mark_read(),
+            Some(Action::MarkUnread) => self.mark_unread(),
+            Some(Action::Sort) => {
+                self.sort = self.sort.next();
+                self.apply_filter();
+                // A new order is a new list: read it from the top rather than
+                // chasing where the highlighted conversation landed.
+                self.conv_cursor = 0;
+                self.conv_offset = 0;
+                self.status = format!("sorted by {}", self.sort_label());
+                if self.sort == Sort::Mine && self.corpus.me.is_none() {
+                    self.status =
+                        "own user id unknown (no DM archive): set SLACK_SELF_USER_ID".to_string();
+                }
+            }
+            Some(Action::Refresh) => self.refresh_conversations(),
+            Some(Action::ConversationsPane) => self.open_conversations_pane(),
+            Some(Action::Keys) => self.open_keys(),
+            _ => {}
+        }
+    }
+
+    fn on_msg_key(&mut self, action: Option<Action>) {
+        if self.active_list().is_none() {
+            self.focus = Focus::Convs;
+            return;
+        }
+        let height = self.msgs_height.max(2) as isize;
+        let line_height = self.msgs_height.max(1) as isize;
+        if let Some(list) = self.active_list_mut().filter(|l| l.line_scroll) {
+            let height = line_height;
+            let first = list.first.get(list.cursor).copied().unwrap_or(0);
+            let last = list.last.get(list.cursor).copied().unwrap_or(first);
+            let max = (last + 1).saturating_sub(height as usize).max(first);
+            let delta = match action {
+                Some(Action::Down) => Some(1),
+                Some(Action::Up) => Some(-1),
+                Some(Action::HalfPageDown) => Some(height / 2),
+                Some(Action::HalfPageUp) => Some(-height / 2),
+                Some(Action::PageDown) => Some(height - 1),
+                Some(Action::PageUp) => Some(1 - height),
+                Some(Action::First) => Some(-(list.scroll as isize)),
+                Some(Action::Last) => Some(max as isize),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                list.scroll = list.scroll.saturating_add_signed(delta).clamp(first, max);
+                return;
+            }
+        }
+        let timeline = self.in_timeline();
+        if matches!(action, Some(Action::Down | Action::PageDown | Action::HalfPageDown | Action::Last))
+            && matches!(self.stack.last(), Some(View::Feed { list, next_cursor: Some(_), .. }) if list.cursor + 1 >= list.len()) {
+            self.fetch_sent(true); return;
+        }
+        match action {
+            Some(Action::Down) => {
+                let at_end = self
+                    .active_list()
+                    .map(|l| l.cursor + 1 >= l.len())
+                    .unwrap_or(true);
+                if at_end && timeline {
+                    self.load_newer();
+                } else if let Some(l) = self.active_list_mut() {
+                    l.move_cursor(1);
+                }
+            }
+            Some(Action::Up) => {
+                let at_start = self.active_list().map(|l| l.cursor == 0).unwrap_or(true);
+                if at_start && timeline {
+                    self.load_older();
+                } else if let Some(l) = self.active_list_mut() {
+                    l.move_cursor(-1);
+                }
+            }
+            Some(Action::First) => {
+                let has_older = self.open.as_ref().is_some_and(|o| o.has_older);
+                if timeline && has_older {
+                    let first = self.open_conv_ref().map(|c| c.first_id).unwrap_or(0);
+                    self.jump_to(first);
+                    if let Some(l) = self.active_list_mut() {
+                        l.cursor = 0;
+                    }
+                } else if let Some(l) = self.active_list_mut() {
+                    l.cursor = 0;
+                }
+            }
+            Some(Action::Last) => {
+                let has_newer = self.open.as_ref().is_some_and(|o| o.has_newer);
+                if timeline && has_newer {
+                    self.reload();
+                } else if let Some(l) = self.active_list_mut() {
+                    l.cursor = l.len().saturating_sub(1);
+                }
+            }
+            Some(Action::HalfPageDown) => {
+                if let Some(l) = self.active_list_mut() {
+                    l.move_lines(height / 2);
+                }
+            }
+            Some(Action::HalfPageUp) => {
+                if let Some(l) = self.active_list_mut() {
+                    l.move_lines(-(height / 2));
+                }
+            }
+            Some(Action::PageDown) => {
+                if let Some(l) = self.active_list_mut() {
+                    l.move_lines(height - 1);
+                }
+            }
+            Some(Action::PageUp) => {
+                if let Some(l) = self.active_list_mut() {
+                    l.move_lines(-(height - 1));
+                }
+            }
+            Some(Action::Open) => {
+                if matches!(self.stack.last(), Some(View::Unreads { .. })) {
+                    self.open_unread_card();
+                } else if matches!(self.stack.last(), Some(View::Feed { .. }))
+                    && self.selected().is_some_and(|message| message.parent_id.is_none() && !message.has_thread()) {
+                    self.open_sent_context();
+                } else if matches!(self.stack.last(), Some(View::Thread { .. })) {
+                    self.open_raw();
+                } else if let Some(m) = self.selected() {
+                    let (cid, root, id) = (m.channel_id.clone(), m.thread_root(), m.id);
+                    self.open_hit(cid, root, id);
+                }
+            }
+            Some(Action::RawJson) => self.open_raw(),
+            Some(Action::ShowInChannel) => {
+                let sel = self.selected().map(|m| {
+                    (
+                        m.channel_id.clone(),
+                        m.thread_root(),
+                        m.channel_name.clone(),
+                    )
+                });
+                if let (false, Some((cid, root, name))) = (timeline, sel) {
+                    match self.corpus.conv_by_channel(&cid) {
+                        Some(idx) => {
+                            self.stack.clear();
+                            if self.open.as_ref().map(|o| o.conv) != Some(idx) {
+                                self.open_conv(idx);
+                            }
+                            self.jump_to(root);
+                        }
+                        None => {
+                            self.status =
+                                format!("#{} is not archived; a archives it", name.unwrap_or(cid));
+                        }
+                    }
+                }
+            }
+            Some(Action::Command) => self.open_command(),
+            Some(Action::GoToDate) => {
+                self.mode = Mode::Prompt {
+                    kind: PromptKind::Date,
+                    buf: Editor::default(),
+                    previous: String::new(),
+                };
+            }
+            Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Unreads { .. })) => self.open_unreads(),
+            // Both halves again: the archive rebuilds every card it can, and
+            // Slack is asked afresh for the threads it does not hold.
+            Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Threads { .. })) => self.open_my_threads(),
+            Some(Action::Reload | Action::Refresh) if matches!(self.stack.last(), Some(View::Feed { .. })) => self.fetch_sent(false),
+            Some(Action::Reload) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
+            Some(Action::Refresh) if matches!(self.stack.last(), Some(View::Saved { .. })) => self.refresh_saved(None),
+            Some(Action::Reload) => self.reload(),
+            Some(Action::Refresh) => self.refresh(),
+            Some(Action::Archive) => self.prompt_archive(),
+            Some(Action::MyThreads) => self.open_my_threads(),
+            Some(Action::Compose) => self.compose(),
+            Some(Action::QuoteReply) => self.quote_reply(),
+            Some(Action::React) => self.view_reactions(),
+            Some(Action::Delete) => self.delete_selected(),
+            Some(Action::Images) => self.open_images(),
+            Some(Action::MarkRead) => self.mark_read(),
+            Some(Action::MarkUnread) => self.mark_unread(),
+            Some(Action::InlineImages) => {
+                self.inline_images = !self.inline_images && self.picker.is_some();
+                self.mark_all_dirty();
+                self.status = if self.inline_images {
+                    "inline images on"
+                } else {
+                    "inline images off"
+                }
+                .to_string();
+            }
+            Some(Action::Close) => self.escape_home(),
+            Some(Action::Back) => {
+                if let Some(list) = self.active_list_mut().filter(|list| list.line_scroll) {
+                    list.line_scroll = false;
+                    self.status.clear();
+                    return;
+                }
+                if self.stack.is_empty() {
+                    if let Some((open, stack, cursor)) = self.sent_return.take() {
+                        self.invalidate_thread_jobs();
+                        self.open = open; self.stack = stack; self.conv_cursor = cursor;
+                        self.top_section = self.stack.last().and_then(|view| match view { View::Feed { section, .. } => Some(*section), _ => None }); self.status.clear();
+                        return;
+                    }
+                }
+                // Unwind one stacked view; from the bare timeline, straight home.
+                if matches!(self.stack.last(), Some(View::Thread { .. } | View::Search { .. })) { self.invalidate_thread_jobs(); }
+                if self.stack.pop().is_none() || (self.open.is_none() && self.stack.is_empty()) {
+                    self.go_home();
+                }
+            }
+            Some(Action::OtherPane) => self.focus = Focus::Convs,
+            Some(Action::ConversationsPane) => self.open_conversations_pane(),
+            Some(Action::Keys) => self.open_keys(),
+            _ => {}
+        }
+    }
+
+    fn on_prompt_key(&mut self, k: KeyEvent) {
+        let Mode::Prompt {
+            kind,
+            buf,
+            previous,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let kind = *kind;
+        match k.code {
+            KeyCode::Esc => {
+                let typed = buf.text.clone();
+                let prefill = previous.clone();
+                if kind == PromptKind::Command && self.focus == Focus::Convs {
+                    self.filter = previous.clone();
+                    self.mode = Mode::Normal;
+                    self.apply_filter();
+                } else {
+                    self.mode = Mode::Normal;
+                }
+                if kind == PromptKind::Compose {
+                    // A quote `>` prefilled and nobody wrote into is not a
+                    // draft. Keeping it would stash a quotation with no answer
+                    // under it, and the draft slot is single, so it would also
+                    // evict the draft another conversation is holding. Only a
+                    // quote-reply has a prefill; `c` opens with none, so an
+                    // emptied `c` prompt still drops its own draft as before.
+                    let untouched_quote = !prefill.is_empty() && typed == prefill;
+                    if !untouched_quote {
+                        self.keep_draft(typed);
+                    }
+                    if let Some(name) = self.drop_attachment() {
+                        self.status = format!("{name} not sent");
+                    }
+                }
+            }
+            // Alt-Enter, and Shift-Enter where the terminal reports it, break
+            // the line instead of sending; Ctrl-j does the same from the editor.
+            KeyCode::Enter
+                if kind == PromptKind::Compose
+                    && k.modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                buf.newline();
+            }
+            KeyCode::Enter => {
+                let text = buf.text.clone();
+                let before = previous.clone();
+                self.mode = Mode::Normal;
+                match kind {
+                    PromptKind::Command => self.run_command(&text, &before),
+                    PromptKind::Date => self.goto_date(&text),
+                    PromptKind::Archive => self.archive_new(&text),
+                    PromptKind::Compose => self.send_message(text),
+                    PromptKind::PaletteColor => self.set_palette_color(&text),
+                }
+            }
+            KeyCode::Tab if kind == PromptKind::Command => {
+                let line = buf.text.clone();
+                if let Some(done) = complete::apply_with_authors(&line, &self.conv_names(), &self.corpus.author_names()) {
+                    if let Mode::Prompt { buf, .. } = &mut self.mode {
+                        *buf = Editor::with(done.clone());
+                    }
+                    self.filter_live(&done);
+                }
+            }
+            KeyCode::Char('v') if kind == PromptKind::Compose && ctrl(k) => {
+                self.attach_clipboard();
+            }
+            _ => {
+                if buf.key(k, kind == PromptKind::Compose) {
+                    let live = buf.text.clone();
+                    if kind == PromptKind::Command {
+                        self.filter_live(&live);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What a `/` line asks for.
+#[derive(Debug, PartialEq)]
+enum Command {
+    /// `find TEXT` and `search TEXT`: filter the list, or search the open conversation.
+    Find(String),
+    /// `leave [#name]`.
+    Leave(String),
+    /// `cache start|stop|wipe [#name]`, and `cache highlight [on|off]`.
+    Cache(String, String),
+    /// `mute [#name]` (true) and `unmute [#name]` (false).
+    Mute(bool, String),
+    Star(bool, String),
+    Save(bool),
+    /// `colorpalette [name]`: edit and persist the semantic UI colors,
+    /// starting from a named palette when one is given.
+    ColorPalette(String),
+    ConversationsPane,
+    /// `keys`: rebind what the lists' keys do.
+    Keys,
+    /// `version`: show the version in the corner, or hide it again.
+    Version,
+    /// `labels`: tag every element on screen with the code that draws it.
+    Labels,
+    /// `upload [path]`: attach a file, the clipboard's image without a path.
+    Upload(String),
+}
+
+/// `find x`, `search x`, `leave`, `leave #name`; a leading slash is ignored.
+fn parse_command(line: &str) -> Option<Command> {
+    let line = line.trim().trim_start_matches('/').trim_start();
+    let (word, rest) = match line.split_once(char::is_whitespace) {
+        Some((w, r)) => (w, r.trim()),
+        None => (line, ""),
+    };
+    match word.to_lowercase().as_str() {
+        "find" | "search" | "f" | "s" => Some(Command::Find(rest.to_string())),
+        "leave" => Some(Command::Leave(rest.to_string())),
+        "save" if rest.is_empty() => Some(Command::Save(true)),
+        "unsave" if rest.is_empty() => Some(Command::Save(false)),
+        "star" | "pin" => Some(Command::Star(true, rest.to_string())),
+        "unstar" | "unpin" => Some(Command::Star(false, rest.to_string())),
+        "mute" => Some(Command::Mute(true, rest.to_string())),
+        "unmute" => Some(Command::Mute(false, rest.to_string())),
+        "colorpalette" | "palette" | "colors" => Some(Command::ColorPalette(rest.to_string())),
+        "conversations-pane" | "conversation-pane" if rest.is_empty() => {
+            Some(Command::ConversationsPane)
+        }
+        "keys" | "keybindings" if rest.is_empty() => Some(Command::Keys),
+        "version" if rest.is_empty() => Some(Command::Version),
+        "labels" if rest.is_empty() => Some(Command::Labels),
+        "upload" | "attach" => Some(Command::Upload(rest.to_string())),
+        "cache" => {
+            let (op, name) = match rest.split_once(char::is_whitespace) {
+                Some((o, n)) => (o, n.trim()),
+                None => (rest, ""),
+            };
+            matches!(op, "start" | "stop" | "wipe" | "highlight")
+                .then(|| Command::Cache(op.to_string(), name.to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn ctrl(k: KeyEvent) -> bool {
+    k.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// The prompt has room for a reason, not for a helper's whole complaint.
+fn clip_note(error: &str) -> String {
+    let one_line = error.replace('\n', " ");
+    match one_line.char_indices().nth(60) {
+        Some((at, _)) => format!("{}…", &one_line[..at]),
+        None => one_line,
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string()
+}
+
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        0..=1023 => format!("{bytes} B"),
+        1024..=1_048_575 => format!("{:.0} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
+}
+
+fn reaction_details(message: &Msg, context: &Ctx) -> Vec<String> {
+    let mut lines = vec!["Read-only · loaded message · j/k scroll · h back · Esc home".into()];
+    let reactions = message.data.get("reactions").and_then(Value::as_array);
+    for reaction in reactions.into_iter().flatten() {
+        let name = reaction["name"].as_str().unwrap_or("?");
+        let count = reaction["count"].as_u64();
+        let mut seen = HashSet::new();
+        let users: Vec<&str> = reaction["users"].as_array().into_iter().flatten()
+            .filter_map(Value::as_str).filter(|user| seen.insert(*user)).collect();
+        lines.push(String::new());
+        lines.push(format!(":{name}: {}", count.map(|n| n.to_string()).unwrap_or_else(|| "count unknown".into())));
+        for user in &users {
+            let name = context.user(user);
+            let label = if name == *user { name } else { format!("@{name}") };
+            lines.push(format!("  {label}"));
+        }
+        match count {
+            Some(count) if count > users.len() as u64 => {
+                lines.push(format!("  Partial: {} missing users from this payload", count - users.len() as u64));
+            }
+            None => lines.push("  Partial: total user count unavailable".into()),
+            _ => {}
+        }
+    }
+    if lines.len() == 1 { lines.push("No reactions in this payload".into()); }
+    lines
+}
+
+/// `@handle` becomes a real mention when `user_id` knows the handle;
+/// anything else, `@channel` and `@here` included, stays literal text.
+fn link_mentions(text: &str, user_id: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, word) in text.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let is_tail = |ch: char| ch.is_ascii_punctuation() && !matches!(ch, '.' | '-' | '_' | '@');
+        let (core, tail) = match word.find(is_tail) {
+            Some(p) => word.split_at(p),
+            None => (word, ""),
+        };
+        let handle = core.strip_prefix('@').map(|h| h.trim_end_matches('.'));
+        match handle.and_then(&user_id) {
+            Some(id) => {
+                out.push_str(&format!("<@{id}>"));
+                if core.ends_with('.') {
+                    out.push('.');
+                }
+                out.push_str(tail);
+            }
+            None => out.push_str(word),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::archive::{Archive, Corpus, Msg};
+    use crate::render::{line_text, Ctx, Tz};
+    use serde_json::json;
+
+    fn msg(secs: i64, text: &str) -> Msg {
+        Msg::from_api(
+            "C1".to_string(),
+            json!({ "ts": format!("{secs}.000000"), "user": "U1", "text": text }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cached_today_labels_refresh_at_midnight_in_headers_and_dividers() {
+        let reference = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc,2026,9,8,12,0,0).unwrap().timestamp();
+        let corpus = Corpus::stub(&[]);
+        let palette = Palette::default();
+        let mut context = Ctx {archive:None,corpus:&corpus,tz:Tz::Utc,
+            image_font:None,last_read:Some(reference*1_000_000-1),palette:&palette};
+        for thread in [false,true] {
+            let mut list = MsgList::new(vec![msg(reference,"first"),msg(reference+86400,"second")],thread);
+            list.set_unread_count(Some(2));
+            let today = context.tz.day(reference);
+            list.rebuild_on_day(&context,120,today);
+            assert!(list.flat[list.first[0]+1].line.to_string().starts_with("Today 12:00 UTC"));
+            assert!(list.flat.iter().any(|row| row.msg.is_none() && row.line.to_string().contains("Today · new (2)")));
+            assert!(list.flat[list.first[1]+1].line.to_string().starts_with("Wed 2026-09-09"));
+            assert!(!list.dirty);
+            list.rebuild_on_day(&context,120,today+1);
+            assert!(list.flat[list.first[0]+1].line.to_string().starts_with("Tue 2026-09-08"));
+            assert!(list.flat[list.first[1]+1].line.to_string().starts_with("Today 12:00 UTC"));
+            assert!(list.flat.iter().any(|row| row.msg.is_none() && row.line.to_string().contains("Tue 2026-09-08 · new (2)")));
+            // A timezone change also invalidates an otherwise unchanged list.
+            context.tz = Tz::Local;
+            list.rebuild_on_day(&context,120,context.tz.day(reference+86400));
+            assert!(list.flat[list.first[1]+1].line.to_string().starts_with(&format!("Today {}",context.tz.fmt(reference+86400,"%H:%M %:z"))));
+            context.tz = Tz::Utc;
+        }
+    }
+
+    #[test]
+    fn file_message_opens_timeline_then_thread_and_back_returns_to_root() {
+        let mut app = mute_test_app();
+        let location = |thread| crate::file_message::Location {
+            channel: "C1".into(), root: 1000000, focus: if thread {2000000} else {1000000},
+            timeline: vec![msg(1,"root")], replies: vec![msg(1,"root"),msg(2,"file reply")],
+            has_older: false, has_newer: true,
+        };
+        app.bg = Some(live::api_tail(Arc::new(Client::for_test(|_,_| Ok(json!({"messages":[]})))), 0, "C1".into(), 0, true));
+        app.open_file_message(location(false));
+        assert!(app.bg.is_none());
+        assert_eq!(app.open.as_ref().unwrap().list.selected().unwrap().id,1000000);
+        assert!(app.stack.is_empty());
+        app.open_file_message(location(true));
+        assert_eq!(app.active_list().unwrap().selected().unwrap().id,2000000);
+        app.on_key(KeyEvent::new(KeyCode::Char('h'),KeyModifiers::NONE));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.open.as_ref().unwrap().list.selected().unwrap().id,1000000);
+    }
+
+    #[test]
+    fn escape_rolls_back_settings_and_disables_late_job_navigation() {
+        let mut app = mute_test_app();
+        let old_keys = app.keymap.text(Action::Down);
+        app.open_keys();
+        app.keymap.bind(Action::Down,crate::keys::Chord::parse("z").unwrap(),false);
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!(app.keymap.text(Action::Down),old_keys);
+        let original = app.palette.get(crate::palette::Role::Accent);
+        app.open_color_palette("");
+        app.palette.set(crate::palette::Role::Accent,ratatui::style::Color::Red);
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!(app.palette.get(crate::palette::Role::Accent),original);
+        app.corpus.archives.push(Archive::stub(&[],&[]));
+        app.corpus.convs[0].archive = 0;
+        let (job,sender) = live::pending_job(JobKind::Refresh {conv:0,before:0});
+        app.job = Some(job);
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert!(!app.job.as_ref().unwrap().navigate_on_completion);
+        sender.send(Ok(Done::Refreshed)).unwrap();
+        app.tick();
+        assert!(app.open.is_none() && app.focus == Focus::Convs);
+        app.stack.push(View::Image {files:vec![],index:0,shown:None,zoom:100});
+        app.on_key(KeyEvent::new(KeyCode::Char('h'),KeyModifiers::NONE));
+        assert!(app.stack.is_empty());
+    }
+
+    #[test]
+    fn escape_returns_home_then_resets_conversation_cursor_and_scroll() {
+        let mut app = mute_test_app();
+        app.conv_cursor = 1;
+        let index = app.filtered[1];
+        app.open_conv(index);
+        app.stack.push(View::Thread {root:1000000,list:MsgList::new(vec![msg(1,"thread")],true),live:None,place:None});
+        app.stack.push(View::Raw {title:"nested".into(),browser:crate::raw::Browser::new(&json!({})),entry_focus:Focus::Msgs});
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert!(app.stack.is_empty() && app.open.is_none() && app.focus == Focus::Convs);
+        assert_eq!(app.conv_cursor,1);
+        app.conv_offset = 1;
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!((app.conv_cursor,app.conv_offset),(0,0));
+        app.help = true;
+        app.open_conversations_pane();
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert!(app.pane_menu.is_none() && !app.help);
+        app.mode = Mode::Prompt {kind:PromptKind::Command,buf:Editor::with("filter".into()),previous:String::new()};
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert!(matches!(app.mode,Mode::Normal));
+        app.compose = Some(Compose {conv:0,cid:"C1".into(),thread:None,label:"test".into()});
+        app.mode = Mode::Prompt {kind:PromptKind::Compose,buf:Editor::with("unsent text".into()),previous:String::new()};
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!(app.draft.as_ref().unwrap().text,"unsent text");
+        assert!(app.open.is_none());
+    }
+
+    #[test]
+    fn word_menu_quit_keys_reach_the_application() {
+        let mut app = mute_test_app();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.open_color_palette("");
+        app.on_key(key(KeyCode::Char('W')));
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.quit);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+        app.quit = false;
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn word_highlights_render_in_selected_conversation_messages_and_title() {
+        let mut app = mute_test_app();
+        let index = app.corpus.convs.iter().position(|conv| conv.id == "C1").unwrap();
+        app.corpus.convs[index].name = "#NGINX-chat".into();
+        app.open_conv(index);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1, "nginx and *NGINX* with nginx-fork")], false);
+        app.conv_cursor = app.filtered.iter().position(|i| *i == index).unwrap();
+        app.focus = Focus::Convs;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut hits = 0;
+        for y in 0..20 {
+            for x in 0..116 {
+                let text: String = (x..x + 5).map(|column| buffer[(column,y)].symbol()).collect();
+                if text.eq_ignore_ascii_case("nginx") {
+                    hits += 1;
+                    for column in x..x + 5 { assert_eq!(buffer[(column,y)].fg, ratatui::style::Color::Green, "{x},{y}"); }
+                }
+            }
+        }
+        assert!(hits >= 5, "conversation name, title, and three body matches: {hits}; {}", buffer.content.iter().map(|cell| cell.symbol()).collect::<String>());
+    }
+
+    #[test]
+    fn palette_word_menu_is_nested_and_cancel_restores_rules() {
+        let mut app = mute_test_app();
+        let original = app.palette.clone();
+        app.open_color_palette("");
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_palette_key(key(KeyCode::Char('G')), false);
+        app.on_palette_key(key(KeyCode::Enter), false);
+        assert!(matches!(app.stack.last(), Some(View::ColorPalette { highlights: Some(_), .. })));
+        app.on_palette_key(key(KeyCode::Char('d')), false);
+        assert!(app.palette.highlights.is_empty());
+        app.on_palette_key(key(KeyCode::Esc), false);
+        assert!(matches!(app.stack.last(), Some(View::ColorPalette { highlights: None, .. })));
+        app.on_palette_key(key(KeyCode::Esc), false);
+        assert_eq!(app.palette, original);
+        app.palette.highlights.clear();
+        app.open_color_palette("vintage");
+        assert!(app.palette.highlights.is_empty());
+    }
+
+    #[test]
+    fn long_message_reads_by_line_before_raw_and_keeps_position() {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![json!({"id":"C1","name":"long","is_member":true})]);
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        let body = (0..100).map(|n| format!("line {n}\n")).collect::<String>();
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1, &body), msg(2, "next")], false);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let draw =
+            |app: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+                terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+            };
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        draw(&mut app, &mut terminal);
+        app.on_key(key(KeyCode::Char('l')));
+        draw(&mut app, &mut terminal);
+        assert!(app.stack.is_empty());
+        let first = app.active_list().unwrap().first[0];
+        for n in 1..=12 {
+            app.on_key(key(KeyCode::Down));
+            draw(&mut app, &mut terminal);
+            assert_eq!(app.active_list().unwrap().scroll, first + n);
+            assert_eq!(app.active_list().unwrap().cursor, 0);
+        }
+        app.mark_all_dirty();
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, first + 12);
+        app.on_key(key(KeyCode::Char('k')));
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, first + 11);
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+        app.on_key(key(KeyCode::Char('h')));
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, first + 11);
+        app.on_key(key(KeyCode::End));
+        draw(&mut app, &mut terminal);
+        let end = app.active_list().unwrap().last[0] + 1 - app.msgs_height;
+        assert_eq!(app.active_list().unwrap().scroll, end);
+        app.on_key(key(KeyCode::Down));
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, end);
+        app.on_key(key(KeyCode::Home));
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.active_list().unwrap().scroll, first);
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.open.is_some());
+        assert!(!app.active_list().unwrap().line_scroll);
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.open.is_none());
+    }
+
+    #[test]
+    fn opening_requests_counts_without_polling_and_waits_for_busy_lookup() {
+        let mut app = mute_test_app();
+        app.pane_settings.number = crate::conversations_pane::NumberColumn::Hidden;
+        let client = Arc::new(Client::for_test(|method, _| {
+            assert_eq!(method, "client.counts");
+            Ok(json!({"channels":[]}))
+        }));
+        assert_eq!(app.poll_every, Duration::ZERO);
+        // An earlier enrichment is still occupying its separate slot.
+        app.unread_count_job = Some(live::api_unread_counts(client.clone(), 0, json!({}), vec![]));
+        app.open_conv(0);
+        app.api = Some(client);
+        assert_eq!(app.unread_count_targets(), vec!["C1"]);
+        assert!(app.counts_pending);
+        app.pump_requested_counts();
+        assert!(app.counts_pending);
+        assert!(app.bg.is_none());
+        app.unread_count_job = None;
+        app.pump_requested_counts();
+        assert!(!app.counts_pending);
+        assert!(matches!(app.bg.as_ref().map(|job| &job.kind), Some(JobKind::Counts { .. })));
+    }
+
+    #[test]
+    fn unread_counts_preserve_snapshot_identity_and_clear_after_read() {
+        let mut app = mute_test_app();
+        let snapshot = json!({"channels":[{"id":"C1","has_unreads":true,"last_read":"1.000000","latest":"5.000000","unread_count":4}]});
+        app.corpus.convs[0].last_id = 100_000_000;
+        app.apply_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, None);
+        app.apply_unread_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, Some(4));
+        app.apply_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, Some(4));
+        let mut invalidated = snapshot.clone();
+        invalidated["channels"][0]["history_invalid"] = json!("changed");
+        app.apply_counts(&invalidated);
+        app.apply_unread_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, None);
+        let mut newer = snapshot.clone();
+        newer["channels"][0]["latest"] = json!("6.000000");
+        app.apply_counts(&newer);
+        assert_eq!(app.corpus.convs[0].unread_count, None);
+        app.apply_unread_counts(&snapshot);
+        assert_eq!(app.corpus.convs[0].unread_count, None);
+        newer["channels"][0]["has_unreads"] = json!(false);
+        newer["channels"][0]["last_read"] = json!("6.000000");
+        app.apply_counts(&newer);
+        app.apply_unread_counts(&snapshot);
+        assert!(!app.corpus.convs[0].unread);
+        assert_eq!(crate::conversations_pane::NumberColumn::Unread.value(&app.corpus.convs[0], false), None);
+    }
+
+    #[test]
+    fn sidebar_refresh_reports_signin_and_applies_counts_without_navigation() {
+        let mut app = mute_test_app();
+        app.focus = Focus::Convs;
+        app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert!(app.status.contains("sign-in"));
+        let cid = app.corpus.convs[0].id.clone();
+        let snapshot = json!({"channels":[{"id":cid,"has_unreads":true,"last_read":"1.000000","latest":"3.000000","unread_count":2}]});
+        app.apply_conversation_snapshot(app.counts_gen, vec![], snapshot.clone());
+        assert!(app.corpus.convs[0].unread);
+        assert_eq!(app.corpus.convs[0].unread_count, Some(2));
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(app.status.contains("refreshed"));
+        app.counts_gen += 1;
+        app.corpus.convs[0].unread = false;
+        app.apply_conversation_snapshot(app.counts_gen - 1, vec![], snapshot);
+        assert!(!app.corpus.convs[0].unread);
+        assert!(app.counts_pending);
+        app.corpus.convs[0].left = true;
+        app.apply_conversation_snapshot(app.counts_gen, vec![json!({"id":cid,"name":"renamed"})],
+            json!({"channels":[{"id":cid,"has_unreads":true,"last_read":"1.000000","latest":"3.000000"}]}));
+        assert!(!app.corpus.convs[0].left);
+        assert!(app.status.contains("1 unread counts unavailable"));
+    }
+
+    #[test]
+    fn conversation_number_modes_and_menu() {
+        use crate::conversations_pane::{Menu, NumberColumn as N, Settings};
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![json!({"id":"C1","name":"one","is_member":true})]);
+        let c = &mut app.corpus.convs[0];
+        c.msgs = 123;
+        c.mine = 12;
+        c.score = 3.6;
+        c.mentions = 2;
+        assert_eq!(N::Messages.value(c, true), None);
+        assert_eq!(N::Mentions.value(c, false), Some(2));
+        assert_eq!(N::Sort.value(c, true), Some(4));
+        assert_eq!(N::Sort.value(c, false), Some(123));
+        c.live_only = false;
+        for sort in [true, false] {
+            assert_eq!(N::Messages.value(c, sort), Some(123));
+            assert_eq!(N::Mine.value(c, sort), Some(12));
+            assert_eq!(N::Activity.value(c, sort), Some(4));
+            assert_eq!(N::Hidden.value(c, sort), None);
+        }
+        let mut menu = Menu::new(Settings::default(), &app.corpus.convs);
+        menu.cursor = 8;
+        menu.toggle();
+        assert_eq!(menu.settings.number, N::Messages);
+        assert!(menu.rows()[8].contains("Cached messages"));
+        menu.cursor = 9;
+        menu.toggle();
+        assert_eq!(menu.settings.overrides.get("C1"), Some(&true));
+        menu.cursor = 1;
+        menu.toggle();
+        assert_eq!(menu.settings, Settings::default());
+        app.run_command("conversation-pane", "");
+        app.pane_menu.as_mut().unwrap().cursor = 8;
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.pane_settings.number, N::Sort);
+        app.run_command("conversation-pane", "");
+        app.pane_menu.as_mut().unwrap().cursor = 8;
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.pane_settings.number, N::Messages);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        // Row 0 is the border, 1..=5 the top sections, 6 their divider, 7 the
+        // first conversation, and 8 the age divider closing its group from
+        // below — it has no newest message, so `earlier`.
+        assert!(
+            (1..29)
+                .map(|x| terminal.backend().buffer()[(x, 8)].symbol())
+                .collect::<String>()
+                .contains(" earlier ")
+        );
+        let row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            (1..29)
+                .map(|x| terminal.backend().buffer()[(x, 7)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(&terminal).ends_with("123"));
+        app.pane_settings.number = N::Unread;
+        app.corpus.convs[0].unread = true;
+        for (count, expected) in [(Some(1), "1"), (Some(9), "9"), (Some(10), "9+"), (Some(500), "9+"), (None, "—")] {
+            app.corpus.convs[0].unread_count = count;
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            assert!(row(&terminal).ends_with(expected));
+        }
+        app.corpus.convs[0].unread = false;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(row(&terminal).trim_end().ends_with("#one"));
+        app.pane_settings.number = N::Hidden;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(!row(&terminal).contains("123"));
+        app.pane_settings.number = N::Messages;
+        app.corpus.convs[0].live_only = true;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(row(&terminal).ends_with('—'));
+    }
+
+    #[test]
+    fn image_zoom_keys_accept_shifted_and_base_characters() {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.stack.push(View::Image {
+            files: vec![],
+            index: 0,
+            zoom: 100,
+            shown: None,
+        });
+        let zoom = |app: &App| match app.stack.last().unwrap() {
+            View::Image { zoom, .. } => *zoom,
+            _ => panic!(),
+        };
+        for c in ['=', '+'] {
+            app.on_key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ));
+        }
+        assert_eq!(zoom(&app), 150);
+        for c in ['-', '_'] {
+            app.on_key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ));
+        }
+        assert_eq!(zoom(&app), 100);
+        for _ in 0..40 {
+            app.on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        }
+        assert_eq!(zoom(&app), 800);
+        for _ in 0..40 {
+            app.on_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        }
+        assert_eq!(zoom(&app), 25);
+        app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert_eq!(zoom(&app), 100);
+    }
+
+    #[test]
+    fn conversations_pane_navigation_and_focused_search() {
+        let mut app = App::new(
+            Corpus::stub(&[]), Tz::Utc, 30.0, false, false,
+            PathBuf::new(), PathBuf::new(), 60, None, None,
+        );
+        app.merge_conversations(vec![
+            json!({"id":"C1", "name":"alpha", "is_member":true}),
+            json!({"id":"C2", "name":"beta", "is_member":true}),
+        ]);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.open_conversations_pane();
+        assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 1);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 2);
+        for _ in 0..2 { app.on_key(key(KeyCode::Char('h'))); }
+        assert!(app.pane_menu.as_ref().unwrap().settings.hidden.contains("public"));
+        for _ in 0..2 { app.on_key(key(KeyCode::Char('l'))); }
+        assert!(!app.pane_menu.as_ref().unwrap().settings.hidden.contains("public"));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Backspace));
+        assert!(app.pane_menu.as_ref().unwrap().query.is_empty());
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 0);
+        for c in "jkh l".chars() { app.on_key(key(KeyCode::Char(c))); }
+        assert_eq!(app.pane_menu.as_ref().unwrap().query, "jkh l");
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.pane_menu.as_ref().unwrap().query, "jkh ");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "beta".chars() { app.on_key(key(KeyCode::Char(c))); }
+        assert_eq!(app.pane_menu.as_ref().unwrap().matching().len(), 1);
+        let mut terminal = ratatui::Terminal::new(
+            ratatui::backend::TestBackend::new(120, 30),
+        ).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let search = (1..20).map(|x| terminal.backend().buffer()[(x, 5)].symbol()).collect::<String>();
+        assert!(search.starts_with("Search: beta"));
+        assert_ne!(terminal.backend().buffer()[(1, 5)].bg, terminal.backend().buffer()[(1, 6)].bg);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 1);
+        app.on_key(key(KeyCode::End));
+        app.on_key(key(KeyCode::Char('h')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().settings.overrides.get("C2"), Some(&false));
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('l')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().settings.overrides.get("C2"), Some(&true));
+        app.pane_menu.as_mut().unwrap().cursor = 7;
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.pane_menu.as_ref().unwrap().settings.only_muted);
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(!app.pane_menu.as_ref().unwrap().settings.only_muted);
+        app.pane_menu.as_mut().unwrap().cursor = 8;
+        app.on_key(key(KeyCode::Char('h')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().settings.number, crate::conversations_pane::NumberColumn::Hidden);
+        app.on_key(key(KeyCode::Char('l')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().settings.number, crate::conversations_pane::NumberColumn::Sort);
+        for leave in [KeyCode::Down, KeyCode::Tab] {
+            app.on_key(key(KeyCode::Home));
+            app.on_key(key(leave));
+            assert_eq!(app.pane_menu.as_ref().unwrap().cursor, 1);
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.pane_menu.is_none());
+        assert_eq!(app.pane_settings.overrides.get("C2"), Some(&true));
+    }
+
+    #[test]
+    fn conversations_pane_save_cancel_reset_and_shortcut() {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![
+            json!({"id":"C1", "name":"public", "is_member":true}),
+            json!({"id":"C2", "name":"private", "is_private":true, "is_member":true}),
+        ]);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(app.pane_menu.is_some());
+        app.pane_menu.as_mut().unwrap().settings.toggle_category(0);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.filtered.len(), 2);
+        app.run_command("conversations-pane", "");
+        app.pane_menu.as_mut().unwrap().settings.toggle_category(0);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.filtered.len(), 1);
+        app.open_conversations_pane();
+        assert_eq!(app.pane_menu.as_ref().unwrap().entries.len(), 2);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.filtered.len(), 2);
+        app.open_conv(app.filtered[0]);
+        app.open_conversations_pane();
+        let id = app.corpus.convs[app.open.as_ref().unwrap().conv].id.clone();
+        app.pane_menu
+            .as_mut()
+            .unwrap()
+            .settings
+            .overrides
+            .insert(id, false);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.open.is_none());
+        assert!(app.stack.is_empty());
+        app.open_conversations_pane();
+        app.pane_menu.as_mut().unwrap().settings = Default::default();
+        for category in 0..6 {
+            app.pane_menu
+                .as_mut()
+                .unwrap()
+                .settings
+                .toggle_category(category);
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.filtered.is_empty());
+        app.run_command("conversations-pane", "");
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().matching().len(), 2);
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.pane_menu.as_ref().unwrap().matching().len(), 1);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.filtered.is_empty());
+        app.open_conversations_pane();
+        app.on_key(key(KeyCode::Char(' ')));
+        // A directory is not a settings file: preserve active choices and keep
+        // the pending menu open when saving fails.
+        app.pane_path = Some(std::env::temp_dir());
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.pane_menu.is_some());
+        assert!(app.filtered.is_empty());
+        assert!(app.status.contains("cannot save"));
+        app.pane_path = None;
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.filtered.len(), 2);
+    }
+
+    #[test]
+    fn live_only_conversation_renders_without_an_archive() {
+        let mut app = App::new(
+            Corpus::stub(&[("C1", "live-channel")]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![
+            json!({"id": "C1", "name": "live-channel", "is_member": true}),
+        ]);
+        assert_eq!(app.corpus.convs.len(), 1);
+        assert!(app.corpus.convs[0].live_only);
+        assert!(app.open_conv(0));
+        assert!(app.title().contains("live from Slack"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1, "hello <#C1>")], false);
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert!(crate::ui::dump(&mut app, 80).contains("live-channel"));
+        app.open.as_mut().unwrap().list =
+            MsgList::new(vec![msg(1, "hello <#C1> <!subteam^S1>")], false);
+        assert!(crate::ui::dump(&mut app, 80).contains("@S1"));
+        app.take_usergroups(vec![json!({"id":"S1", "name":"oncall"})]);
+        assert!(crate::ui::dump(&mut app, 80).contains("@oncall"));
+        assert_eq!(app.ctx_for(0).user("U1"), "U1");
+        app.run_search("hello");
+        assert!(app.status.contains("no message matching"));
+
+        app.merge_conversations(vec![json!({"id":"D1", "is_im":true, "user":"U1"})]);
+        app.take_profiles(vec![json!({"id":"U1", "name":"Ada", "is_bot":false})]);
+        assert_eq!(app.corpus.convs[1].name, "@Ada");
+        assert_eq!(app.ctx_for(0).author(&msg(1, "hello")), "Ada");
+        assert!(crate::ui::dump(&mut app, 80).contains("Ada"));
+        app.merge_conversations(vec![json!({"id":"D2", "is_im":true, "user":"U1"})]);
+        assert_eq!(app.corpus.convs[2].name, "@Ada");
+
+        // Index zero must not become the live conversation's archive when a
+        // different conversation has a local cache.
+        app.corpus
+            .archives
+            .push(Archive::stub(&[], &[("C1", "wrong-channel")]));
+        assert!(app.ctx_for(0).archive.is_none());
+        assert!(crate::ui::dump(&mut app, 80).contains("live-channel"));
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+    }
+
+    #[test]
+    fn reaction_details_resolve_deduplicate_and_report_partial_payloads() {
+        let mut corpus = Corpus::stub(&[]);
+        corpus.merge_profiles(vec![json!({"id":"U1", "name":"ada"})]);
+        let mut message = msg(1, "reactions");
+        message.data["reactions"] = json!([
+            {"name":"eyes", "count":5, "users":["U1", "U1", "UNKNOWN", "UNKNOWN"]},
+            {"name":"custom", "count":2},
+            {"name":"unknown-count", "users":["U1"]}
+        ]);
+        let before = message.data.clone();
+        let palette = Palette::default();
+        let context = Ctx { archive: None, corpus: &corpus, tz: Tz::Utc, image_font: None, last_read: None, palette: &palette };
+        let lines = reaction_details(&message, &context);
+        assert!(lines.contains(&":eyes: 5".into()));
+        assert_eq!(lines.iter().filter(|line| *line == "  UNKNOWN").count(), 1);
+        assert_eq!(lines.iter().filter(|line| *line == "  @ada").count(), 2);
+        assert!(lines.contains(&"  Partial: 3 missing users from this payload".into()));
+        assert!(lines.contains(&"  Partial: 2 missing users from this payload".into()));
+        assert!(lines.contains(&"  Partial: total user count unavailable".into()));
+        assert_eq!(message.data, before);
+        assert!(reaction_details(&msg(2, "empty"), &context).contains(&"No reactions in this payload".into()));
+    }
+
+    #[test]
+    fn reaction_details_target_selection_and_isolate_navigation_offline() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        app.corpus.merge_profiles(vec![json!({"id":"U1", "name":"ada"})]);
+        let mut root = msg(1, "root");
+        root.data["reactions"] = json!([{"name":"root", "count":1, "users":["U1"]}]);
+        let mut reply = msg(2, "reply");
+        reply.data["reactions"] = json!([{"name":"reply", "count":3, "users":["U1", "UNKNOWN"]}]);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![root.clone()], false);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for thread in [false, true] {
+            if thread {
+                let mut list = MsgList::new(vec![root.clone(), reply.clone()], true);
+                list.cursor = 1;
+                app.stack.push(View::Thread { root: root.id, list, live: None, place: None });
+            }
+            let depth = app.stack.len();
+            app.on_key(key(KeyCode::Char('e')));
+            let Some(View::Reactions { title, lines, .. }) = app.stack.last() else { panic!("details missing") };
+            assert!(title.contains(if thread { "1970-01-01 00:00:02" } else { "1970-01-01 00:00:01" }));
+            assert!(lines.contains(&if thread { ":reply: 3" } else { ":root: 1" }.into()));
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let text = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+            assert!(text.contains("ada"));
+            if thread { assert!(text.contains("UNKNOWN")); assert!(text.contains("Partial: 1 missing")); }
+            app.msgs_height = 1;
+            app.on_key(key(KeyCode::Char('j')));
+            assert!(matches!(app.stack.last(), Some(View::Reactions { scroll: 1, .. })));
+            app.on_key(key(KeyCode::Char('k')));
+            assert!(matches!(app.stack.last(), Some(View::Reactions { scroll: 0, .. })));
+            for character in ['D', 'c', 'e', 'm', 'M', 'R', 'a', 'T', '/', 'I'] {
+                app.on_key(key(KeyCode::Char(character)));
+                assert_eq!(app.stack.len(), depth + 1);
+                assert!(matches!(app.mode, Mode::Normal));
+                assert!(app.pending_delete.is_none());
+                assert!(app.job.is_none());
+                assert!(app.api.is_none());
+            }
+            app.on_key(key(KeyCode::Char('h')));
+            assert_eq!(app.stack.len(), depth);
+            assert_eq!(app.selected().unwrap().id, if thread { reply.id } else { root.id });
+        }
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!(app.open.as_ref().unwrap().list.msgs[0].data, root.data);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(app.open.is_none());
+    }
+
+    #[test]
+    fn reaction_details_use_the_selected_channel_and_archive_profiles() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        let open_channel = app.open_conv_ref().unwrap().id.clone();
+        app.merge_conversations(vec![json!({"id":"COTHER", "name":"other-channel", "is_member":true})]);
+        let index = app.corpus.conv_by_channel("COTHER").unwrap();
+        app.corpus.archives.push(Archive::stub(&[("UARCHIVE","archive.user")], &[]));
+        app.corpus.convs[index].archive = app.corpus.archives.len() - 1;
+        app.corpus.convs[index].live_only = false;
+        let mut hit = msg(1,"other channel hit");
+        hit.channel_id = "COTHER".into();
+        hit.data["reactions"] = json!([{"name":"eyes", "count":1, "users":["UARCHIVE"]}]);
+        app.stack.push(View::Search {query:"hit".into(),list:MsgList::new(vec![hit.clone()],false),
+            capped:false,live_hits:None,live_pending:false});
+        app.view_reactions();
+        assert!(app.title().starts_with("#other-channel · Reactions"));
+        assert_eq!(app.open_conv_ref().unwrap().id,open_channel);
+        let Some(View::Reactions {lines,..}) = app.stack.last() else {panic!()};
+        assert!(lines.contains(&"  @archive.user".into()));
+        app.stack.clear();
+        hit.data["reactions"] = json!([{"name":"thread", "count":1, "users":["UTHREAD"]}]);
+        app.stack.push(View::Thread {root:hit.id,list:MsgList::new(vec![hit],true),
+            live:Some(Box::new(Archive::stub(&[("UTHREAD","thread.user")], &[]))),place:None});
+        app.view_reactions();
+        let Some(View::Reactions {lines,..}) = app.stack.last() else {panic!()};
+        assert!(lines.contains(&"  @thread.user".into()));
+        app.on_key(KeyEvent::new(KeyCode::Char('?'),KeyModifiers::NONE));
+        assert!(app.help);
+        app.on_key(KeyEvent::new(KeyCode::Char('?'),KeyModifiers::NONE));
+        assert!(!app.help);
+        app.on_key(KeyEvent::new(KeyCode::Char('q'),KeyModifiers::NONE));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn empty_saved_thread_can_retry_and_releases_obsolete_read_slots() {
+        let mut app=mute_test_app(); app.open_saved();
+        app.job=Some(Job::completed_for_test(JobKind::Thread {cid:"COLD".into(),root:1,focus:1},Err("late failure".into())));
+        app.open_thread_in("CNEW".into(),2_000_000,2_000_000);
+        assert!(app.job.is_none());
+        let View::Thread {list,..}=app.stack.last().unwrap() else {panic!()};
+        assert_eq!(list.source_channel.as_deref(),Some("CNEW")); assert!(list.msgs.is_empty());
+        app.api=Some(Arc::new(Client::for_test(|method,params| {
+            assert_eq!(method,"conversations.replies");assert!(params.contains(&("channel","CNEW")));
+            Err("offline retry".into())
+        })));
+        app.refresh(); assert!(matches!(app.job.as_ref().map(|job|&job.kind),Some(JobKind::Thread {cid,..}) if cid=="CNEW"));
+        app.job=Some(Job::completed_for_test(JobKind::SetMuted,Err("write in progress".into())));
+        app.invalidate_thread_jobs(); assert!(matches!(app.job.as_ref().map(|job|&job.kind),Some(JobKind::SetMuted)));
+    }
+
+    #[test]
+    fn saved_thread_navigation_invalidates_old_foreground_and_background_reads() {
+        for background in [false,true] {
+            let mut app=mute_test_app();
+            app.open_saved();
+            let mut wrong=msg(10,"old channel response"); wrong.channel_id="COLD".into();
+            let old=Job::completed_for_test(JobKind::Thread {cid:"COLD".into(),root:wrong.id,focus:wrong.id},Ok(Done::ThreadMsgs(vec![wrong])));
+            if background {app.bg=Some(old)} else {app.job=Some(old)}
+            app.open_thread_in("CNEW".into(),10_000_000,10_000_000);
+            let mut correct=msg(10,"new channel cached root");correct.channel_id="CNEW".into();
+            if let Some(View::Thread {list,..})=app.stack.last_mut() { *list=MsgList::new(vec![correct],true); }
+            app.tick();assert_eq!(app.selected().unwrap().channel_id,"CNEW");
+            assert_eq!(app.selected().unwrap().text,"new channel cached root");
+            app.on_msg_key(Some(Action::Back)); assert!(matches!(app.stack.last(),Some(View::Saved {..})));
+            app.on_msg_key(Some(Action::Back)); assert!(app.focus == Focus::Convs);
+        }
+    }
+
+    #[test]
+    fn plain_half_page_keys_preserve_text_input_and_readers() {
+        let mut app=mute_test_app();app.msgs_height=12;
+        app.merge_conversations((0..30).map(|i|json!({"id":format!("CEXTRA{i}"),"name":format!("extra{i}"),"is_member":true})).collect());
+        app.top_section=Some(TopSection::Saved);
+        // A half page from the top row lands past the five top sections.
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,1);
+        app.on_key(KeyEvent::new(KeyCode::Char('b'),KeyModifiers::NONE));assert_eq!(app.top_section,Some(TopSection::Saved));
+        app.msgs_height=20;
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));assert_eq!(app.conv_cursor,5);
+        app.msgs_height=10;
+        app.stack.push(View::Reactions {title:"reactions".into(),lines:vec!["reaction".into();100],scroll:0});
+        for (key,expected) in [('f',5),('j',6),('k',5),('b',0)] {
+            app.on_key(KeyEvent::new(KeyCode::Char(key),KeyModifiers::NONE));
+            assert!(matches!(app.stack.last(),Some(View::Reactions {scroll,..}) if *scroll==expected));
+        }
+        app.stack.clear();app.open_command();
+        for key in ['f','b'] {app.on_key(KeyEvent::new(KeyCode::Char(key),KeyModifiers::NONE));}
+        assert!(matches!(&app.mode,Mode::Prompt {buf,..} if buf.text=="fb"));
+        app.mode=Mode::Normal;
+        let mut browser=crate::raw::Browser::new(&json!({"text":"line\n".repeat(100)}));
+        browser.scroll=20;
+        app.stack.push(View::Raw {title:"raw".into(),browser,entry_focus:Focus::Msgs});
+        app.on_key(KeyEvent::new(KeyCode::Char('f'),KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(),Some(View::Raw {browser,..}) if browser.scroll==24));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'),KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(),Some(View::Raw {browser,..}) if browser.scroll==20));
+    }
+
+    #[test]
+    fn received_key_indicator_tracks_prompts_and_expires() {
+        let mut app=mute_test_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('/'),KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'),KeyModifiers::CONTROL|KeyModifiers::SHIFT));
+        assert_eq!(app.last_key.as_ref().unwrap().0,"Ctrl+Shift+s");
+        assert_eq!(crate::keys::received_key(KeyEvent::new(KeyCode::Char('x'),KeyModifiers::ALT)),"Alt+x");
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let text:String=terminal.backend().buffer().content.iter().map(|cell|cell.symbol()).collect();
+        assert!(text.contains("Ctrl+Shift+s"));
+        app.last_key.as_mut().unwrap().1=Instant::now()-Duration::from_secs(4);
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let text:String=terminal.backend().buffer().content.iter().map(|cell|cell.symbol()).collect();
+        assert!(!text.contains("Ctrl+Shift+s"));
+        app.on_key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE));
+        assert_eq!(app.last_key.as_ref().unwrap().0,"Esc");
+    }
+
+    #[test]
+    fn author_command_completion_scope_and_global_rendering() {
+        let mut app=mute_test_app();app.corpus.me=Some("U1".into());
+        app.corpus.merge_profiles(vec![json!({"id":"U1","name":"gabriel.clima"}),json!({"id":"U2","name":"gwen.parker"})]);
+        app.open_command();
+        if let Mode::Prompt {buf,..}=&mut app.mode { *buf=Editor::with("/find from:@gab".into()); }
+        app.on_key(KeyEvent::new(KeyCode::Tab,KeyModifiers::NONE));
+        assert!(matches!(&app.mode,Mode::Prompt {buf,..} if buf.text=="/find from:@gabriel.clima"));
+        app.filter_live("/find from:@gab");assert!(app.filter.is_empty());
+        app.mode=Mode::Normal;
+        app.run_command("/find from:@me","");app.finish_archive_scan_for_test();
+        assert!(app.focus==Focus::Msgs);assert!(app.open.is_none());
+        let mut hit=msg(2,"authored message");hit.channel_id="C1".into();app.merge_hits("from:@me",vec![hit],true);
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let text:String=terminal.backend().buffer().content.iter().map(|cell|cell.symbol()).collect();assert!(text.contains("authored message"));
+        app.open_hit("C1".into(),2_000_000,2_000_000);assert!(app.open.is_none());
+        app.on_msg_key(Some(Action::Back));assert!(matches!(app.stack.last(),Some(View::Search {..})));
+        app.on_msg_key(Some(Action::Back));assert!(app.focus==Focus::Convs);
+        let (tx,rx)=std::sync::mpsc::channel();
+        app.api=Some(Arc::new(Client::for_test(move |method,params| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            tx.send(params.iter().find(|(key,_)|*key=="query").unwrap().1.to_string()).unwrap();Ok(json!({"messages":{"matches":[]}}))
+        })));
+        app.live=true;app.run_command("/find from:@me nginx","");app.finish_archive_scan_for_test();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"from:U1 nginx");
+        app.go_home();app.open=Some(Open {conv:0,list:MsgList::new(vec![],false),total:0,has_older:false,has_newer:false,api_only:true});app.focus=Focus::Msgs;
+        let expected=format!("in:<#{}> from:U2 cache",app.corpus.convs[0].id);
+        app.run_command("/find from:@gwen.parker cache","");app.finish_archive_scan_for_test();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),expected);
+        app.go_home();
+        let mut thread=MsgList::new(vec![],true);thread.source_channel=Some("COTHER".into());
+        app.stack.push(View::Thread {root:1,list:thread,live:None,place:None});app.focus=Focus::Msgs;
+        app.run_command("/find from:@me","");app.finish_archive_scan_for_test();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"in:<#COTHER> from:U1");
+        app.on_msg_key(Some(Action::Back));assert!(app.job.is_none());
+        app.run_command("/find from:@me","");app.finish_archive_scan_for_test();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"in:<#COTHER> from:U1");
+        app.invalidate_thread_jobs();assert!(!app.title().contains("searching Slack"));assert!(app.title().contains("cached results only"));
+        app.run_command("/find from:@me again","");app.finish_archive_scan_for_test();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"in:<#COTHER> from:U1 again");
+        // A request still in flight when the scan lands keeps Slack out of it;
+        // the scan runs regardless, in its own slot.
+        app.go_home();
+        let (busy,_keep)=live::pending_job(JobKind::Profiles);app.job=Some(busy);
+        app.run_command("/find from:@me","");app.finish_archive_scan_for_test();
+        assert!(app.status.contains("Slack was not searched"),"{}",app.status);assert!(app.title().contains("cached results only"));
+        app.job=None;
+        app.go_home();app.run_command("/find from:@unknown","");app.finish_archive_scan_for_test();
+        assert!(app.status.contains("Unknown author"));assert!(app.stack.is_empty());
+    }
+
+    /// An archive on disk holding these messages, attached to `channel`.
+    /// A file, not an in-memory database: the scan worker opens its own
+    /// read-only connection to the archive's directory. Returns the
+    /// directory, for the test to remove.
+    fn attach_archive(app: &mut App, channel: &str, rows: &[(i64, Option<i64>, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "slack-tui-scan-{channel}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.join("slackdump.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE MESSAGE(ID INTEGER, CHUNK_ID INTEGER, CHANNEL_ID TEXT, TS TEXT, PARENT_ID INTEGER,
+                 THREAD_TS TEXT, IS_PARENT INTEGER, LATEST_REPLY TEXT, TXT TEXT, DATA BLOB);").unwrap();
+            for &(seconds, parent, text) in rows {
+                let ts = format!("{seconds}.000000");
+                let data = json!({"text":text,"ts":ts,"user":"U1"}).to_string().into_bytes();
+                conn.execute(
+                    "INSERT INTO MESSAGE VALUES(?1,1,?2,?3,?4,?5,0,NULL,?6,?7)",
+                    rusqlite::params![seconds*1_000_000, channel, ts, parent.map(|p| p*1_000_000),
+                        parent.map(|p| format!("{p}.000000")), text, data]).unwrap();
+            }
+        }
+        let archive = Archive::open(format!("full/{channel}"), &dir).unwrap();
+        let index = app.corpus.conv_by_channel(channel).unwrap();
+        app.corpus.archives.push(archive);
+        app.corpus.convs[index].archive = app.corpus.archives.len() - 1;
+        app.corpus.convs[index].live_only = false;
+        dir
+    }
+
+    /// `/find message:` from the list searches text everywhere the archives
+    /// reach; inside a conversation it is the ordinary search it always was.
+    #[test]
+    fn message_search_crosses_conversations_and_leaves_the_name_filter_alone() {
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.merge_profiles(vec![json!({"id":"U1","name":"gabriel.clima"})]);
+        app.merge_conversations(vec![json!({"id":"COTHER","name":"other-channel","is_member":true})]);
+        let dirs = [
+            attach_archive(&mut app, "C1", &[(1, None, "nginx in one"), (3, Some(1), "nginx reply in one"),
+                (5, None, "a quoted foo bar phrase")]),
+            attach_archive(&mut app, "COTHER", &[(2, None, "nginx over there"), (4, None, "nothing to see")]),
+        ];
+        let hits = |app: &App| -> Vec<String> {
+            let Some(View::Search { list, .. }) = app.stack.last() else { panic!("no search view") };
+            list.msgs.iter().map(|m| m.text.clone()).collect()
+        };
+
+        for line in ["/find message: nginx", "/find message: \"nginx\"", "/find MESSAGE:nginx"] {
+            app.go_home();
+            app.run_command(line, "");
+            app.finish_archive_scan_for_test();
+            assert_eq!(app.focus, Focus::Msgs, "{line}");
+            assert!(app.open.is_none(), "{line}");
+            let Some(View::Search { list, query, capped, .. }) = app.stack.last() else { panic!("{line}") };
+            assert_eq!(query, "nginx", "{line}");
+            assert!(!capped, "{line}");
+            assert!(list.source_channel.is_none(), "{line}");
+            // Newest first, both conversations, the thread reply included.
+            assert_eq!(hits(&app), ["nginx reply in one", "nginx over there", "nginx in one"], "{line}");
+            assert_eq!(list.msgs.iter().filter(|m| m.channel_id == "COTHER").count(), 1, "{line}");
+            assert_eq!(list.msgs[0].channel_name.as_deref(), Some("#one"), "{line}");
+            assert!(app.status.contains("3 cached message matches"), "{line}: {}", app.status);
+        }
+
+        // l on a hit from another conversation opens its thread there, over
+        // the search view, without switching the list to that conversation.
+        app.on_msg_key(Some(Action::Down));
+        assert_eq!(app.selected().unwrap().channel_id, "COTHER");
+        app.on_msg_key(Some(Action::Open));
+        let Some(View::Thread { list, place, .. }) = app.stack.last() else { panic!("no thread") };
+        assert_eq!(list.source_channel.as_deref(), Some("COTHER"));
+        assert_eq!(place.as_deref(), Some("#other-channel"));
+        assert!(app.open.is_none());
+        app.on_msg_key(Some(Action::Back));
+        assert!(matches!(app.stack.last(), Some(View::Search { .. })));
+
+        // An empty needle asks rather than searching, and a needle of blanks
+        // is an empty needle: quoted, it must not become a scan of everything.
+        for line in ["/find message:", "/find message:   ", "/find message: \"\"", "/find message: \"   \""] {
+            app.go_home();
+            app.run_command(line, "");
+            app.finish_archive_scan_for_test();
+            assert_eq!(app.status, "search what?", "{line}");
+            assert!(app.stack.is_empty(), "{line}");
+            assert!(app.job.is_none(), "{line}");
+            assert_eq!(app.focus, Focus::Convs, "{line}");
+        }
+
+        // Typed live, the prefix never becomes a name filter.
+        app.open_command();
+        app.filter_live("/find one");
+        assert_eq!(app.filter, "one");
+        let narrowed = app.filtered.len();
+        app.filter_live("/find message: ng");
+        assert!(app.filter.is_empty());
+        assert!(app.filtered.len() > narrowed);
+        app.mode = Mode::Normal;
+
+        // Inside a conversation the prefix means what /find TEXT means there.
+        app.go_home();
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.run_command("/find nginx", "");
+        let plain = hits(&app);
+        assert_eq!(plain, ["nginx reply in one", "nginx in one"]);
+        app.stack.clear();
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        let Some(View::Search { list, query, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(query, "nginx");
+        assert_eq!(list.source_channel.as_deref(), Some("C1"));
+        assert_eq!(hits(&app), plain);
+
+        // Signed in, Slack is asked the bare needle: no in: filter from the
+        // list, and from:@ still combines with it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Only the search is under test; ordinary background calls (counts,
+        // muted channels) reach the same stub and must not panic its thread.
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            tx.send(params.iter().find(|(key, _)| *key == "query").unwrap().1.to_string()).unwrap();
+            Ok(json!({"messages":{"matches":[]}}))
+        })));
+        app.live = true;
+        // Each round collects the Slack half it started before the next one
+        // begins. A round that leaves it pending refuses the next round's
+        // live search ("another request is running") and then replaces that
+        // round's status line with its own.
+        let collect_slack = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.job.is_some() && Instant::now() < deadline {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(app.job.is_none(), "the Slack search never finished");
+        };
+        app.go_home();
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nginx");
+        assert!(app.status.contains("cached message matches"), "{}", app.status);
+        // The tick that started the Slack half does not also collect it, or
+        // the line above would never be drawn.
+        assert!(app.job.is_some(), "the Slack half was collected where it was started");
+        collect_slack(&mut app);
+        assert!(app.status.starts_with("Slack: 0 hits"), "{}", app.status);
+        app.go_home();
+        app.run_command("/find message: nginx from:@me", "");
+        app.finish_archive_scan_for_test();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1 nginx");
+        assert!(app.status.contains("cached author matches"), "{}", app.status);
+        assert_eq!(hits(&app).len(), 3);
+        collect_slack(&mut app);
+
+        // A quoted phrase keeps its quotes out of the needle and out of the
+        // Slack query when an author sits beside them.
+        for line in ["/find message: \"foo bar\" from:@me", "/find message: from:@me \"foo bar\""] {
+            app.go_home();
+            app.run_command(line, "");
+            app.finish_archive_scan_for_test();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1 foo bar", "{line}");
+            assert_eq!(hits(&app), ["a quoted foo bar phrase"], "{line}");
+            collect_slack(&mut app);
+        }
+        // Blanks stay empty even with an author: that is an author search.
+        app.go_home();
+        app.run_command("/find message: \"  \" from:@me", "");
+        app.finish_archive_scan_for_test();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "from:U1");
+        assert_eq!(hits(&app).len(), 5);
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// A search stub over two small archives, ready to run `/find`.
+    fn scan_test_app() -> (App, [PathBuf; 2]) {
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.merge_profiles(vec![json!({"id":"U1","name":"gabriel.clima"})]);
+        app.merge_conversations(vec![json!({"id":"COTHER","name":"other-channel","is_member":true})]);
+        let dirs = [
+            attach_archive(&mut app, "C1", &[(1, None, "nginx in one"), (3, Some(1), "nginx reply in one")]),
+            attach_archive(&mut app, "COTHER", &[(2, None, "nginx over there"), (4, None, "nothing to see")]),
+        ];
+        (app, dirs)
+    }
+
+    /// What a stub answers for the ordinary background calls a signed-in app
+    /// makes: enough shape that none of them writes an error over the status
+    /// the search under test just set.
+    fn quiet_slack() -> serde_json::Value {
+        json!({"ok": true, "prefs": {"all_notifications_prefs": {"channels": {}}},
+               "items": [], "channels": [], "ims": [], "mpims": []})
+    }
+
+    /// A Slack mock that answers only once the test says so. Without it the
+    /// live job can finish inside the very tick that started it, and an
+    /// assertion about the search still being out passes or fails on timing.
+    fn gated_slack(
+        answer: serde_json::Value,
+    ) -> (std::sync::Arc<Client>, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<String>) {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (asked, queries) = std::sync::mpsc::channel::<String>();
+        let gate = std::sync::Mutex::new(gate);
+        let client = Client::for_test(move |method, params| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            asked.send(params.iter().find(|(key, _)| *key == "query").unwrap().1.to_string()).unwrap();
+            gate.lock().expect("gate").recv().expect("the test releases the search");
+            Ok(answer.clone())
+        });
+        (std::sync::Arc::new(client), release, queries)
+    }
+
+    /// Let the worker narrate without collecting its result, so the box can
+    /// be looked at mid-scan.
+    fn wait_for_scan_lines(app: &mut App, wanted: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let overlay = app.scan_overlay.as_mut().expect("a progress box");
+            overlay.drain();
+            if overlay.lines.len() >= wanted || Instant::now() > deadline { break }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.scan_overlay.as_ref().unwrap().lines.len() >= wanted,
+            "only {} lines", app.scan_overlay.as_ref().unwrap().lines.len());
+    }
+
+    /// The scan narrates the statement it runs, then every conversation it
+    /// visits, then the total; nothing is pushed until it is done.
+    #[test]
+    fn the_archive_scan_narrates_its_query_each_conversation_and_the_total() {
+        let (mut app, dirs) = scan_test_app();
+        app.run_command("/find message: nginx", "");
+        assert!(app.stack.is_empty(), "nothing is shown until the scan lands");
+        wait_for_scan_lines(&mut app, 4);
+        let overlay = app.scan_overlay.as_ref().unwrap();
+        let said: Vec<&str> = overlay.lines.iter().map(|l| l.text.as_str()).collect();
+        // The resolved statement first, dim, with the needle substituted.
+        assert!(overlay.lines[0].dim);
+        let like = r"LIKE '%nginx%' ESCAPE '\'";
+        assert_eq!(said[0], format!(
+            "sqlite: … WHERE (TXT {like} OR CAST(DATA AS TEXT) {like}) \
+             AND (NULL IS NULL OR json_extract(DATA,'$.user') = NULL) LIMIT 500"));
+        // Then one line per conversation, in list order, then the total.
+        assert_eq!(said[1], "searching #one … 2 hits");
+        assert_eq!(said[2], "searching #other-channel … 1 hit");
+        assert_eq!(said[3], "2 conversations scanned · 3 hits");
+        assert!(said[1..].iter().all(|line| !line.starts_with("sqlite:")));
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// An author search names the id it resolved in the same line.
+    #[test]
+    fn the_narrated_statement_carries_the_resolved_author() {
+        let (mut app, dirs) = scan_test_app();
+        app.run_command("/find from:@gabriel.clima", "");
+        wait_for_scan_lines(&mut app, 1);
+        let first = app.scan_overlay.as_ref().unwrap().lines[0].text.clone();
+        assert!(first.contains("('U1' IS NULL OR json_extract(DATA,'$.user') = 'U1')"), "{first}");
+        assert!(first.contains("LIMIT 500"), "{first}");
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// The box is centred, four fifths of the screen, on the palette's own
+    /// colour, titled with the command and showing the newest line; and it
+    /// is gone once the search is over.
+    #[test]
+    fn the_progress_box_covers_four_fifths_and_leaves_when_the_search_lands() {
+        let (mut app, dirs) = scan_test_app();
+        app.palette.set(Role::ProgressOverlay, ratatui::style::Color::Rgb(9, 9, 9));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        // The prompt hands the command over without the slash it opened on.
+        app.run_command("find message: nginx", "");
+        wait_for_scan_lines(&mut app, 4);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let rect = crate::ui::scan_overlay_rect(ratatui::layout::Rect::new(0, 0, 100, 30));
+        assert_eq!(rect, ratatui::layout::Rect::new(10, 3, 80, 24));
+        let buffer = terminal.backend().buffer();
+        // Its own background, over the whole box and nowhere outside it.
+        assert_eq!(buffer[(rect.x, rect.y)].bg, ratatui::style::Color::Rgb(9, 9, 9));
+        assert_eq!(buffer[(rect.x + rect.width - 1, rect.y + rect.height - 1)].bg, ratatui::style::Color::Rgb(9, 9, 9));
+        assert_ne!(buffer[(rect.x - 1, rect.y)].bg, ratatui::style::Color::Rgb(9, 9, 9));
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("/find message: nginx"), "no title");
+        assert!(text.contains("2 conversations scanned · 3 hits"), "no latest line");
+        // The list behind it is covered, not merely dimmed.
+        assert!(!text.contains("nginx reply in one"));
+        app.finish_archive_scan_for_test();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!text.contains("conversations scanned"), "the box outlived the search");
+        assert!(text.contains("nginx reply in one"), "the hits are not showing");
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// Esc during the archive phase abandons the search outright.
+    #[test]
+    fn escape_during_the_scan_cancels_it_and_leaves_the_list_alone() {
+        let (mut app, dirs) = scan_test_app();
+        let before = app.filtered.clone();
+        app.run_command("/find message: nginx", "");
+        wait_for_scan_lines(&mut app, 1);
+        // Any other key is swallowed while the box is up.
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(app.scan_overlay.is_some());
+        assert_eq!(app.conv_cursor, 0);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.scan_overlay.is_none());
+        assert!(app.pending_search.is_none());
+        assert!(app.job.is_none() && app.bg.is_none());
+        assert_eq!(app.status, "search cancelled");
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Convs);
+        assert_eq!(app.filtered, before);
+        // A late result from the abandoned worker changes nothing.
+        app.tick();
+        assert!(app.stack.is_empty());
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// The scan has a slot of its own, so a busy client cannot refuse a
+    /// search, and its result is collected from that third slot.
+    #[test]
+    fn a_scan_runs_and_lands_with_both_other_slots_busy() {
+        let (mut app, dirs) = scan_test_app();
+        let (fetching, _hold_job) = live::pending_job(JobKind::Refresh { conv: 0, before: 0 });
+        let (polling, _hold_bg) = live::pending_job(JobKind::Counts { gen: 0 });
+        app.job = Some(fetching);
+        app.bg = Some(polling);
+        app.run_command("/find message: nginx", "");
+        assert_ne!(app.status, "a fetch is already running; try again in a moment");
+        assert!(app.job.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Refresh { .. })), "the fetch slot was taken");
+        assert!(app.bg.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Counts { .. })), "the quiet slot was taken");
+        assert!(app.scan.as_ref().is_some_and(|job| matches!(job.kind, JobKind::ArchiveScan { .. })), "no scan started");
+        app.finish_archive_scan_for_test();
+        let Some(View::Search { list, query, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(query, "nginx");
+        assert_eq!(list.msgs.len(), 3);
+        assert_eq!(app.focus, Focus::Msgs);
+        assert!(app.status.contains("3 cached message matches"), "{}", app.status);
+        app.job = None;
+        app.bg = None;
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// A fetch finishing mid-scan navigates, and navigation invalidates
+    /// thread jobs. It must not take the search with it: the reader asked
+    /// for the search, nothing asked for it to be abandoned. The scan worker
+    /// is held on a gate, so which of the two lands first is decided here
+    /// rather than by the scheduler.
+    #[test]
+    fn a_refresh_landing_mid_scan_does_not_cancel_the_search() {
+        // The refresh lands first: the search is untouched and arrives after.
+        let (mut app, dirs) = scan_test_app();
+        let conv = app.corpus.conv_by_channel("C1").unwrap();
+        let (refreshing, finish_refresh) = live::pending_job(JobKind::Refresh { conv, before: 0 });
+        let (release_scan, gate) = std::sync::mpsc::channel();
+        app.scan_gate = Some(gate);
+        app.job = Some(refreshing);
+        app.run_command("/find message: nginx", "");
+        assert!(app.scan.is_some() && app.scan_overlay.is_some());
+        finish_refresh.send(Ok(Done::Refreshed)).unwrap();
+        app.tick();
+        assert!(app.job.is_none(), "the refresh was not collected");
+        assert!(app.status.starts_with("refreshed:"), "{}", app.status);
+        assert!(app.scan.is_some(), "the refresh cancelled the scan");
+        assert!(app.pending_search.is_some(), "the refresh dropped the pending search");
+        assert!(app.scan_overlay.is_some(), "the box went with the refresh");
+        release_scan.send(()).unwrap();
+        app.finish_archive_scan_for_test();
+        let Some(View::Search { list, query, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(query, "nginx");
+        assert_eq!(list.msgs.len(), 3);
+
+        // The scan lands first: the search is showing, and the refresh then
+        // navigates over it. A refresh has always done that to whatever was
+        // on screen; it is not something this change introduced.
+        let (mut app, more_dirs) = scan_test_app();
+        let conv = app.corpus.conv_by_channel("C1").unwrap();
+        let (refreshing, finish_refresh) = live::pending_job(JobKind::Refresh { conv, before: 0 });
+        app.job = Some(refreshing);
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        assert!(matches!(app.stack.last(), Some(View::Search { .. })));
+        finish_refresh.send(Ok(Done::Refreshed)).unwrap();
+        app.tick();
+        assert!(app.stack.is_empty(), "open_conv clears the stack, as it does for any view");
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(conv));
+
+        // Both ready in one tick: the scan is polled first, so the search is
+        // pushed and the refresh then navigates over it, same as above. Both
+        // results are staged as already-delivered, so neither is waited on.
+        let (mut app, yet_more_dirs) = scan_test_app();
+        let conv = app.corpus.conv_by_channel("C1").unwrap();
+        let (release_scan, gate) = std::sync::mpsc::channel();
+        app.scan_gate = Some(gate);
+        app.run_command("/find message: nginx", "");
+        drop(release_scan);
+        let mut hit = msg(2, "nginx in one");
+        hit.channel_id = "C1".into();
+        app.scan = Some(Job::completed_for_test(
+            JobKind::ArchiveScan { query: "nginx".into() },
+            Ok(Done::ArchiveHits { hits: vec![hit], capped: false, users: Vec::new() }),
+        ));
+        app.job = Some(Job::completed_for_test(
+            JobKind::Refresh { conv, before: 0 },
+            Ok(Done::Refreshed),
+        ));
+        app.tick();
+        assert!(app.scan.is_none() && app.job.is_none(), "both were meant to land in one tick");
+        assert!(app.stack.is_empty());
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(conv));
+
+        for dir in dirs.into_iter().chain(more_dirs).chain(yet_more_dirs) {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// A scan with no box does not swallow keys, so the reader can walk away
+    /// from it. Its hits belong where they were asked for: if the reader has
+    /// gone elsewhere by the time they land, they are dropped. Every way of
+    /// going elsewhere bumps the navigation generation, which is why this
+    /// does not depend on a list of keys to intercept.
+    #[test]
+    fn a_box_less_scan_is_abandoned_when_the_reader_moves_on() {
+        let cases: [(&str, fn(&mut App)); 5] = [
+            ("h home", |app| app.on_msg_key(Some(Action::Back))),
+            ("THREADS", |app| {
+                app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+                app.on_msg_key(Some(Action::MyThreads));
+            }),
+            ("a thread", |app| {
+                let message = app.active_list().unwrap().selected().unwrap().clone();
+                app.open_thread_in(message.channel_id.clone(), message.id, message.id);
+            }),
+            ("a date", |app| app.goto_date("2026-01-01")),
+            ("/keys", |app| app.run_command("/keys", "")),
+        ];
+        for (what, go) in cases {
+            let (mut app, dirs) = scan_test_app();
+            let (release_scan, gate) = std::sync::mpsc::channel();
+            app.scan_gate = Some(gate);
+            app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+            app.run_command("/find from:@gabriel.clima", "");
+            assert!(app.scan.is_some() && app.scan_overlay.is_none(), "{what}: a one-conversation scan draws no box");
+            assert!(!app.scan_running(), "{what}: a box-less scan must not swallow keys");
+            go(&mut app);
+            let focus = app.focus;
+            let stack = app.stack.len();
+            let open = app.open.as_ref().map(|open| open.conv);
+            release_scan.send(()).unwrap();
+            app.finish_archive_scan_for_test();
+            assert!(!app.stack.iter().any(|view| matches!(view, View::Search { .. })),
+                "{what}: the abandoned search pushed its view");
+            assert_eq!(app.status, "search abandoned: you moved on", "{what}");
+            assert_eq!(app.focus, focus, "{what}: focus moved");
+            assert_eq!(app.stack.len(), stack, "{what}: the stack changed");
+            assert_eq!(app.open.as_ref().map(|open| open.conv), open, "{what}: the conversation changed");
+            assert!(app.scan.is_none() && app.pending_search.is_none(), "{what}");
+            for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+        }
+    }
+
+    /// Staying put is not moving on: the same scan, with no navigation, still
+    /// pushes its hits.
+    #[test]
+    fn a_box_less_scan_that_is_left_alone_still_lands() {
+        let (mut app, dirs) = scan_test_app();
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.run_command("/find from:@gabriel.clima", "");
+        // Moving the cursor and swapping panes are not leaving.
+        app.on_msg_key(Some(Action::Down));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.finish_archive_scan_for_test();
+        let Some(View::Search { list, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(list.msgs.len(), 2);
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// One conversation is too fast to be worth a box; the scan still runs.
+    #[test]
+    fn a_single_conversation_scan_runs_without_a_box() {
+        let (mut app, dirs) = scan_test_app();
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.run_command("/find from:@gabriel.clima", "");
+        assert!(app.scan.is_some(), "the scan did not start");
+        assert!(app.scan_overlay.is_none(), "a box flashed for a one-conversation search");
+        // With no box up, ordinary keys still reach the UI.
+        assert!(!app.scan_running());
+        app.finish_archive_scan_for_test();
+        let Some(View::Search { list, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(list.source_channel.as_deref(), Some("C1"));
+        // One conversation only: COTHER's message is not in this search.
+        assert_eq!(list.msgs.len(), 2);
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// A needle carrying an apostrophe still renders as valid SQL.
+    #[test]
+    fn the_narrated_statement_doubles_apostrophes() {
+        let (mut app, dirs) = scan_test_app();
+        app.run_command("/find message: O'Reilly", "");
+        wait_for_scan_lines(&mut app, 1);
+        let first = app.scan_overlay.as_ref().unwrap().lines[0].text.clone();
+        assert!(first.contains("LIKE '%O''Reilly%' ESCAPE"), "{first}");
+        // Doubling is for the display only; the bound query is untouched.
+        assert!(!first.contains("'%O'Reilly%'"), "{first}");
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// The newest line is always visible, however narrow the box and however
+    /// long that line: the body is wrapped before its tail is taken.
+    #[test]
+    fn the_box_keeps_the_newest_line_visible_at_any_width() {
+        let (mut app, dirs) = scan_test_app();
+        app.run_command("/find message: nginx", "");
+        wait_for_scan_lines(&mut app, 1);
+        let overlay = app.scan_overlay.as_mut().unwrap();
+        overlay.lines.clear();
+        for filler in 0..40 {
+            overlay.lines.push(live::ScanLine::plain(format!("earlier line {filler} that is quite long and wraps")));
+        }
+        let tail = "THE-TAIL-OF-THE-NEWEST-LINE";
+        overlay.lines.push(live::ScanLine::plain(format!("{} {tail}", "x".repeat(400))));
+        for (width, height) in [(20, 8), (120, 30), (40, 12)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rect = crate::ui::scan_overlay_rect(ratatui::layout::Rect::new(0, 0, width, height));
+            let inner = ratatui::widgets::Block::bordered().inner(rect);
+            // The interior is not blank, and the tail of the newest line is on it.
+            let body: String = (inner.y..inner.y + inner.height)
+                .flat_map(|row| (inner.x..inner.x + inner.width).map(move |column| (column, row)))
+                .map(|at| buffer[at].symbol().to_string())
+                .collect();
+            assert!(body.trim().len() > 4, "{width}x{height}: the box drew nothing");
+            assert!(body.contains(tail), "{width}x{height}: the newest line's tail is off screen");
+        }
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// Signed in, the box stays up for Slack's half of the same search and
+    /// reports what each side contributed. The Slack mock is held on a gate,
+    /// so "still pending" and "landed" are asserted either side of a signal
+    /// rather than either side of a thread schedule.
+    #[test]
+    fn the_box_waits_for_slack_and_counts_what_it_did_not_return() {
+        let (mut app, dirs) = scan_test_app();
+        // One hit the archive already has, one it does not; the archive's
+        // newest hit is left out, so Slack does not return it.
+        let (client, release, asked) = gated_slack(json!({"messages":{"matches":[
+            {"channel":{"id":"C1","name":"one"},"ts":"1.000000","user":"U1","text":"nginx in one"},
+            {"channel":{"id":"COTHER","name":"other-channel"},"ts":"2.000000","user":"U1","text":"nginx over there"},
+            {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}
+        ]}}));
+        app.api = Some(client);
+        app.live = true;
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        // Slack is asked the bare needle, and has not answered: nothing here
+        // can race, the mock is parked on the gate.
+        assert_eq!(asked.recv_timeout(Duration::from_secs(2)).unwrap(), "nginx");
+        assert!(app.job.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Search { .. })));
+        for _ in 0..5 { app.tick(); }
+        // The archive hits are showing already, under a box that stays up.
+        let overlay = app.scan_overlay.as_ref().expect("the box waits for Slack");
+        assert!(overlay.live_pending && !overlay.finished);
+        assert_eq!(overlay.lines.last().unwrap().text, "search.messages query=\"nginx\"");
+        assert!(overlay.lines.last().unwrap().dim);
+        assert_eq!(app.active_list().unwrap().msgs.len(), 3);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.job.is_some() && Instant::now() < deadline { app.tick(); std::thread::sleep(Duration::from_millis(1)); }
+        let overlay = app.scan_overlay.as_ref().expect("the last line is drawn once");
+        assert_eq!(overlay.lines.last().unwrap().text, "Slack: 3 hits · +1 new · 1 not returned by Slack");
+        assert!(overlay.finished);
+        let Some(View::Search { live_hits, live_pending, list, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(*live_hits, Some(LiveHits { added: 1, cache_only: 1, complete: true }));
+        assert!(!live_pending);
+        assert_eq!(list.msgs.len(), 4);
+        assert_eq!(app.title(), "search 'nginx' · 4 hits · 1 more from Slack · 1 not returned by Slack");
+        app.tick();
+        assert!(app.scan_overlay.is_none(), "the box outlived the search");
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// Slack's answer is paged to the archive's own cap, so "only in cache"
+    /// is measured against everything Slack holds, not against one page.
+    #[test]
+    fn the_live_search_pages_to_the_cap_before_counting_cache_only_hits() {
+        let (mut app, dirs) = scan_test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            let cursor = params.iter().find(|(key, _)| *key == "cursor").unwrap().1.to_string();
+            tx.send(cursor.clone()).unwrap();
+            // Page one holds a hit the archive already has and says there is
+            // more; page two holds one the archive does not, and ends.
+            Ok(match cursor.as_str() {
+                "*" => json!({"messages":{"matches":[
+                        {"channel":{"id":"C1","name":"one"},"ts":"1.000000","user":"U1","text":"nginx in one"}],
+                    "pagination":{"next_cursor":"page2"}}}),
+                _ => json!({"messages":{"matches":[
+                        {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}],
+                    "pagination":{"next_cursor":""}}}),
+            })
+        })));
+        app.live = true;
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.job.is_some() && Instant::now() < deadline { app.tick(); std::thread::sleep(Duration::from_millis(1)); }
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "*");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "page2", "the second page was never asked for");
+        // Slack held 2; the archive's other 2 hits are genuinely cache-only.
+        let Some(View::Search { live_hits, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(*live_hits, Some(LiveHits { added: 1, cache_only: 2, complete: true }));
+        assert!(app.title().contains("2 not returned by Slack"), "{}", app.title());
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// A rate limit part way through the paging keeps the pages that did
+    /// arrive: they fold in, and the title says the answer is partial rather
+    /// than the search failing outright.
+    #[test]
+    fn a_rate_limit_mid_pagination_keeps_the_pages_that_arrived() {
+        let (mut app, dirs) = scan_test_app();
+        let page = std::sync::atomic::AtomicUsize::new(0);
+        app.api = Some(Arc::new(Client::for_test(move |method, _| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            match page.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Ok(json!({"messages":{"matches":[
+                        {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}],
+                    "pagination":{"next_cursor":"page2"}}})),
+                _ => Err("search.messages: ratelimited".to_string()),
+            }
+        })));
+        app.live = true;
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.job.is_some() && Instant::now() < deadline { app.tick(); std::thread::sleep(Duration::from_millis(1)); }
+        assert!(!app.status.starts_with("Slack: search.messages"), "the search failed outright: {}", app.status);
+        // The box says the answer was cut short, not that more is coming:
+        // nothing follows a page that failed.
+        let overlay = app.scan_overlay.as_ref().expect("the last line is drawn once");
+        assert_eq!(overlay.lines.last().unwrap().text,
+            "Slack: 1 hit · +1 new · 3 not returned by Slack (partial answer)");
+        let Some(View::Search { live_hits, live_pending, list, .. }) = app.stack.last() else { panic!("no search view") };
+        // Page one's hit is in the list, and the count is not called exact.
+        assert_eq!(list.msgs.len(), 4);
+        assert!(!live_pending);
+        let counts = live_hits.expect("Slack's partial answer");
+        assert_eq!(counts.added, 1);
+        assert!(!counts.complete, "a half-collected answer was called complete");
+        assert!(app.title().contains("3 not returned by Slack (partial answer)"), "{}", app.title());
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// When Slack still has more at the cap, its answer is not the whole of
+    /// what Slack holds, so the count must not be called "only in cache".
+    #[test]
+    fn a_truncated_slack_answer_never_claims_a_hit_is_only_in_cache() {
+        let (mut app, dirs) = scan_test_app();
+        let page = std::sync::atomic::AtomicUsize::new(0);
+        app.api = Some(Arc::new(Client::for_test(move |method, _| {
+            if method != "search.messages" { return Ok(quiet_slack()); }
+            // Every page is full and every page says there is another, so the
+            // cap is reached with a cursor still outstanding.
+            let n = page.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let matches: Vec<_> = (0..100).map(|index| json!({
+                "channel": {"id": "C1", "name": "one"},
+                "ts": format!("{}.000000", 1000 + n * 100 + index), "user": "U1", "text": "nginx"
+            })).collect();
+            Ok(json!({"messages":{"matches":matches,"pagination":{"next_cursor":format!("page{}", n + 1)}}}))
+        })));
+        app.live = true;
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.job.is_some() && Instant::now() < deadline { app.tick(); std::thread::sleep(Duration::from_millis(1)); }
+        let Some(View::Search { live_hits, .. }) = app.stack.last() else { panic!("no search view") };
+        let counts = live_hits.expect("Slack answered");
+        assert_eq!(counts.added, SEARCH_CAP);
+        assert_eq!(counts.cache_only, 3);
+        assert!(!counts.complete, "a page with a cursor left over was called complete");
+        // The fact holds either way; only a complete answer drops the caveat.
+        let title = app.title();
+        assert!(title.contains("3 not returned by Slack (partial answer)"), "{title}");
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// Without a sign-in nothing follows the archive phase, so the box goes
+    /// as soon as the hits do.
+    #[test]
+    fn the_box_closes_after_the_archive_phase_when_slack_is_not_asked() {
+        let (mut app, dirs) = scan_test_app();
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        assert!(app.scan_overlay.is_none());
+        assert!(app.job.is_none());
+        let Some(View::Search { live_pending, live_hits, .. }) = app.stack.last() else { panic!("no search view") };
+        assert!(!live_pending && live_hits.is_none());
+        assert!(app.title().contains("cached results only"));
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    /// Esc while Slack is still out only dismisses the box: the archive hits
+    /// stay on screen and the live search folds in when it answers.
+    #[test]
+    fn escape_during_the_slack_phase_keeps_the_list_and_the_job() {
+        let (mut app, dirs) = scan_test_app();
+        let (client, release, asked) = gated_slack(json!({"messages":{"matches":[
+            {"channel":{"id":"C1","name":"one"},"ts":"9.000000","user":"U1","text":"nginx only on slack"}
+        ]}}));
+        app.api = Some(client);
+        app.live = true;
+        app.run_command("/find message: nginx", "");
+        app.finish_archive_scan_for_test();
+        assert_eq!(asked.recv_timeout(Duration::from_secs(2)).unwrap(), "nginx");
+        for _ in 0..5 { app.tick(); }
+        assert!(app.scan_overlay.as_ref().is_some_and(|o| o.live_pending));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.scan_overlay.is_none(), "the box stayed up");
+        assert!(app.job.as_ref().is_some_and(|job| matches!(job.kind, JobKind::Search { .. })), "the live search was dropped");
+        assert_ne!(app.status, "search cancelled");
+        let Some(View::Search { list, live_pending, .. }) = app.stack.last() else { panic!("no search view") };
+        assert_eq!(list.msgs.len(), 3);
+        assert!(live_pending);
+        // It still folds in, exactly as it did before the box existed.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.job.is_some() && Instant::now() < deadline { app.tick(); std::thread::sleep(Duration::from_millis(1)); }
+        assert_eq!(app.active_list().unwrap().msgs.len(), 4);
+        assert!(app.scan_overlay.is_none());
+        for dir in dirs { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+
+    #[test]
+    fn sent_compose_respects_sidebar_and_unread_marker_precedes_selection() {
+        let mut app=mute_test_app();app.open_sent();let generation=app.sent_generation;
+        let mut newer=msg(3,"newer");newer.channel_id="C1".into();
+        let mut selected=msg(2,"selected");selected.channel_id="C1".into();
+        app.apply_sent(generation,false,crate::sent::Page {messages:vec![newer,selected],next_cursor:None});
+        app.active_list_mut().unwrap().cursor=1;
+        app.api=Some(Arc::new(Client::for_test(|method,params| {
+            assert_eq!(method,"conversations.mark");assert!(params.contains(&("ts","1.999999")));Ok(json!({"ok":true}))
+        })));
+        app.mark_unread();assert!(matches!(app.job.as_ref().map(|j|&j.kind),Some(JobKind::Mark {id:1_999_999,..})));
+        app.focus=Focus::Convs;app.top_section=None;app.conv_cursor=1;
+        let target=app.compose_target().unwrap();
+        assert_eq!(target.cid,app.corpus.convs[app.filtered[1]].id);assert!(target.thread.is_none());
+        for section in TopSection::ALL {app.top_section=Some(section);assert!(app.compose_target().is_err());}
+    }
+
+    /// An application signed in far enough for the compose prompt to open;
+    /// nothing in these tests reaches the network, and `>` never asks it to.
+    fn quote_test_app() -> App {
+        let mut app = mute_test_app();
+        app.api = Some(Arc::new(Client::for_test(|method, _| {
+            // Opening a conversation reads; the quote key must never write.
+            assert!(
+                method.starts_with("conversations.") && method != "conversations.mark",
+                "{method} called: the quote key writes nothing to Slack"
+            );
+            Ok(json!({ "messages": [] }))
+        })));
+        app
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The interior rows of the compose box at the bottom of `buffer`, borders
+    /// stripped, so a row can be compared with what was quoted into it.
+    fn box_rows(buffer: &ratatui::buffer::Buffer, rows: u16) -> Vec<String> {
+        let width = buffer.area.width;
+        let top = buffer.area.height - rows;
+        (top + 1..buffer.area.height - 1)
+            .map(|y| {
+                (1..width - 1)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// `>` in a conversation: the message's own Slack text quoted line by line
+    /// into the compose box, the cursor on the empty line under it, and the
+    /// box addressed where `c` would have addressed it.
+    #[test]
+    fn quote_opens_the_compose_box_with_the_message_and_the_cursor_below_it() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        // Mentions, a labelled link, a blank line and a line already quoted.
+        let text = "<@U1> see <https://example.org|the docs>\n\n> earlier";
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1000, text)], false);
+        app.on_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT));
+        let target = app.compose.as_ref().expect("the compose target");
+        assert_eq!(target.label, "message to #one");
+        assert_eq!(target.cid, "C1");
+        assert!(target.thread.is_none(), "a timeline quote is not a threaded reply");
+        let Mode::Prompt { kind, buf, .. } = &app.mode else { panic!("no prompt opened") };
+        assert_eq!(*kind, PromptKind::Compose);
+        assert_eq!(buf.text, format!("{}\n", crate::edit::quote_block(text)));
+        assert_eq!(buf.cursor, buf.text.len());
+        // Nothing was sent, and nothing was queued to send.
+        assert!(!matches!(
+            app.job.as_ref().map(|job| &job.kind),
+            Some(JobKind::Send { .. } | JobKind::Upload { .. })
+        ));
+        let rows = app.prompt_rows(60, 20);
+        assert_eq!(rows, 6, "three quoted rows and the empty one below them");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            box_rows(buffer, rows),
+            [
+                "> <@U1> see <https://example.org|the docs>",
+                ">",
+                "> > earlier",
+                "",
+            ]
+        );
+        // The label rides the top border, as it does for `c`.
+        let border: String = (0..60).map(|x| buffer[(x, 14)].symbol()).collect();
+        assert!(border.contains("message to #one"), "{border:?}");
+        // The cursor is the first cell of the empty line under the quote.
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 18)
+        );
+    }
+
+    /// Inside a thread the quote replies in that thread, exactly as `c` does.
+    #[test]
+    fn quote_inside_a_thread_replies_in_that_thread() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.stack.push(View::Thread {
+            root: 1_000_000,
+            list: MsgList::new(vec![msg(1, "the root"), msg(2, "a reply")], true),
+            live: None,
+            place: None,
+        });
+        app.active_list_mut().unwrap().cursor = 1;
+        app.on_key(press(KeyCode::Char('>')));
+        let target = app.compose.as_ref().expect("the compose target");
+        assert_eq!(target.label, "reply in this thread in #one");
+        assert_eq!(target.thread, Some(1_000_000));
+        let rows = app.prompt_rows(60, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(box_rows(terminal.backend().buffer(), rows), ["> a reply", ""]);
+        let border: String = (0..60)
+            .map(|x| terminal.backend().buffer()[(x, 20 - rows)].symbol())
+            .collect();
+        assert!(border.contains("reply in this thread"), "{border:?}");
+    }
+
+    /// From a THREADS card the target is that card's thread, and the root is
+    /// what gets quoted.
+    #[test]
+    fn quote_from_the_threads_view_targets_the_selected_thread() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.focus = Focus::Msgs;
+        let card = crate::render::Card {
+            conversation: "#one".to_string(),
+            participants: "alice, bob".to_string(),
+            hidden: 2,
+            counted_from: 1_000_000,
+            counted_through: 3_000_000,
+            tail: vec![msg(3000, "the newest reply")],
+            elision: crate::render::Elision::Replies,
+        };
+        app.stack.push(View::Threads {
+            list: MsgList::with_cards(vec![(msg(1000, "the thread root"), card)]),
+        });
+        app.on_key(press(KeyCode::Char('>')));
+        let target = app.compose.as_ref().expect("the compose target");
+        assert_eq!(target.cid, "C1");
+        assert_eq!(target.thread, Some(1_000_000_000));
+        assert!(target.label.ends_with("thread in #one"), "{}", target.label);
+        let rows = app.prompt_rows(60, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            box_rows(terminal.backend().buffer(), rows),
+            ["> the thread root", ""]
+        );
+    }
+
+    /// Esc keeps a quoted draft the way it keeps a typed one, and quoting a
+    /// second message for the same target puts the new quote above it rather
+    /// than dropping what was written.
+    #[test]
+    fn escape_keeps_the_quote_and_a_second_quote_goes_above_the_draft() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1000, "deploy is done")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        for c in "thanks".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+        let draft = app.draft.as_ref().expect("Esc kept the draft");
+        assert_eq!(draft.text, "> deploy is done\nthanks");
+        assert_eq!((draft.cid.as_str(), draft.thread), ("C1", None));
+
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list =
+            MsgList::new(vec![msg(2000, "and the cache is warm")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "quoted above your draft");
+        let quote = "> and the cache is warm\n";
+        let kept = "> deploy is done\nthanks";
+        let Mode::Prompt { buf, .. } = &app.mode else { panic!("no prompt opened") };
+        // The answer gets an empty line of its own; the kept draft starts on
+        // the line below it, not on the one the cursor is on.
+        assert_eq!(buf.text, format!("{quote}\n{kept}"));
+        assert_eq!(buf.cursor, quote.len());
+        let rows = app.prompt_rows(60, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            box_rows(terminal.backend().buffer(), rows),
+            ["> and the cache is warm", "", "> deploy is done", "thanks"]
+        );
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 20 - rows + 2)
+        );
+        // What is typed there is the answer, on its own line: it neither joins
+        // the kept draft nor pushes a `>` into the middle of a line.
+        for c in "answer".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        let Mode::Prompt { buf, .. } = &app.mode else { panic!("no prompt opened") };
+        assert_eq!(buf.text, format!("{quote}answer\n{kept}"));
+    }
+
+    /// The draft slot is single, so a quote nobody wrote into must not be
+    /// stashed: doing so would throw away whatever another conversation is
+    /// holding, which plain `c` on an empty prompt never does.
+    #[test]
+    fn a_quote_left_untouched_is_not_kept_and_spares_another_target_s_draft() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        // Half a message typed in the DM, kept by Esc.
+        app.open_conv(1);
+        app.focus = Focus::Msgs;
+        let elsewhere = app.corpus.convs[1].id.clone();
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1000, "a DM")], false);
+        app.on_key(press(KeyCode::Char('c')));
+        for c in "half typed".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Esc));
+        assert_eq!(app.draft.as_ref().expect("the DM draft").text, "half typed");
+
+        // `>` in the other conversation, cancelled without a character typed.
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(2000, "quotable")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        app.on_key(press(KeyCode::Esc));
+        let draft = app.draft.as_ref().expect("the DM draft survived the quote");
+        assert_eq!(draft.cid, elsewhere);
+        assert_eq!(draft.text, "half typed");
+
+        // One character makes it a draft, and the single slot then costs the
+        // DM its own. Pinned here so the trade is deliberate, not incidental.
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(2000, "quotable")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        app.on_key(press(KeyCode::Char('!')));
+        app.on_key(press(KeyCode::Esc));
+        let draft = app.draft.as_ref().expect("a quote written into is kept");
+        assert_eq!(draft.cid, "C1");
+        assert_eq!(draft.text, "> quotable\n!");
+    }
+
+    /// The two refusals, and the sign-in the prompt needs: each says why in
+    /// the status line and opens nothing.
+    #[test]
+    fn quote_says_what_it_cannot_quote_and_opens_nothing() {
+        let mut app = quote_test_app();
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        // The conversations pane has no message under its cursor.
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "select a message first");
+        assert!(matches!(app.mode, Mode::Normal) && app.compose.is_none());
+        // A conversation with nothing loaded: still no message.
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(Vec::new(), false);
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "select a message first");
+        assert!(matches!(app.mode, Mode::Normal) && app.compose.is_none());
+        // A file-only message has no text a quote could carry.
+        let file_only = Msg::from_api(
+            "C1".to_string(),
+            json!({
+                "ts": "1000.000000", "user": "U1", "text": "",
+                "files": [{ "id": "F1", "title": "shot.png", "mimetype": "image/png" }]
+            }),
+        )
+        .unwrap();
+        app.open.as_mut().unwrap().list = MsgList::new(vec![file_only], false);
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "nothing to quote");
+        assert!(matches!(app.mode, Mode::Normal) && app.compose.is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let status: String = (0..60)
+            .map(|x| terminal.backend().buffer()[(x, 19)].symbol())
+            .collect();
+        assert!(status.contains("nothing to quote"), "{status:?}");
+        // Without the sign-in the prompt cannot send, so it does not open.
+        app.api = None;
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1000, "quotable")], false);
+        app.on_key(press(KeyCode::Char('>')));
+        assert_eq!(app.status, "sending needs the Slack sign-in");
+        assert!(matches!(app.mode, Mode::Normal) && app.compose.is_none());
+    }
+
+    #[test]
+    fn browser_completion_preserves_raw_navigation_and_reports_failure() {
+        let mut app=mute_test_app();
+        app.stack.push(View::Raw { title:"raw".into(), browser:crate::raw::Browser::new(&json!({"url":"https://example.org/"})), entry_focus:Focus::Msgs });
+        for outcome in [Ok(Done::BrowserOpened),Err("Browser opener failed".into())] {
+            let success=outcome.is_ok();
+            app.browser_jobs.push(Job::completed_for_test(JobKind::OpenBrowser,outcome));
+            app.tick();
+            assert!(app.browser_jobs.is_empty()); assert!(app.job.is_none());
+            assert!(matches!(app.stack.last(),Some(View::Raw {..})));
+            assert!(app.status.contains(if success {"Opened link"} else {"Browser opener failed"}));
+        }
+    }
+
+    #[test]
+    fn sent_dm_opens_context_and_returns_to_sent() {
+        for key in [KeyCode::Char('l'), KeyCode::Enter] {
+            let mut app=mute_test_app();
+            app.merge_conversations(vec![json!({"id":"DTEST","is_im":true,"user":"U2"})]);
+            app.open_sent(); let generation=app.sent_generation;
+            let mut message=msg(2,"sent DM"); message.channel_id="DTEST".into();
+            app.apply_sent(generation,false,crate::sent::Page {messages:vec![message],next_cursor:None});
+            app.api=Some(Arc::new(Client::for_test(|method,params| {
+                assert_eq!(method,"conversations.history");
+                assert!(params.contains(&("channel","DTEST")));
+                if params.contains(&("inclusive","true")) {
+                    Ok(json!({"messages":[{"ts":"2.000000","text":"sent DM"},{"ts":"1.000000","text":"before"}]}))
+                } else { Ok(json!({"messages":[{"ts":"3.000000","text":"after"}]})) }
+            })));
+            app.on_key(KeyEvent::new(key,KeyModifiers::NONE));
+            let job=app.job.take().unwrap();
+            let outcome=job.wait_for_test();
+            app.job=Some(Job::completed_for_test(job.kind,outcome)); app.tick();
+            assert!(app.stack.is_empty()); assert!(app.in_timeline());
+            assert_eq!(app.selected().unwrap().text,"sent DM");
+            assert_eq!(app.active_list().unwrap().len(),3);
+            assert_eq!(app.corpus.convs[app.open.as_ref().unwrap().conv].id,"DTEST");
+            app.open_conv(app.open.as_ref().unwrap().conv);
+            assert!(app.sent_return.is_some());
+            app.on_key(KeyEvent::new(KeyCode::Char('h'),KeyModifiers::NONE));
+            assert!(matches!(app.stack.last(),Some(View::Feed {..})));
+            assert_eq!(app.selected().unwrap().text,"sent DM"); assert!(app.sent_return.is_none());
+            app.job=Some(Job::completed_for_test(JobKind::SentContext {generation,focus:2_000_000,channel:"DTEST".into()},Err("offline".into())));
+            app.tick(); assert!(matches!(app.stack.last(),Some(View::Feed {..}))); assert!(app.status.contains("offline"));
+            app.on_key(KeyEvent::new(key,KeyModifiers::NONE));
+            let job=app.job.take().unwrap(); let outcome=job.wait_for_test();
+            app.escape_home();
+            app.job=Some(Job::completed_for_test(job.kind,outcome)); app.tick();
+            assert!(app.open.is_none()); assert!(app.stack.is_empty());
+        }
+    }
+
+    #[test]
+    fn mentions_sidebar_fetch_refresh_and_return_to_feed() {
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.merge_conversations(vec![json!({"id":"DTEST","is_im":true,"user":"U2"})]);
+        app.api = Some(Arc::new(Client::for_test(|method, params| match method {
+            "search.messages" => {
+                assert!(params.contains(&("query","<@U1>")));
+                Ok(json!({"messages":{"matches":[{"channel":{"id":"DTEST"},"ts":"2.000000","text":"hello <@U1>"}]}}))
+            }
+            "conversations.history" => Ok(json!({"messages":[{"ts":"2.000000","text":"hello <@U1>"}]})),
+            _ => panic!("unexpected {method}")
+        })));
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..2 { app.on_conv_key(Some(Action::Down)); }
+        assert_eq!(app.top_section,Some(TopSection::Mentions));
+        app.on_conv_key(Some(Action::Open));
+        let finish = |app: &mut App| { let job=app.job.take().unwrap(); let outcome=job.wait_for_test(); app.job=Some(Job::completed_for_test(job.kind,outcome)); app.tick(); };
+        finish(&mut app);
+        assert!(app.title().contains("MENTIONS"));
+        assert_eq!(app.selected().unwrap().text,"hello <@U1>");
+        app.on_key(KeyEvent::new(KeyCode::Char('l'),KeyModifiers::NONE));
+        finish(&mut app);
+        assert!(app.in_timeline());
+        app.on_key(KeyEvent::new(KeyCode::Char('h'),KeyModifiers::NONE));
+        assert_eq!(app.top_section,Some(TopSection::Mentions));
+        assert!(matches!(app.stack.last(),Some(View::Feed {section:TopSection::Mentions,..})));
+        app.on_msg_key(Some(Action::Refresh)); finish(&mut app);
+        let old = app.sent_generation;
+        app.api=None; app.open_sent();
+        app.apply_sent(old,false,crate::sent::Page {messages:vec![msg(1,"late")],next_cursor:None});
+        assert!(app.active_list().unwrap().msgs.is_empty());
+    }
+
+    #[test]
+    fn sent_navigation_pagination_refresh_and_late_results() {
+        let mut app = mute_test_app();
+        app.on_conv_key(Some(Action::First));
+        app.on_conv_key(Some(Action::Down));
+        assert_eq!(app.top_section,Some(TopSection::Sent));
+        assert!(app.target_conv("").is_err()); assert!(app.compose_target().is_err());
+        app.on_conv_key(Some(Action::Open));
+        assert!(app.open.is_none()); assert!(app.status.contains("sign-in"));
+        assert!(app.target_conv("").is_err());
+        let generation=app.sent_generation;
+        let mut reply=msg(3,"sent reply");reply.channel_id="C1".into();reply.parent_id=Some(1_000_000);
+        let mut older=msg(2,"older sent");older.channel_id="D1".into();
+        app.job=Some(Job::completed_for_test(JobKind::Sent {generation,append:false},Ok(Done::SentPage(crate::sent::Page {messages:vec![reply.clone()],next_cursor:Some("next".into())}))));
+        app.tick();assert_eq!(app.selected().unwrap().text,"sent reply");
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let buffer=terminal.backend().buffer();
+        for (y,name) in [(1,"SAVED"),(2,"SENT"),(3,"MENTIONS"),(4,"THREADS")] {let row:String=(1..20).map(|x|buffer[(x,y)].symbol()).collect();assert!(row.starts_with(name));}
+        let text:String=buffer.content.iter().map(|cell|cell.symbol()).collect();assert!(text.contains("sent reply"));
+        app.apply_sent(generation,true,crate::sent::Page {messages:vec![reply.clone(),older.clone()],next_cursor:None});
+        assert_eq!(app.active_list().unwrap().len(),2);assert_eq!(app.selected().unwrap().id,reply.id);
+        app.on_msg_key(Some(Action::Open));assert!(matches!(app.stack.last(),Some(View::Thread {root:1_000_000,..})));
+        app.on_msg_key(Some(Action::Back));assert!(matches!(app.stack.last(),Some(View::Feed {..})));
+        assert_eq!(app.selected().unwrap().id,reply.id);
+        app.on_msg_key(Some(Action::Back));assert!(app.focus==Focus::Convs);
+        app.apply_sent(generation,false,crate::sent::Page {messages:vec![older.clone()],next_cursor:None});assert!(app.stack.is_empty());
+        app.open_sent();let current=app.sent_generation;
+        app.apply_sent(generation,false,crate::sent::Page {messages:vec![reply],next_cursor:None});assert!(app.active_list().unwrap().msgs.is_empty());
+        app.apply_sent(current,false,crate::sent::Page {messages:vec![older],next_cursor:Some("next".into())});
+        // A failed older-page request preserves the list and cursor for retry.
+        app.job=Some(Job::completed_for_test(JobKind::Sent {generation:current,append:true},Err("offline".into())));app.tick();
+        assert_eq!(app.active_list().unwrap().len(),1);
+        app.api=Some(Arc::new(Client::for_test(|method,params| {
+            assert_eq!(method,"search.messages");assert!(params.contains(&("cursor","next")));
+            Ok(json!({"messages":{"matches":[]}}))
+        })));
+        app.on_msg_key(Some(Action::Down));assert!(matches!(app.job.as_ref().map(|j|&j.kind),Some(JobKind::Sent {append:true,..})));
+        app.on_msg_key(Some(Action::Back));assert!(app.job.is_none());
+        app.on_conv_key(Some(Action::Down));assert_eq!(app.top_section,Some(TopSection::Mentions));
+        app.on_conv_key(Some(Action::Down));assert_eq!(app.top_section,Some(TopSection::Threads));
+        app.on_conv_key(Some(Action::Down));assert_eq!(app.top_section,Some(TopSection::Unreads));
+        app.on_conv_key(Some(Action::Down));assert!(app.top_section.is_none());assert_eq!(app.conv_cursor,0);
+        app.api=None;app.corpus.convs.clear();app.filtered.clear();
+        app.on_conv_key(Some(Action::Last));assert_eq!(app.top_section,Some(TopSection::Unreads));app.on_conv_key(Some(Action::Open));
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        app.escape_home();app.escape_home();assert_eq!(app.top_section,Some(TopSection::Saved));
+    }
+
+    /// THREADS is the fourth top row and opens what Ctrl-T opens: the roots of
+    /// every cached thread the owner took part in or was mentioned in, newest
+    /// reply first. Neither path opens a conversation or moves the sidebar
+    /// cursor; selecting a row still opens that thread.
+    #[test]
+    fn threads_row_and_control_t_open_the_thread_list_without_opening_a_conversation() {
+        let dir = crate::archive::test_dir("threads-row");
+        crate::archive::thread_database(&dir, crate::archive::THREAD_FIXTURE);
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..3 { app.on_conv_key(Some(Action::Down)); }
+        assert_eq!(app.top_section,Some(TopSection::Threads));
+        assert_eq!(TopSection::Threads.label(),"THREADS");
+        let cursor = app.conv_cursor;
+        app.on_conv_key(Some(Action::Open));
+        assert!(matches!(app.stack.last(),Some(View::Threads {..})));
+        assert!(app.open.is_none());
+        assert_eq!(app.conv_cursor,cursor);
+        assert_eq!(app.active_list().unwrap().msgs.iter().map(|m|m.id).collect::<Vec<_>>(),
+            [5_000_000,3_000_000,1_000_000]);
+        assert!(app.status.contains("3 threads you took part in or were mentioned in"));
+        // The list is drawn with no conversation open: the messages pane must
+        // show the roots, not its "select a conversation" hint. State alone
+        // cannot tell the two apart.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        let screen = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, app: &mut App| {
+            terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height).map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(!drawn.contains("select a conversation"), "THREADS list not drawn:\n{drawn}");
+        assert!(drawn.contains("quiet root"));
+        // Each root is drawn as a card headed by its conversation and, with no
+        // reply_users in the fixture, by its own author.
+        assert_eq!(drawn.matches("#one  U").count(), 3, "one card header each:\n{drawn}");
+        // Selecting a row opens that thread over the list, as SAVED and
+        // MENTIONS do, still with no conversation open, and it draws too.
+        app.on_msg_key(Some(Action::Open));
+        assert!(matches!(app.stack.last(),Some(View::Thread {root:5_000_000,..})));
+        assert!(app.open.is_none());
+        assert_eq!(app.selected().unwrap().text,"quiet root");
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(!drawn.contains("select a conversation"), "thread over THREADS not drawn:\n{drawn}");
+        assert!(drawn.contains("quiet root"));
+        // Ctrl-T from the sidebar reaches the same list and leaves the
+        // conversation under the cursor closed.
+        app.escape_home();
+        app.top_section = None;
+        app.conv_cursor = 1;
+        app.on_key(KeyEvent::new(KeyCode::Char('t'),KeyModifiers::CONTROL));
+        assert!(matches!(app.stack.last(),Some(View::Threads {..})));
+        assert!(app.open.is_none());
+        assert_eq!(app.conv_cursor,1);
+        assert_eq!(app.active_list().unwrap().msgs.iter().map(|m|m.id).collect::<Vec<_>>(),
+            [5_000_000,3_000_000,1_000_000]);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Opening UNREADS retires a refresh's pending navigation: the job was
+    /// going to open the conversation it refreshed, and the reader has gone
+    /// somewhere else since. SAVED and SENT retire it the same way.
+    #[test]
+    fn opening_unreads_leaves_a_pending_refresh_with_nowhere_to_navigate() {
+        let dir = crate::archive::test_dir("unreads-refresh");
+        let mut app = unreads_test_app(&dir);
+        let conv = app.corpus.convs.iter().position(|c| c.id == "C3").unwrap();
+        // Without the view, the refresh lands and opens its conversation.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Refresh { conv, before: 0 },
+            Ok(Done::Refreshed),
+        ));
+        app.tick();
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(conv));
+        app.escape_home();
+        // With it, the same job lands quietly and the view survives.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Refresh { conv, before: 0 },
+            Ok(Done::Refreshed),
+        ));
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        app.tick();
+        assert!(matches!(app.stack.last(), Some(View::Unreads { .. })), "the view was replaced");
+        assert!(app.open.is_none(), "the refresh opened a conversation anyway");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card stands for a conversation, not for the one message it leads
+    /// with: deleting that message promotes the next one the card drew and
+    /// takes the header's count down by one. The card goes only when the
+    /// conversation has nothing unread left.
+    #[test]
+    fn deleting_the_message_an_unreads_card_leads_with_promotes_the_next_one() {
+        let dir = crate::archive::test_dir("unreads-delete");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        let card = |app: &App, at: usize| match app.stack.last() {
+            Some(View::Unreads { list, .. }) => (
+                list.cards[at].conversation.clone(),
+                list.cards[at].participants.clone(),
+                list.msgs[at].id,
+                list.cards[at].hidden,
+                list.cards[at].tail.iter().map(|m| m.id).collect::<Vec<_>>(),
+            ),
+            _ => panic!("not the UNREADS view"),
+        };
+        assert_eq!(
+            card(&app, 4),
+            ("#one".into(), "6 unread".into(), 11_000_000, 2,
+                vec![14_000_000, 15_000_000, 16_000_000])
+        );
+        // The lead message goes: the first of the tail leads instead, the
+        // elided count is untouched, and the header counts one fewer.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 11_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(app.active_list().unwrap().len(), 5, "the card was dropped");
+        assert_eq!(
+            card(&app, 4),
+            ("#one".into(), "5 unread".into(), 14_000_000, 2, vec![15_000_000, 16_000_000])
+        );
+        // A message the card only counted comes off the count alone.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 12_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(
+            card(&app, 4),
+            ("#one".into(), "4 unread".into(), 14_000_000, 1, vec![15_000_000, 16_000_000])
+        );
+        // #two draws both of its unread messages: deleting the lead leaves
+        // the other, and deleting that one leaves nothing to stand for.
+        assert_eq!(card(&app, 3), ("#two".into(), "2 unread".into(), 21_000_000, 0, vec![22_000_000]));
+        for id in [21_000_000, 22_000_000] {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C2".into(), root: None },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        }
+        assert_eq!(app.active_list().unwrap().len(), 4, "the emptied card stayed");
+        assert!(match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list.cards.iter().all(|c| c.conversation != "#two"),
+            _ => panic!("not the UNREADS view"),
+        });
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Message ids are Slack timestamps, so two conversations can lead their
+    /// cards with the same one. The delete has to match the channel too, or
+    /// it promotes or drops the wrong card.
+    #[test]
+    fn a_delete_matches_the_channel_as_well_as_the_id() {
+        let dir = crate::archive::test_dir("unreads-collision");
+        crate::archive::channel_database(
+            &dir,
+            &[("C8", "eight", Kind::Channel), ("C9", "nine", Kind::Channel)],
+            &[
+                ("C8", 80, 0, "U1", "eight read"),
+                ("C8", 81, 0, "U2", "eight unread"),
+                ("C9", 80, 0, "U1", "nine read"),
+                ("C9", 81, 0, "U2", "nine unread"),
+            ],
+        );
+        let mut app = mute_test_app();
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        app.merge_conversations(vec![
+            json!({"id":"C8","name":"eight","is_member":true}),
+            json!({"id":"C9","name":"nine","is_member":true}),
+        ]);
+        for conv in app.corpus.convs.iter_mut() {
+            conv.archive = 0;
+            conv.live_only = false;
+        }
+        app.apply_counts(&json!({"channels":[
+            {"id":"C8","has_unreads":true,"last_read":"80.000000","latest":"81.000000"},
+            {"id":"C9","has_unreads":true,"last_read":"80.000000","latest":"81.000000"},
+        ]}));
+        app.apply_filter();
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        // Both cards lead with the same id, in different conversations.
+        let leads = |app: &App| match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list
+                .msgs
+                .iter()
+                .map(|m| (m.channel_id.clone(), m.id))
+                .collect::<Vec<_>>(),
+            _ => panic!("not the UNREADS view"),
+        };
+        assert_eq!(
+            leads(&app),
+            [("C8".to_string(), 81_000_000), ("C9".to_string(), 81_000_000)]
+        );
+        // Deleting #nine's leaves #eight's card exactly as it was.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 81_000_000, cid: "C9".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(leads(&app), [("C8".to_string(), 81_000_000)]);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card counts only the messages between the one it was built to lead
+    /// with and the newest it drew. An older message — already read, deleted
+    /// from the conversation while the view sits in the stack — is one the
+    /// card never stood for, and its count must not move. The lower bound is
+    /// fixed at build: promoting a new lead steps past messages the card is
+    /// still counting.
+    #[test]
+    fn a_message_older_than_a_card_was_built_for_leaves_its_count_alone() {
+        let dir = crate::archive::test_dir("unreads-older");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        let one = |app: &App| match app.stack.last() {
+            Some(View::Unreads { list, .. }) => {
+                (list.msgs[4].id, list.cards[4].hidden, list.cards[4].participants.clone())
+            }
+            _ => panic!("not the UNREADS view"),
+        };
+        assert_eq!(one(&app), (11_000_000, 2, "6 unread".to_string()));
+        // The read message under the card's lead: not one of its unread ones.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 10_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(one(&app), (11_000_000, 2, "6 unread".to_string()));
+        // After a promotion the elided messages are older than the lead, and
+        // deleting one still takes the count down: the bound is the message
+        // the card was built for, not the one it now leads with.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 11_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(one(&app), (14_000_000, 2, "5 unread".to_string()));
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 12_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(one(&app), (14_000_000, 1, "4 unread".to_string()));
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card whose drawn messages are all deleted but which still counts
+    /// messages it did not draw goes back to the archive for them. The
+    /// archive is read-only and deliberately keeps what Slack no longer has,
+    /// so the rebuild leaves out every id deleted since the view opened;
+    /// without that it would hand the deleted messages straight back.
+    #[test]
+    fn a_card_that_still_counts_unread_messages_is_rebuilt_from_the_archive() {
+        let dir = crate::archive::test_dir("unreads-refill");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        let one = |app: &App| match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list.cards.iter().position(|c| c.conversation == "#one")
+                .map(|at| (
+                    list.msgs[at].id,
+                    list.cards[at].hidden,
+                    list.cards[at].tail.iter().map(|m| m.id).collect::<Vec<_>>(),
+                    list.cards[at].participants.clone(),
+                )),
+            _ => panic!("not the UNREADS view"),
+        };
+        // Delete every message the card draws: 11 leads, 14/15/16 are drawn,
+        // and 12/13 are the two it only counts.
+        for id in [11_000_000, 14_000_000, 15_000_000] {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C1".into(), root: None },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        }
+        assert_eq!(one(&app), Some((16_000_000, 2, vec![], "3 unread".to_string())));
+        // The last drawn one goes: the card is rebuilt on the two it counted,
+        // and none of the four deleted messages comes back with them.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 16_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        assert_eq!(one(&app), Some((12_000_000, 0, vec![13_000_000], "2 unread".to_string())));
+        // Those two go too, and now there is nothing unread to stand for.
+        for id in [12_000_000, 13_000_000] {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C1".into(), root: None },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        }
+        assert_eq!(one(&app), None);
+        // A refresh does not resurrect them either: the ledger of what was
+        // deleted outlives the rebuild the view does for itself. Slack still
+        // calls the conversation unread, so a card comes back — but on the
+        // newest message the archive holds that is not one of the deleted
+        // ones, and saying the unread messages are not there.
+        app.on_msg_key(Some(Action::Refresh));
+        assert_eq!(
+            one(&app),
+            Some((10_000_000, 0, vec![], "unread · not in the archive".to_string()))
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card whose unread messages the archive does not hold positions
+    /// nothing, so it leaves whatever `open_conv` reported standing — for a
+    /// conversation only Slack has and no session to fetch it with, that is
+    /// the news the reader needs.
+    #[test]
+    fn a_fallback_card_keeps_the_status_the_conversation_open_reported() {
+        let dir = crate::archive::test_dir("unreads-fallback-status");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        // The second card is #five, which no archive holds.
+        app.on_msg_key(Some(Action::Down));
+        assert_eq!(app.selected().unwrap().channel_id, "C5");
+        app.on_msg_key(Some(Action::Open));
+        assert_eq!(app.status, "not signed in, and this conversation is not cached");
+        assert_eq!(app.corpus.convs[app.open.as_ref().unwrap().conv].id, "C5");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A Slack that answers `conversations.history` from the messages each
+    /// channel holds, the way Slack documents the call: `oldest` and `latest`
+    /// bound the window and are exclusive unless `inclusive` says otherwise,
+    /// `limit` caps the page, the newest messages come back first, and
+    /// `has_more` says the window reaches past the page. Deriving the answer
+    /// from the bounds is what makes an inclusive-boundary or paging
+    /// regression fail here rather than pass on a canned page.
+    ///
+    /// Every call is recorded as `(channel, oldest, latest)`. From call
+    /// `gate_from` on the stub blocks until the returned sender is used, so a
+    /// test can look at a phase while a call is out; `usize::MAX` never
+    /// blocks. Every other method gets the quiet answer the background jobs
+    /// need.
+    #[allow(clippy::type_complexity)]
+    fn unread_slack(
+        history: Vec<(&str, &str, Vec<i64>)>,
+        gate_from: usize,
+    ) -> (
+        Arc<Client>,
+        std::sync::mpsc::Receiver<(String, String, String)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let held: HashMap<String, (String, Vec<i64>)> = history
+            .into_iter()
+            .map(|(cid, text, seconds)| (cid.to_string(), (text.to_string(), seconds)))
+            .collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (asked, seen) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let client = Client::for_test(move |method, params| {
+            if method != "conversations.history" {
+                return Ok(quiet_slack());
+            }
+            let field = |key: &str| {
+                params.iter().find(|(k, _)| *k == key).map(|(_, value)| (*value).to_string())
+            };
+            let channel = field("channel").expect("a channel");
+            let oldest = field("oldest");
+            let latest = field("latest");
+            asked
+                .send((
+                    channel.clone(),
+                    oldest.clone().unwrap_or_default(),
+                    latest.clone().unwrap_or_default(),
+                ))
+                .expect("the test reads the calls");
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= gate_from {
+                let _ = gate.lock().expect("gate").recv();
+            }
+            let inclusive = field("inclusive").as_deref() == Some("true");
+            let limit: usize = field("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
+            let bound = |value: &Option<String>| value.as_ref().and_then(|v| v.parse::<f64>().ok());
+            let (low, high) = (bound(&oldest), bound(&latest));
+            let (text, seconds) = held.get(&channel).cloned().unwrap_or_default();
+            let mut window: Vec<i64> = seconds
+                .into_iter()
+                .filter(|second| {
+                    let second = *second as f64;
+                    low.is_none_or(|low| if inclusive { second >= low } else { second > low })
+                        && high.is_none_or(|high| if inclusive { second <= high } else { second < high })
+                })
+                .collect();
+            window.sort_unstable();
+            let more = window.len() > limit;
+            let page: Vec<serde_json::Value> = window
+                .iter()
+                .rev()
+                .take(limit)
+                .map(|second| json!({"ts": format!("{second}.000000"), "user": "U2",
+                                     "text": format!("{text} {second}")}))
+                .collect();
+            Ok(json!({"ok": true, "messages": page, "has_more": more}))
+        });
+        (Arc::new(client), seen, release)
+    }
+
+    /// The UNREADS view as it stands: one row per card, `(name, header, lead
+    /// id, elided, tail ids)`.
+    fn unread_cards(app: &App) -> Vec<(String, String, i64, i64, Vec<i64>)> {
+        match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list
+                .msgs
+                .iter()
+                .zip(&list.cards)
+                .map(|(message, card)| {
+                    (
+                        card.conversation.clone(),
+                        card.participants.clone(),
+                        message.id,
+                        card.hidden,
+                        card.tail.iter().map(|m| m.id).collect(),
+                    )
+                })
+                .collect(),
+            _ => panic!("not the UNREADS view"),
+        }
+    }
+
+    /// Open UNREADS from the conversation list, the way the fifth top row does.
+    fn open_unreads_row(app: &mut App) {
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 {
+            app.on_conv_key(Some(Action::Down));
+        }
+        app.on_conv_key(Some(Action::Open));
+    }
+
+    fn screen_of(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A signed-in session fetches the unread messages of every fallback card
+    /// from Slack and puts them on the card: the first unread message leads,
+    /// the newest three are the tail, the rest are elided. The cards the
+    /// archive filled are not touched, and nothing fetched reaches an archive.
+    #[test]
+    fn unreads_fills_its_fallback_cards_from_slack() {
+        let dir = crate::archive::test_dir("unreads-live");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        // Each channel holds the message its read marker names as well, which
+        // an exclusive `oldest` must leave out.
+        let (client, calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=45).collect()), ("C6", "six live", (5..=7).collect())],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        // The archive pass first: #six, #five and #four have fallback cards,
+        // and the phase is out for the two of them that have a read marker.
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| (c.0.clone(), c.1.clone())).collect::<Vec<_>>(),
+            vec![
+                ("#six".to_string(), "unread · not in the archive".to_string()),
+                ("#five".to_string(), "unread · not in the archive".to_string()),
+                ("#four".to_string(), "unread · not in the archive".to_string()),
+                ("#two".to_string(), "2 unread".to_string()),
+                ("#one".to_string(), "6 unread".to_string()),
+            ]
+        );
+        // The phase runs behind the progress box `/find` draws, which is
+        // modal over the view it is filling in.
+        assert!(app.scan_running(), "no progress box");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::UnreadFetch));
+        let before = screen_of(&mut app, 100, 44);
+        assert!(before.contains("Esc"), "the box is not drawn:\n{before}");
+        assert!(!before.contains("four live 41"), "{before}");
+        let lines = app.finish_unread_fetch_for_test();
+        // Two fallback cards became ordinary ones on the fetched messages;
+        // the archive's cards and the marker-less one are as they were.
+        let filled = vec![
+            ("#six".to_string(), "2 unread".to_string(), 6_000_000, 0, vec![7_000_000]),
+            ("#five".to_string(), "unread · not in the archive".to_string(), 50_000_000, 0, vec![]),
+            ("#four".to_string(), "5 unread".to_string(), 41_000_000, 1,
+                vec![43_000_000, 44_000_000, 45_000_000]),
+            ("#two".to_string(), "2 unread".to_string(), 21_000_000, 0, vec![22_000_000]),
+            ("#one".to_string(), "6 unread".to_string(), 11_000_000, 2,
+                vec![14_000_000, 15_000_000, 16_000_000]),
+        ];
+        assert_eq!(unread_cards(&app), filled);
+        // One log line per API call, and one call per conversation here.
+        assert!(lines.contains(&"conversations.history #four oldest=40.000000 → 5 messages".to_string()),
+            "{lines:#?}");
+        assert!(lines.contains(&"conversations.history #six oldest=5.000000 → 2 messages".to_string()),
+            "{lines:#?}");
+        let asked: Vec<(String, String, String)> = calls.try_iter().collect();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked.iter().all(|(_, _, latest)| latest.is_empty()), "{asked:?}");
+        // The fetched messages are drawn, the elided one is not, and the read
+        // message the marker names was never asked for.
+        let after = screen_of(&mut app, 100, 44);
+        for drawn in ["four live 41", "four live 43", "four live 45", "six live 6", "six live 7"] {
+            assert!(after.contains(drawn), "{drawn:?} is not on screen:\n{after}");
+        }
+        assert!(!after.contains("four live 42"), "the elided message was drawn:\n{after}");
+        assert!(!after.contains("four live 40"), "the message at the marker was fetched:\n{after}");
+        assert!(after.contains("#four  5 unread"), "{after}");
+        assert!(app.status.contains("2 of 2 cards filled in from Slack"), "{}", app.status);
+        // Nothing was written to the archive: it still stops where it did.
+        let archive = &app.corpus.archives[0];
+        assert_eq!(archive.timeline_count("C4").unwrap(), 1);
+        assert_eq!(archive.timeline_count("C6").unwrap(), 1);
+        // `r` runs both phases again: the view is rebuilt from the archive,
+        // which puts the fallback cards back, and Slack is asked afresh.
+        app.on_msg_key(Some(Action::Refresh));
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+            ["unread · not in the archive", "unread · not in the archive",
+             "unread · not in the archive", "2 unread", "6 unread"]
+        );
+        app.finish_unread_fetch_for_test();
+        assert_eq!(unread_cards(&app), filled);
+        assert_eq!(calls.try_iter().count(), 2, "the rerun asked a different number of times");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A conversation whose read marker Slack has never reported has no
+    /// `oldest` to fetch from, so the phase leaves it alone and its card
+    /// stands as the archive built it.
+    #[test]
+    fn a_conversation_with_no_read_marker_is_not_fetched() {
+        let dir = crate::archive::test_dir("unreads-live-no-marker");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let five = app.corpus.convs.iter().position(|c| c.id == "C5").unwrap();
+        assert_eq!(app.corpus.convs[five].last_read, 0, "the fixture gave #five a marker");
+        let (client, calls, _release) = unread_slack(
+            vec![
+                ("C4", "four live", (41..=42).collect()),
+                ("C5", "five live", (51..=52).collect()),
+                ("C6", "six live", (6..=7).collect()),
+            ],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        app.finish_unread_fetch_for_test();
+        let asked: Vec<String> = calls.try_iter().map(|(channel, _, _)| channel).collect();
+        assert_eq!(asked, ["C6", "C4"], "the marker-less conversation was fetched");
+        let cards = unread_cards(&app);
+        assert_eq!(cards[1].0, "#five");
+        assert_eq!(cards[1].1, "unread · not in the archive");
+        assert_eq!(cards[1].2, 50_000_000, "the placeholder was replaced");
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(!screen.contains("five live"), "{screen}");
+        assert!(screen.contains("not cached; open the conversation to load it from Slack"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Paging follows `has_more`, not a page coming back full, and each page
+    /// walks `latest` back while `oldest` stays at the marker. The walk that
+    /// reaches the marker has the whole unread run, so the header is a plain
+    /// count and the lead is the conversation's first unread message.
+    #[test]
+    fn the_unread_fetch_pages_until_slack_says_there_is_no_more() {
+        let dir = crate::archive::test_dir("unreads-live-pages");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let four = app.corpus.convs.iter().position(|c| c.id == "C4").unwrap();
+        app.corpus.convs[four].unread_count = Some(150);
+        let (client, calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=240).collect()), ("C6", "six live", vec![6])],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        let lines = app.finish_unread_fetch_for_test();
+        assert_eq!(
+            calls.try_iter().collect::<Vec<_>>(),
+            vec![
+                ("C6".to_string(), "5.000000".to_string(), String::new()),
+                ("C4".to_string(), "40.000000".to_string(), String::new()),
+                // The second page walks back from the oldest of the first;
+                // the marker it counts from does not move.
+                ("C4".to_string(), "40.000000".to_string(), "141.000000".to_string()),
+            ],
+            "the paging is wrong"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("#four")).collect::<Vec<_>>(),
+            [
+                "conversations.history #four oldest=40.000000 → 100 messages",
+                "conversations.history #four oldest=40.000000 → 100 messages",
+            ]
+        );
+        // Both pages are on one card: the oldest message leads and the newest
+        // three are the tail, whichever page each came from. Slack's count of
+        // 150 is stale and the walk reached the marker, so what came back is
+        // what the header says.
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "200 unread".to_string(), 41_000_000, 196,
+                vec![238_000_000, 239_000_000, 240_000_000])
+        );
+        // A single short page is a whole answer when Slack says so.
+        assert_eq!(unread_cards(&app)[0].1, "1 unread");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Slack is free to answer with fewer rows than the limit and still have
+    /// more behind them — it applies the limit before dropping the rows the
+    /// call does not return. A fetch that read a short page as the end of the
+    /// run would report those few messages as the whole unread run, so the
+    /// walk goes on while `has_more` says to, whatever the page's size.
+    #[test]
+    fn a_short_page_with_has_more_is_not_the_whole_unread_run() {
+        let dir = crate::archive::test_dir("unreads-live-short-page");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let four = app.corpus.convs.iter().position(|c| c.id == "C4").unwrap();
+        app.corpus.convs[four].unread_count = Some(150);
+        // What Slack answers for #four, call after call: a short page that
+        // says there is more, then a shorter one that says there is not.
+        let script = std::sync::Mutex::new(vec![
+            (191..=240, true),
+            (151..=190, false),
+        ]);
+        let (asked, calls) = std::sync::mpsc::channel();
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            if method != "conversations.history" {
+                return Ok(quiet_slack());
+            }
+            let field = |key: &str| {
+                params.iter().find(|(k, _)| *k == key).map_or(String::new(), |(_, v)| (*v).to_string())
+            };
+            let channel = field("channel");
+            asked.send((channel.clone(), field("oldest"), field("latest"))).expect("read");
+            if channel != "C4" {
+                return Ok(json!({"ok": true, "has_more": false, "messages": []}));
+            }
+            let mut script = script.lock().expect("script");
+            if script.is_empty() {
+                panic!("#four was asked a third time");
+            }
+            let (seconds, more) = script.remove(0);
+            let messages: Vec<serde_json::Value> = seconds
+                .rev()
+                .map(|second| json!({"ts": format!("{second}.000000"), "user": "U2",
+                                     "text": format!("four live {second}")}))
+                .collect();
+            Ok(json!({"ok": true, "has_more": more, "messages": messages}))
+        })));
+        open_unreads_row(&mut app);
+        let lines = app.finish_unread_fetch_for_test();
+        assert_eq!(
+            calls.try_iter().filter(|(channel, _, _)| channel == "C4").collect::<Vec<_>>(),
+            vec![
+                ("C4".to_string(), "40.000000".to_string(), String::new()),
+                ("C4".to_string(), "40.000000".to_string(), "191.000000".to_string()),
+            ],
+            "a short page ended the walk"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("#four")).collect::<Vec<_>>(),
+            [
+                "conversations.history #four oldest=40.000000 → 50 messages",
+                "conversations.history #four oldest=40.000000 → 40 messages",
+            ]
+        );
+        // Both pages on one card, and the walk reached the marker, so the
+        // header is the count of what came back rather than Slack's stale 150.
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "90 unread".to_string(), 151_000_000, 86,
+                vec![238_000_000, 239_000_000, 240_000_000])
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The page cap stops a very long unread run short of the marker. What
+    /// came back is then a window of the newest unread messages, not the run:
+    /// the header carries Slack's count and says how many of them the card
+    /// holds, so the message it leads with is not read as the first unread.
+    #[test]
+    fn a_run_longer_than_the_page_cap_says_how_much_of_it_was_fetched() {
+        let dir = crate::archive::test_dir("unreads-live-truncated");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let four = app.corpus.convs.iter().position(|c| c.id == "C4").unwrap();
+        app.corpus.convs[four].unread_count = Some(400);
+        let (client, calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=440).collect()), ("C6", "six live", vec![6])],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        let lines = app.finish_unread_fetch_for_test();
+        // Three pages of a hundred and no fourth: the cap, not the marker.
+        let asked: Vec<(String, String, String)> = calls.try_iter().collect();
+        assert_eq!(
+            asked.iter().filter(|(channel, _, _)| channel == "C4").collect::<Vec<_>>(),
+            vec![
+                &("C4".to_string(), "40.000000".to_string(), String::new()),
+                &("C4".to_string(), "40.000000".to_string(), "341.000000".to_string()),
+                &("C4".to_string(), "40.000000".to_string(), "241.000000".to_string()),
+            ]
+        );
+        assert_eq!(lines.iter().filter(|line| line.contains("#four")).count(), 3, "{lines:#?}");
+        // The header is Slack's count with the fetched share beside it, and
+        // the lead is the oldest of the window — 141, not the first unread
+        // message at 41, which the fetch never reached.
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "400 unread · newest 300 fetched".to_string(), 141_000_000, 396,
+                vec![438_000_000, 439_000_000, 440_000_000])
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("#four  400 unread · newest 300 fetched"), "{screen}");
+        assert!(!screen.contains("four live 41 "), "the unreached first unread was drawn:\n{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The page cap can also stop the walk on Slack's own count, with as many
+    /// messages fetched as it claims are unread. The marker was still not
+    /// reached, so the card holds a window and says so: the count is a floor,
+    /// not a total, and the `+` is what says it.
+    #[test]
+    fn a_walk_stopped_on_slacks_count_says_the_count_is_a_floor() {
+        let dir = crate::archive::test_dir("unreads-live-floor");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let four = app.corpus.convs.iter().position(|c| c.id == "C4").unwrap();
+        // Slack says a hundred; the conversation really holds two hundred.
+        app.corpus.convs[four].unread_count = Some(100);
+        let (client, calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=240).collect()), ("C6", "six live", vec![6])],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        app.finish_unread_fetch_for_test();
+        // One page covered the count, so no second went out — and the walk
+        // never reached the marker.
+        assert_eq!(
+            calls.try_iter().filter(|(channel, _, _)| channel == "C4").count(),
+            1,
+            "the count stop did not hold"
+        );
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "100+ unread · newest 100 fetched".to_string(), 141_000_000, 96,
+                vec![238_000_000, 239_000_000, 240_000_000])
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("#four  100+ unread · newest 100 fetched"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card draws four of the messages fetched for it and counts the rest,
+    /// so deleting the drawn ones has to reach the ones it only counted. The
+    /// archive cannot supply them — it never held them, which is why they
+    /// were fetched — so the view keeps the whole run and rebuilds from that.
+    #[test]
+    fn deleting_a_fetched_cards_drawn_messages_rebuilds_it_from_the_fetched_run() {
+        let dir = crate::archive::test_dir("unreads-live-refill");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        // The archive stops at 40; everything past it comes from Slack.
+        let (client, _calls, _release) = unread_slack(
+            vec![("C4", "four live", (40..=45).collect()), ("C6", "six live", vec![6])],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        app.finish_unread_fetch_for_test();
+        let four = |app: &App| {
+            unread_cards(app).into_iter().find(|card| card.0 == "#four")
+                .map(|(_, header, lead, hidden, tail)| (header, lead, hidden, tail))
+        };
+        // 41 leads, 42 is only counted, 43/44/45 are the tail.
+        assert_eq!(
+            four(&app),
+            Some(("5 unread".to_string(), 41_000_000, 1, vec![43_000_000, 44_000_000, 45_000_000]))
+        );
+        let delete = |app: &mut App, id: i64| {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C4".into(), root: None },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        };
+        // Each drawn message in turn; the next one the card drew leads.
+        delete(&mut app, 41_000_000);
+        assert_eq!(
+            four(&app),
+            Some(("4 unread".to_string(), 43_000_000, 1, vec![44_000_000, 45_000_000]))
+        );
+        delete(&mut app, 43_000_000);
+        assert_eq!(four(&app), Some(("3 unread".to_string(), 44_000_000, 1, vec![45_000_000])));
+        delete(&mut app, 44_000_000);
+        assert_eq!(four(&app), Some(("2 unread".to_string(), 45_000_000, 1, vec![])));
+        // Nothing drawn is left, and 42 is still unread: the card is rebuilt
+        // on it rather than dropped, which is what the archive would force.
+        delete(&mut app, 45_000_000);
+        assert_eq!(four(&app), Some(("1 unread".to_string(), 42_000_000, 0, vec![])));
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("four live 42"), "{screen}");
+        assert!(!screen.contains("four live 41"), "a deleted message came back:\n{screen}");
+        // Only when the last one goes does the card, the conversation having
+        // nothing unread left to stand for.
+        delete(&mut app, 42_000_000);
+        assert_eq!(four(&app), None, "the emptied card stayed");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The three-page cap is a cap on requests, not on pages that carried
+    /// something. Slack can answer with an empty page and a fresh cursor
+    /// indefinitely; reading through those inside one call would put a
+    /// hundred requests between two chances to give up, and Esc reaches the
+    /// phase only between them.
+    #[test]
+    fn empty_pages_with_fresh_cursors_cost_three_requests_and_no_more() {
+        let dir = crate::archive::test_dir("unreads-live-cursors");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (asked, seen) = std::sync::mpsc::channel();
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            if method != "conversations.history" {
+                return Ok(quiet_slack());
+            }
+            let nth = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let channel = params.iter().find(|(k, _)| *k == "channel").expect("a channel").1;
+            asked.send(channel.to_string()).expect("the test reads the calls");
+            // Nothing in this answer says stop.
+            Ok(json!({"ok": true, "has_more": true, "messages": [],
+                      "response_metadata": {"next_cursor": format!("cursor-{nth}")}}))
+        })));
+        open_unreads_row(&mut app);
+        let lines = app.finish_unread_fetch_for_test();
+        let mut per_channel: HashMap<String, usize> = HashMap::new();
+        for channel in seen.try_iter() {
+            *per_channel.entry(channel).or_default() += 1;
+        }
+        assert_eq!(per_channel.get("C4"), Some(&3), "{per_channel:?}");
+        assert_eq!(per_channel.get("C6"), Some(&3), "{per_channel:?}");
+        // One narration per request, which is where a cancel is noticed.
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("#four oldest=40.000000 → 0 messages")).count(),
+            3,
+            "{lines:#?}"
+        );
+        // Nothing came back, so every fallback card stands as it was.
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+            ["unread · not in the archive", "unread · not in the archive",
+             "unread · not in the archive", "2 unread", "6 unread"]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A message deleted from Slack while the call was out comes back in the
+    /// answer, Slack having replied from before the delete. The view's ledger
+    /// is the only record that it went, so the fetched messages are filtered
+    /// against it before they reach the card.
+    #[test]
+    fn a_message_deleted_while_the_call_was_out_stays_off_the_card() {
+        let dir = crate::archive::test_dir("unreads-live-deleted");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        // #six is asked first and answers; #four's call is the one held open.
+        let (client, _calls, release) = unread_slack(
+            vec![("C4", "four live", (40..=45).collect()), ("C6", "six live", (5..=7).collect())],
+            2,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.unread_fetch.as_ref().is_some_and(|phase| phase.replaced == 0)
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.unread_fetch.as_ref().map(|phase| phase.replaced), Some(1));
+        // One of the messages the held call is about is deleted meanwhile.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 43_000_000, cid: "C4".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        release.send(()).unwrap();
+        app.finish_unread_fetch_for_test();
+        assert_eq!(
+            unread_cards(&app)[2],
+            ("#four".to_string(), "4 unread".to_string(), 41_000_000, 0,
+                vec![42_000_000, 44_000_000, 45_000_000])
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(!screen.contains("four live 43"), "the deleted message came back:\n{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The two phases share one progress box and one job slot, so a job that
+    /// lands after its own box is gone must not touch the box a later phase
+    /// opened: closing it drops the channel the running worker narrates
+    /// through, and the phase stops mid-call.
+    #[test]
+    fn a_late_search_does_not_close_the_unread_fetch_box() {
+        let dir = crate::archive::test_dir("unreads-live-overlay");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let (release_search, search_gate) = std::sync::mpsc::channel::<()>();
+        let (release_history, history_gate) = std::sync::mpsc::channel::<()>();
+        let search_gate = std::sync::Mutex::new(search_gate);
+        let history_gate = std::sync::Mutex::new(history_gate);
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            match method {
+                "search.messages" => {
+                    let _ = search_gate.lock().expect("gate").recv();
+                    Ok(json!({"messages": {"matches": []}}))
+                }
+                "conversations.history" => {
+                    let _ = history_gate.lock().expect("gate").recv();
+                    let channel = params.iter().find(|(k, _)| *k == "channel").expect("a channel").1;
+                    Ok(json!({"ok": true, "has_more": false, "messages": [
+                        {"ts": "99.000000", "user": "U2", "text": format!("{channel} live")}]}))
+                }
+                _ => Ok(quiet_slack()),
+            }
+        })));
+        // The archive half of a `/find` lands and the Slack half goes out.
+        app.run_command("/find message: unread", "");
+        app.finish_archive_scan_for_test();
+        assert!(app.job.is_some(), "the Slack half never started");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::Search));
+        // Esc dismisses the box; the search itself is still out.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.scan_overlay.is_none() && app.job.is_some());
+        // UNREADS opens over the search view and takes the box for itself.
+        app.focus = Focus::Convs;
+        open_unreads_row(&mut app);
+        assert!(app.unread_fetch.is_some() && app.scan.is_some());
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::UnreadFetch));
+        // Now the abandoned search finishes.
+        release_search.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.job.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.job.is_none(), "the search never landed");
+        assert!(app.scan_running(), "the search closed the unread fetch's box");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::UnreadFetch));
+        assert!(app.unread_fetch.is_some(), "the search stopped the unread fetch");
+        // And the phase runs on to its end.
+        for _ in 0..4 {
+            let _ = release_history.send(());
+        }
+        app.finish_unread_fetch_for_test();
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+            ["1 unread", "unread · not in the archive", "1 unread", "2 unread", "6 unread"]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The navigation-generation rule: a page that lands after the reader has
+    /// left the view lands nowhere. The stack it would have written to is not
+    /// there any more, and nothing is pushed in its place.
+    #[test]
+    fn leaving_unreads_before_the_fetch_lands_leaves_the_stack_alone() {
+        let dir = crate::archive::test_dir("unreads-live-abandoned");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        let (client, _calls, release) = unread_slack(
+            vec![("C4", "four live", (41..=42).collect()), ("C6", "six live", (6..=7).collect())],
+            1,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        assert!(app.unread_fetch.is_some() && app.scan.is_some(), "the phase never started");
+        // Gone home while the first call is out.
+        app.go_home();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.unread_fetch.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.unread_fetch.is_none(), "the phase outlived the view");
+        assert!(app.stack.is_empty(), "the fetch pushed a view over the home screen");
+        assert!(app.open.is_none());
+        assert!(app.scan_overlay.is_none(), "the box outlived the view");
+        let screen = screen_of(&mut app, 100, 30);
+        assert!(!screen.contains("four live"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Esc abandons the phase where it stands: the cards it had already
+    /// replaced keep the messages it fetched, and the conversations it had
+    /// not reached keep their fallback cards.
+    #[test]
+    fn esc_during_the_unread_fetch_keeps_the_cards_already_replaced() {
+        let dir = crate::archive::test_dir("unreads-live-esc");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        // The second call blocks, so exactly one conversation is answered.
+        let (client, _calls, _release) = unread_slack(
+            vec![("C4", "four live", (41..=42).collect()), ("C6", "six live", (6..=7).collect())],
+            2,
+        );
+        app.api = Some(client);
+        open_unreads_row(&mut app);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.unread_fetch.as_ref().is_some_and(|phase| phase.replaced == 0)
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.unread_fetch.as_ref().map(|phase| phase.replaced), Some(1),
+            "the first conversation never landed");
+        // The box is modal: Esc is the one key that reaches the phase.
+        assert!(app.scan_running());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.unread_fetch.is_none() && app.scan.is_none() && app.scan_overlay.is_none());
+        assert!(app.status.contains("unread fetch abandoned; 1 card filled in"), "{}", app.status);
+        // The view is still there, with the one replaced card and the rest
+        // exactly as the archive pass drew them.
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| (c.0.clone(), c.1.clone())).collect::<Vec<_>>(),
+            vec![
+                ("#six".to_string(), "2 unread".to_string()),
+                ("#five".to_string(), "unread · not in the archive".to_string()),
+                ("#four".to_string(), "unread · not in the archive".to_string()),
+                ("#two".to_string(), "2 unread".to_string()),
+                ("#one".to_string(), "6 unread".to_string()),
+            ]
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("six live 6") && screen.contains("six live 7"), "{screen}");
+        assert!(screen.contains("#four  unread · not in the archive"), "{screen}");
+        assert!(!screen.contains("four live"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A rate-limit reply stops the phase with a status line, and every
+    /// conversation it had not reached keeps the card the archive drew.
+    #[test]
+    fn a_rate_limited_reply_stops_the_unread_fetch() {
+        let dir = crate::archive::test_dir("unreads-live-ratelimit");
+        let mut app = unreads_test_app(&dir);
+        app.live = true;
+        app.api = Some(Arc::new(Client::for_test(|method, _| {
+            if method != "conversations.history" {
+                return Ok(quiet_slack());
+            }
+            Err("conversations.history: ratelimited".to_string())
+        })));
+        open_unreads_row(&mut app);
+        app.finish_unread_fetch_for_test();
+        assert!(app.status.contains("ratelimited"), "{}", app.status);
+        assert!(app.status.contains("2 cards left"), "{}", app.status);
+        assert_eq!(
+            unread_cards(&app).iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+            [
+                "unread · not in the archive",
+                "unread · not in the archive",
+                "unread · not in the archive",
+                "2 unread",
+                "6 unread",
+            ]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The unread cases, one conversation each: a long unread run, a short
+    /// one, a read channel, a conversation whose unread messages the archive
+    /// does not hold, one no archive holds at all, one whose newest cached
+    /// message is far behind what Slack reports, and a muted one.
+    fn unreads_test_app(dir: &std::path::Path) -> App {
+        crate::archive::channel_database(
+            dir,
+            &[
+                ("C1", "one", Kind::Channel),
+                ("C2", "two", Kind::Channel),
+                ("C3", "three", Kind::Channel),
+                ("C4", "four", Kind::Channel),
+                ("C6", "six", Kind::Channel),
+                ("C7", "loud", Kind::Channel),
+            ],
+            &[
+                // #one: read through 10, then six unread messages.
+                ("C1", 10, 0, "U1", "one read"),
+                ("C1", 11, 0, "U2", "one unread first"),
+                ("C1", 12, 0, "U2", "one unread second"),
+                ("C1", 13, 0, "U2", "one unread third"),
+                ("C1", 14, 0, "U2", "one unread fourth"),
+                ("C1", 15, 0, "U2", "one unread fifth"),
+                ("C1", 16, 0, "U2", "one unread sixth"),
+                // #two: two unread, both newer than #one's newest.
+                ("C2", 20, 0, "U1", "two read"),
+                ("C2", 21, 0, "U3", "two unread first"),
+                ("C2", 22, 0, "U3", "two unread second"),
+                // #three is read through its newest message.
+                ("C3", 30, 0, "U1", "three read"),
+                // #four is unread on Slack and the archive stops short of it.
+                ("C4", 40, 0, "U1", "four stale"),
+                // #six the same, but its newest cached message is ancient
+                // while Slack says the conversation is the freshest of all.
+                ("C6", 5, 0, "U1", "six ancient"),
+                // #loud is muted, with unread messages the archive holds.
+                ("C7", 70, 0, "U1", "loud read"),
+                ("C7", 71, 0, "U2", "loud unread"),
+            ],
+        );
+        let mut app = mute_test_app();
+        app.corpus.archives.push(Archive::open("test".into(), dir).unwrap());
+        app.merge_conversations(vec![
+            json!({"id":"C1","name":"one","is_member":true,"has_unreads":true,
+                   "last_read":"10.000000","latest":"16.000000"}),
+            json!({"id":"C2","name":"two","is_member":true,"has_unreads":true,
+                   "last_read":"20.000000","latest":"22.000000"}),
+            json!({"id":"C3","name":"three","is_member":true,"latest":"30.000000"}),
+            json!({"id":"C4","name":"four","is_member":true,"has_unreads":true,
+                   "last_read":"40.000000","latest":"45.000000"}),
+            json!({"id":"C5","name":"five","is_member":true,"has_unreads":true,
+                   "latest":"50.000000"}),
+            json!({"id":"C6","name":"six","is_member":true,"has_unreads":true,
+                   "last_read":"5.000000","latest":"60.000000"}),
+            json!({"id":"C7","name":"loud","is_member":true,"has_unreads":true,
+                   "last_read":"70.000000","latest":"71.000000"}),
+        ]);
+        for conv in app.corpus.convs.iter_mut() {
+            conv.archive = 0;
+            conv.live_only = conv.id == "C5";
+        }
+        // The read markers and the unread flags come from Slack's counts, the
+        // way a signed-in session gets them.
+        app.apply_counts(&json!({"channels":[
+            {"id":"C1","has_unreads":true,"last_read":"10.000000","latest":"16.000000"},
+            {"id":"C2","has_unreads":true,"last_read":"20.000000","latest":"22.000000"},
+            {"id":"C3","has_unreads":false,"last_read":"30.000000","latest":"30.000000"},
+            {"id":"C4","has_unreads":true,"last_read":"40.000000","latest":"45.000000"},
+            {"id":"C5","has_unreads":true,"latest":"50.000000"},
+            {"id":"C6","has_unreads":true,"last_read":"5.000000","latest":"60.000000"},
+            {"id":"C7","has_unreads":true,"last_read":"70.000000","latest":"71.000000"},
+        ]}));
+        app.muted.insert("C7".to_string());
+        app.apply_filter();
+        app
+    }
+
+    /// UNREADS is the fifth top row and draws one card per conversation with
+    /// unread messages, newest unread message first: the conversation and its
+    /// count, the first unread message, the ones between elided, and the
+    /// newest of them.
+    #[test]
+    fn the_unreads_row_cards_every_unread_conversation_newest_unread_first() {
+        let dir = crate::archive::test_dir("unreads-cards");
+        let mut app = unreads_test_app(&dir);
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        assert_eq!(app.top_section, Some(TopSection::Unreads));
+        assert_eq!(TopSection::Unreads.label(), "UNREADS");
+        assert_eq!(TopSection::ALL.len(), 5);
+        let cursor = app.conv_cursor;
+        app.on_conv_key(Some(Action::Open));
+        assert!(matches!(app.stack.last(), Some(View::Unreads { .. })));
+        // It opens no conversation and leaves the sidebar cursor alone.
+        assert!(app.open.is_none());
+        assert_eq!(app.conv_cursor, cursor);
+        // Newest first, and for a card whose unread messages the archive does
+        // not hold, newest is what Slack last reported: #six's own cached
+        // message is the oldest thing on screen and its card is still first,
+        // because Slack puts the conversation at 60. Then #five at 50, #four
+        // at 45, #two's newest unread at 22 and #one's at 16. #three is read
+        // and #loud is muted: neither has a card.
+        let cards: Vec<(String, i64, i64, Vec<i64>)> = match app.stack.last() {
+            Some(View::Unreads { list, .. }) => list
+                .msgs
+                .iter()
+                .zip(&list.cards)
+                .map(|(m, c)| {
+                    (c.conversation.clone(), m.id, c.hidden, c.tail.iter().map(|t| t.id).collect())
+                })
+                .collect(),
+            _ => panic!("not the UNREADS view"),
+        };
+        assert_eq!(
+            cards,
+            vec![
+                ("#six".to_string(), 5_000_000, 0, vec![]),
+                ("#five".to_string(), 50_000_000, 0, vec![]),
+                ("#four".to_string(), 40_000_000, 0, vec![]),
+                ("#two".to_string(), 21_000_000, 0, vec![22_000_000]),
+                // Six unread: the first, the newest three, and two elided.
+                ("#one".to_string(), 11_000_000, 2,
+                    vec![14_000_000, 15_000_000, 16_000_000]),
+            ]
+        );
+        assert!(app.status.contains("5 conversations with unread messages"), "{}", app.status);
+        assert!(app.title().starts_with("UNREADS · 5 conversations"), "{}", app.title());
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 44)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string())
+            .collect();
+        let screen = rows.join("\n");
+        let row_of = |needle: &str| {
+            rows.iter().position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{screen}"))
+        };
+        // The card of the long run: header with the count, the first unread,
+        // the elision, and the newest three. The two between are not drawn.
+        assert!(row_of("#one  6 unread") < row_of("one unread first"), "{screen}");
+        assert!(row_of("one unread first") < row_of("… 2 more"), "{screen}");
+        assert!(row_of("… 2 more") < row_of("one unread fourth"), "{screen}");
+        assert!(row_of("one unread fourth") < row_of("one unread fifth"), "{screen}");
+        assert!(row_of("one unread fifth") < row_of("one unread sixth"), "{screen}");
+        for elided in ["one unread second", "one unread third"] {
+            assert!(!screen.contains(elided), "{elided:?} should be elided:\n{screen}");
+        }
+        // The short run is drawn whole, with no elision line.
+        assert!(row_of("#two  2 unread") < row_of("two unread first"), "{screen}");
+        assert!(!rows[row_of("two unread first")..row_of("two unread second")]
+            .iter().any(|row| row.contains('…')), "a two-message run is elided:\n{screen}");
+        // The read channel has no card at all, and neither has the muted one:
+        // the muted block is where the alert channels sit and their counts
+        // would bury every card worth reading.
+        assert!(!screen.contains("#three"), "{screen}");
+        assert!(!screen.contains("#loud"), "{screen}");
+        assert!(!screen.contains("loud unread"), "{screen}");
+        // The stale conversation says the messages are not cached and draws
+        // the newest message the archive does hold; the conversation no
+        // archive holds draws a note in place of a message.
+        assert!(row_of("#four  unread · not in the archive") < row_of("four stale"), "{screen}");
+        assert!(screen.contains("#five  unread · not in the archive"), "{screen}");
+        assert!(screen.contains("not cached; open the conversation to load it from Slack"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `Enter` on a card opens that conversation at its first unread message,
+    /// the way opening a mention does; `r` re-reads the unread state.
+    #[test]
+    fn enter_on_an_unreads_card_opens_the_conversation_at_its_first_unread() {
+        let dir = crate::archive::test_dir("unreads-open");
+        let mut app = unreads_test_app(&dir);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        // Down to the card of #one, whose unread run is the long one.
+        for _ in 0..4 { app.on_msg_key(Some(Action::Down)); }
+        assert_eq!(app.selected().unwrap().id, 11_000_000);
+        app.on_msg_key(Some(Action::Open));
+        assert!(app.stack.is_empty(), "the view is left behind");
+        let open = app.open.as_ref().expect("a conversation is open");
+        assert_eq!(app.corpus.convs[open.conv].id, "C1");
+        assert_eq!(app.conv_cursor, app.filtered.iter().position(|&i| i == open.conv).unwrap());
+        assert_eq!(app.selected().unwrap().id, 11_000_000);
+        assert_eq!(app.selected().unwrap().text, "one unread first");
+        assert_eq!(app.focus, Focus::Msgs);
+        assert!(app.top_section.is_none());
+        assert!(app.status.contains("#one at the first unread message"), "{}", app.status);
+
+        // Back to UNREADS and refresh: the read marker has not moved, so the
+        // same four cards come back, in place rather than stacked.
+        app.escape_home();
+        assert!(app.stack.is_empty() && app.open.is_none() && app.focus == Focus::Convs);
+        app.on_conv_key(Some(Action::First));
+        for _ in 0..4 { app.on_conv_key(Some(Action::Down)); }
+        app.on_conv_key(Some(Action::Open));
+        app.on_msg_key(Some(Action::Refresh));
+        assert_eq!(app.stack.len(), 1);
+        assert!(matches!(app.stack.last(), Some(View::Unreads { .. })));
+        assert_eq!(app.active_list().unwrap().len(), 5);
+        // Reading #two moves its marker; the refresh drops its card.
+        let two = app.corpus.convs.iter().position(|c| c.id == "C2").unwrap();
+        app.corpus.convs[two].unread = false;
+        app.on_msg_key(Some(Action::Reload));
+        assert_eq!(app.stack.len(), 1);
+        assert_eq!(app.active_list().unwrap().len(), 4);
+        assert_eq!(
+            match app.stack.last() {
+                Some(View::Unreads { list, .. }) =>
+                    list.cards.iter().map(|c| c.conversation.clone()).collect::<Vec<_>>(),
+                _ => panic!("not the UNREADS view"),
+            },
+            ["#six", "#five", "#four", "#one"]
+        );
+        // Esc leaves the view for the list, with no conversation opened.
+        app.on_msg_key(Some(Action::Close));
+        assert!(app.stack.is_empty(), "the view is still stacked");
+        assert!(app.open.is_none());
+        assert_eq!(app.focus, Focus::Convs);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Four threads for the card tests: six replies, exactly one, none at all,
+    /// and one whose root carries no `reply_users`. The ids order the cards
+    /// newest reply first, so they come out 50, 40, 30, 10.
+    const CARD_FIXTURE: &[(i64, i64, &str, &str)] = &[
+        (50, 50, "U1", "root with six"),
+        (51, 50, "U2", "reply one"),
+        (52, 50, "U3", "reply two"),
+        (53, 50, "U4", "reply three"),
+        (54, 50, "U5", "reply four"),
+        (55, 50, "U6", "reply five"),
+        (56, 50, "U2", "freshest answer"),
+        (40, 40, "U1", "root with one"),
+        (41, 40, "U2", "the only reply"),
+        (30, 30, "U1", "unanswered root"),
+        (10, 10, "U1", "root without reply users"),
+        (11, 10, "U2", "unnamed alpha"),
+        (12, 10, "U2", "unnamed omega"),
+    ];
+
+    /// THREADS draws Slack's Threads screen: one card per thread, headed by
+    /// the conversation and its participants, then the thread's first message,
+    /// a count of the replies between, and the newest reply. No day dividers,
+    /// a blank line between cards, and the cursor selects a whole card.
+    #[test]
+    fn each_thread_draws_as_a_card_with_its_first_and_last_message() {
+        let dir = crate::archive::test_dir("threads-cards");
+        crate::archive::thread_database(&dir, CARD_FIXTURE);
+        crate::archive::set_message_data(&dir, 50,
+            json!({"reply_count":6,"reply_users":["U2","U3","U4","U9"],"reply_users_count":5}));
+        crate::archive::set_message_data(&dir, 40,
+            json!({"reply_count":1,"reply_users":["U2"],"reply_users_count":1}));
+        // The root nobody answered, and the root Slack sent no participants
+        // for: both fall back to naming their author.
+        crate::archive::set_message_data(&dir, 10, json!({"reply_count":2}));
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        let names = [("U1","ann"),("U2","bea"),("U3","cyd"),("U4","dee"),("U5","eve"),("U6","fay")];
+        // The card's participants line resolves through the archive it was
+        // built from; the message headers resolve through the corpus, which
+        // `Corpus::open` fills from the archive with the most users.
+        app.corpus.archives[0].adopt_users(Arc::new(
+            names.into_iter()
+                .map(|(id, name)| (id.to_string(), crate::archive::User { name: name.to_string(), is_bot: false }))
+                .collect(),
+        ));
+        app.corpus.merge_profiles(names.iter().map(|(id, name)| json!({"id": id, "name": name})).collect());
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(matches!(app.stack.last(), Some(View::Threads { .. })));
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [50_000_000, 40_000_000, 30_000_000, 10_000_000]
+        );
+        assert!(app.title().contains("first and last message"), "{}", app.title());
+
+        // The cards are the whole screen: the conversations pane's own rows
+        // would otherwise be read as rows of a card.
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 44)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string())
+            .collect();
+        let screen = rows.join("\n");
+        let row_of = |needle: &str| {
+            rows.iter().position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{screen}"))
+        };
+        let blank = |row: &String| row.chars().all(|c| c == '│' || c == ' ');
+        // Six replies: header, root, the five between elided, the newest, and
+        // the newest reply's author over it.
+        let head = row_of("#one  bea, cyd, and 3 others");
+        let root = row_of("root with six");
+        let elision = row_of("… 5 more replies");
+        let last = row_of("freshest answer");
+        assert!(head < root && root < elision && elision < last, "card out of order:\n{screen}");
+        assert!(rows[last - 1].contains("bea"), "the last reply names its author:\n{screen}");
+        // Only the newest reply is drawn, not the five before it.
+        for hidden in ["reply one", "reply two", "reply three", "reply four", "reply five"] {
+            assert!(!screen.contains(hidden), "{hidden:?} should be elided:\n{screen}");
+        }
+        // Exactly one reply: no elision line between root and reply. The
+        // trailing space keeps the needle off the first card's header.
+        let one_head = row_of("#one  bea ");
+        let one_root = row_of("root with one");
+        let one_last = row_of("the only reply");
+        assert!(one_head < one_root && one_root < one_last, "second card out of order:\n{screen}");
+        assert!(!rows[one_root + 1..one_last].iter().any(|row| row.contains('…')),
+            "a single reply is elided:\n{screen}");
+        // The two cards whose participants are the root's author alone: the
+        // thread nobody answered, and the root Slack sent no reply_users for.
+        let author_heads: Vec<usize> = rows.iter().enumerate()
+            .filter(|(_, row)| row.contains("#one  ann")).map(|(y, _)| y).collect();
+        assert_eq!(author_heads.len(), 2, "reply_users absent should name the author:\n{screen}");
+        // No replies at all: the header and the root, and nothing under it.
+        let quiet_root = row_of("unanswered root");
+        assert!(author_heads[0] < quiet_root && blank(&rows[quiet_root + 1]),
+            "an unanswered root draws something under it:\n{screen}");
+        // No reply_users, two replies: the second is elided, the newest drawn.
+        assert!(author_heads[1] < row_of("root without reply users"));
+        assert!(row_of("… 1 more reply") < row_of("unnamed omega"));
+        assert!(!screen.contains("unnamed alpha"), "{screen}");
+        // Slack's Threads screen has no day dividers; the only lines a card
+        // list draws that belong to no item would be dividers, and it has none.
+        let list = app.active_list().unwrap();
+        assert!(list.flat.iter().all(|line| line.msg.is_some()), "a divider is in the list");
+        assert!(!screen.contains("1970-01-01 ─"), "a day divider is drawn:\n{screen}");
+        // A blank row above every card but the first, whose own blank the
+        // cursor box has taken for its top edge.
+        for card_head in [one_head, author_heads[0], author_heads[1]] {
+            assert!(blank(&rows[card_head - 1]),
+                "no blank line above the card at row {card_head}:\n{screen}");
+        }
+        assert!(rows[head - 1].contains('╭'), "the selected card is not boxed:\n{screen}");
+
+        // The cursor selects a whole card: down moves to the next thread, and
+        // l opens that one, not the one it started on.
+        assert_eq!(app.selected().unwrap().id, 50_000_000);
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected().unwrap().id, 40_000_000);
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(), Some(View::Thread { root: 40_000_000, .. })), "l opened the wrong thread");
+        assert_eq!(app.selected().unwrap().text, "root with one");
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(), Some(View::Threads { .. })));
+        assert_eq!(app.active_list().unwrap().cursor, 1);
+        assert_eq!(app.selected().unwrap().id, 40_000_000);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An app whose archive holds two of the owner's threads in #one: one
+    /// answered twice and one answered once, the second the more recently.
+    /// The clock is pinned, so the phase's seven-day window is a fixed range
+    /// of fixture timestamps rather than one that moves with the suite: every
+    /// second past 200 is inside it.
+    fn threads_test_app(dir: &std::path::Path) -> App {
+        crate::archive::channel_database(
+            dir,
+            &[("C1", "one", Kind::Channel)],
+            &[
+                ("C1", 300, 300, "U1", "archived root one"),
+                ("C1", 310, 300, "U2", "archived reply one"),
+                ("C1", 380, 300, "U2", "archived reply two"),
+                ("C1", 500, 500, "U1", "archived root two"),
+                ("C1", 520, 500, "U2", "archived reply three"),
+            ],
+        );
+        crate::archive::set_message_data(dir, 300, json!({"reply_count": 2}));
+        crate::archive::set_message_data(dir, 500, json!({"reply_count": 1}));
+        let mut app = mute_test_app();
+        app.clock = Some(605_000);
+        app.cache_dir = dir.join("cache");
+        app.conversations_pane = ConversationsPaneVisibility::AlwaysHidden;
+        app.corpus.me = Some("U1".into());
+        app.corpus.archives.push(Archive::open("test".into(), dir).unwrap());
+        // The same names the archive's own user table carries, so a card the
+        // archive built and a card Slack built name a person the same way.
+        app.corpus.merge_profiles(vec![
+            json!({"id": "U1", "name": "u1"}),
+            json!({"id": "U2", "name": "u2"}),
+        ]);
+        let one = app.corpus.convs.iter().position(|c| c.id == "C1").expect("#one");
+        app.corpus.convs[one].archive = 0;
+        app.corpus.convs[one].live_only = false;
+        app.live = true;
+        app
+    }
+
+    /// The threads the live phase's stub Slack holds, as `(channel, root,
+    /// root text, replies, whether the root carries `latest_reply`)` in whole
+    /// seconds. Slack sends `latest_reply` on every parent that has replies;
+    /// a root without one is the answer the fallback walk exists for.
+    type StubThread = (&'static str, i64, &'static str, Vec<(i64, &'static str)>, bool);
+
+    /// A stub thread whose root carries `latest_reply`, which is what Slack
+    /// answers with.
+    fn stub_thread(
+        cid: &'static str,
+        root: i64,
+        text: &'static str,
+        replies: Vec<(i64, &'static str)>,
+    ) -> StubThread {
+        (cid, root, text, replies, true)
+    }
+    /// One search match the stub answers with: `(query, channel, thread root,
+    /// the match's own timestamp)`, all in whole seconds.
+    type StubMatch = (&'static str, &'static str, i64, i64);
+
+    /// The two live threads every THREADS live test uses, and the archive's
+    /// own newer thread beside them — held by the stub too, so a phase that
+    /// wrongly asked for it would get an answer and draw a second card for
+    /// it, which is a visible failure rather than a silent one.
+    fn live_threads() -> Vec<StubThread> {
+        vec![
+            stub_thread("C9", 400, "live root A", vec![
+                (420, "live A first"),
+                (440, "live A second"),
+                (600, "live A newest"),
+            ]),
+            stub_thread("C9", 210, "live root B", vec![(250, "live B newest")]),
+            stub_thread("C1", 500, "archived root two", vec![(520, "archived reply three")]),
+        ]
+    }
+
+    /// A Slack that answers the THREADS live phase from what each request
+    /// asks for. `search.messages` takes the matches whose query is the one
+    /// asked, sorts them newest first, pages them by the `count` it is given
+    /// and hands back a cursor while any are left; `conversations.replies`
+    /// answers from the threads, honouring `oldest`, `inclusive` and `limit`
+    /// as Slack documents them, with the parent first and counting toward the
+    /// limit. Deriving the answers from the parameters is what makes a
+    /// paging, window or reply-bound regression fail here rather than pass on
+    /// a canned page.
+    ///
+    /// A match names its thread only in its permalink, as Slack's matches do.
+    ///
+    /// Every call is recorded as `(method, what it asked for)`. From call
+    /// `gate_from` on — counting from one — the stub blocks until the
+    /// returned sender is used, so a test can look at the phase while a call
+    /// is out; `usize::MAX` never blocks. Every other method gets the quiet
+    /// answer the background jobs need.
+    #[allow(clippy::type_complexity)]
+    fn thread_slack(
+        matches: Vec<StubMatch>,
+        threads: Vec<StubThread>,
+        gate_from: usize,
+    ) -> (
+        Arc<Client>,
+        std::sync::mpsc::Receiver<(String, String)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (asked, seen) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let client = Client::for_test(move |method, params| {
+            if method != "search.messages" && method != "conversations.replies" {
+                return Ok(quiet_slack());
+            }
+            let field = |key: &str| {
+                params.iter().find(|(k, _)| *k == key).map_or(String::new(), |(_, v)| (*v).to_string())
+            };
+            let number = |key: &str| field(key).split('.').next().and_then(|s| s.parse::<i64>().ok());
+            if method == "search.messages" {
+                let query = field("query");
+                let count: usize = field("count").parse().unwrap_or(100);
+                let page: usize = field("cursor")
+                    .strip_prefix("page-")
+                    .and_then(|page| page.parse().ok())
+                    .unwrap_or(0);
+                asked.send((method.to_string(), format!("{query} page {page}"))).expect("read");
+                let mut mine: Vec<&StubMatch> =
+                    matches.iter().filter(|(q, _, _, _)| *q == query).collect();
+                mine.sort_by_key(|(_, _, _, ts)| std::cmp::Reverse(*ts));
+                let taken: Vec<&&StubMatch> = mine.iter().skip(page * count).take(count).collect();
+                let values: Vec<serde_json::Value> = taken
+                    .iter()
+                    .map(|(_, cid, root, ts)| {
+                        json!({
+                            "ts": format!("{ts}.000000"),
+                            "user": "U1",
+                            "text": format!("a match in {cid}"),
+                            "channel": {"id": cid, "name": cid.to_lowercase()},
+                            "permalink": format!(
+                                "https://x.slack.com/archives/{cid}/p{ts}000000?thread_ts={root}.000000&cid={cid}"
+                            ),
+                        })
+                    })
+                    .collect();
+                let more = mine.len() > page * count + values.len();
+                let cursor = if more { format!("page-{}", page + 1) } else { String::new() };
+                if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= gate_from {
+                    let _ = gate.lock().expect("gate").recv();
+                }
+                return Ok(json!({"ok": true, "messages": {"matches": values,
+                                 "pagination": {"next_cursor": cursor}}}));
+            }
+            let channel = field("channel");
+            let ts = field("ts");
+            let limit: usize = field("limit").parse().unwrap_or(1000);
+            let oldest = field("oldest");
+            let inclusive = field("inclusive") == "true";
+            asked
+                .send((
+                    method.to_string(),
+                    format!("{channel} ts={ts} oldest={oldest} limit={limit}"),
+                ))
+                .expect("read");
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= gate_from {
+                let _ = gate.lock().expect("gate").recv();
+            }
+            let Some((_, root, text, replies, sends_latest)) = threads
+                .iter()
+                .find(|(cid, root, _, _, _)| *cid == channel && format!("{root}.000000") == ts)
+            else {
+                // What Slack answers for a thread it cannot show, and what it
+                // answers when the conversation itself is out of reach.
+                return Err(format!(
+                    "conversations.replies: {}",
+                    if threads.iter().any(|(cid, _, _, _, _)| *cid == channel) {
+                        "thread_not_found"
+                    } else {
+                        "channel_not_found"
+                    }
+                ));
+            };
+            let mut head = json!({
+                "ts": format!("{root}.000000"), "user": "U1", "text": text,
+                "thread_ts": format!("{root}.000000"),
+                "reply_count": replies.len(), "reply_users": ["U2"], "reply_users_count": 1,
+            });
+            if *sends_latest {
+                if let Some((second, _)) = replies.last() {
+                    head["latest_reply"] = json!(format!("{second}.000000"));
+                }
+            }
+            let floor = number("oldest").filter(|_| !oldest.is_empty());
+            let window: Vec<&(i64, &str)> = replies
+                .iter()
+                .filter(|(second, _)| {
+                    !floor.is_some_and(|floor| *second < floor || (*second == floor && !inclusive))
+                })
+                .collect();
+            // The parent comes back first and counts toward the limit, so a
+            // page holds one fewer reply than the limit asks for; the cursor
+            // says where the next page picks the window up.
+            let from: usize = field("cursor")
+                .strip_prefix("reply-")
+                .and_then(|at| at.parse().ok())
+                .unwrap_or(0);
+            let room = limit.max(1) - 1;
+            let mut out = vec![head];
+            for (second, text) in window.iter().skip(from).take(room) {
+                out.push(json!({"ts": format!("{second}.000000"), "user": "U2", "text": text,
+                                "thread_ts": format!("{root}.000000")}));
+            }
+            let read = from + out.len() - 1;
+            let cursor = if window.len() > read { format!("reply-{read}") } else { String::new() };
+            Ok(json!({"ok": true, "messages": out,
+                      "response_metadata": {"next_cursor": cursor}}))
+        });
+        (Arc::new(client), seen, release)
+    }
+
+    /// The THREADS view as it stands: one row per card, `(conversation,
+    /// participants, root id, elided replies, drawn reply ids)`.
+    fn thread_cards(app: &App) -> Vec<(String, String, i64, i64, Vec<i64>)> {
+        match app.stack.last() {
+            Some(View::Threads { list }) => list
+                .msgs
+                .iter()
+                .zip(&list.cards)
+                .map(|(root, card)| {
+                    (
+                        card.conversation.clone(),
+                        card.participants.clone(),
+                        root.id,
+                        card.hidden,
+                        card.tail.iter().map(|reply| reply.id).collect(),
+                    )
+                })
+                .collect(),
+            _ => panic!("not the THREADS view"),
+        }
+    }
+
+    /// What the stub was asked, in order.
+    fn calls_of(seen: &std::sync::mpsc::Receiver<(String, String)>) -> Vec<String> {
+        seen.try_iter().map(|(method, what)| format!("{method} {what}")).collect()
+    }
+
+    /// A signed-in session asks Slack which threads the owner has been in
+    /// this week and fetches the ones the archive does not hold: the view
+    /// shows the archive's two cards, then four, newest reply first, the live
+    /// ones carrying their root and their newest reply. A thread the archive
+    /// already holds is not fetched, and nothing fetched reaches the archive.
+    #[test]
+    fn threads_fills_in_the_threads_slack_has_and_the_archive_does_not() {
+        let dir = crate::archive::test_dir("threads-live");
+        let mut app = threads_test_app(&dir);
+        let (client, seen, _release) = thread_slack(
+            vec![
+                ("from:me", "C9", 400, 600),
+                // The archive's own newer thread, which it holds already.
+                ("from:me", "C1", 500, 520),
+                ("from:me", "C9", 210, 250),
+                // The same thread again, through the mention query.
+                ("<@U1>", "C9", 400, 590),
+            ],
+            live_threads(),
+            usize::MAX,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // The archive pass first: its two threads, newest reply first.
+        assert_eq!(
+            thread_cards(&app),
+            vec![
+                ("#one".to_string(), "u1".to_string(), 500_000_000, 0, vec![520_000_000]),
+                ("#one".to_string(), "u1".to_string(), 300_000_000, 1, vec![380_000_000]),
+            ]
+        );
+        // The phase runs behind the progress box `/find` draws, which is
+        // modal over the view it is filling in.
+        assert!(app.scan_running(), "no progress box");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::ThreadFetch));
+        let before = screen_of(&mut app, 100, 44);
+        assert!(!before.contains("live root A"), "{before}");
+        let lines = app.finish_thread_fetch_for_test();
+        // Two live cards among the archived ones, ordered by newest reply
+        // whichever half built them.
+        assert_eq!(
+            thread_cards(&app),
+            vec![
+                ("#c9".to_string(), "u2".to_string(), 400_000_000, 2, vec![600_000_000]),
+                ("#one".to_string(), "u1".to_string(), 500_000_000, 0, vec![520_000_000]),
+                ("#one".to_string(), "u1".to_string(), 300_000_000, 1, vec![380_000_000]),
+                ("#c9".to_string(), "u2".to_string(), 210_000_000, 0, vec![250_000_000]),
+            ]
+        );
+        // Two searches, and two calls per thread fetched — never one for the
+        // thread the archive already holds, and never a second one for the
+        // thread the mention query named again.
+        assert_eq!(
+            calls_of(&seen),
+            [
+                "search.messages from:me page 0",
+                "search.messages <@U1> page 0",
+                "conversations.replies C9 ts=400.000000 oldest= limit=1",
+                "conversations.replies C9 ts=400.000000 oldest=600.000000 limit=2",
+                "conversations.replies C9 ts=210.000000 oldest= limit=1",
+                "conversations.replies C9 ts=210.000000 oldest=250.000000 limit=2",
+            ]
+        );
+        // One log line per API call, owner-tagged by the box it is in.
+        for said in [
+            "search.messages \"from:me\" page 1 → 3 matches · 3 threads",
+            "search.messages \"<@U1>\" page 1 → 1 match · 0 threads",
+            "conversations.replies #c9 ts=400.000000 → the root · 3 replies",
+            "conversations.replies #c9 oldest=600.000000 → the newest reply",
+            "conversations.replies #c9 ts=210.000000 → the root · 1 reply",
+        ] {
+            assert!(lines.contains(&said.to_string()), "{said:?} is not in {lines:#?}");
+        }
+        assert!(app.status.contains("2 of 2 threads fetched from Slack"), "{}", app.status);
+        // The root and the newest reply are drawn, the replies between are
+        // counted and not drawn, and the archived cards are as they were.
+        let after = screen_of(&mut app, 100, 44);
+        for drawn in ["live root A", "live A newest", "live root B", "live B newest",
+                      "archived root one", "archived reply two"] {
+            assert!(after.contains(drawn), "{drawn:?} is not on screen:\n{after}");
+        }
+        for hidden in ["live A first", "live A second"] {
+            assert!(!after.contains(hidden), "{hidden:?} should be elided:\n{after}");
+        }
+        assert!(after.contains("… 2 more replies"), "{after}");
+        // Nothing was written to the archive: it holds what it held.
+        let archive = &app.corpus.archives[0];
+        assert_eq!(archive.timeline_count("C1").unwrap(), 2);
+        assert_eq!(archive.timeline_count("C9").unwrap(), 0);
+        // `r` runs both phases again: the archive rebuilds its two cards and
+        // Slack is asked afresh for the rest.
+        app.on_msg_key(Some(Action::Refresh));
+        assert_eq!(thread_cards(&app).len(), 2, "the rerun kept the live cards");
+        app.finish_thread_fetch_for_test();
+        assert_eq!(thread_cards(&app).len(), 4);
+        assert_eq!(calls_of(&seen).len(), 6, "the rerun asked a different number of times");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Enter on a live card opens its thread the way it opens a conversation
+    /// only Slack has: the archive has nothing to open it from, so the thread
+    /// comes from Slack.
+    #[test]
+    fn enter_on_a_live_thread_card_opens_the_thread_from_slack() {
+        let dir = crate::archive::test_dir("threads-live-open");
+        let mut app = threads_test_app(&dir);
+        let (client, _seen, _release) =
+            thread_slack(vec![("from:me", "C9", 400, 600)], live_threads(), usize::MAX);
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.finish_thread_fetch_for_test();
+        // The newest thread is the live one, and the cursor is on it.
+        assert_eq!(app.selected().map(|root| root.id), Some(400_000_000));
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(), Some(View::Thread { root: 400_000_000, .. })),
+            "the live card opened the wrong thread");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.job.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Root and all three replies, which no archive holds.
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [400_000_000, 420_000_000, 440_000_000, 600_000_000]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A page whose oldest match is still inside the window has more behind
+    /// it, so the next one goes out; a page whose oldest match is outside it
+    /// is the page the window ends in, and nothing behind it can be inside.
+    #[test]
+    fn a_search_page_whose_oldest_match_is_inside_the_window_fetches_the_next() {
+        let dir = crate::archive::test_dir("threads-live-paging");
+        let mut app = threads_test_app(&dir);
+        // A hundred matches, every one of them inside the window and every
+        // one naming the same thread, then one page more; the mention query
+        // answers with a single match from before the window.
+        let mut matches: Vec<StubMatch> =
+            (0..100).map(|n| ("from:me", "C9", 400, 600 - n)).collect();
+        matches.push(("from:me", "C9", 210, 250));
+        // A hundred and one matches for the mention query, every one of them
+        // from before the window: a full page with a cursor behind it, which
+        // only the window stops.
+        matches.extend((0..101).map(|n| ("<@U1>", "C9", 210, 99 + n)));
+        let (client, seen, _release) = thread_slack(matches, live_threads(), usize::MAX);
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let lines = app.finish_thread_fetch_for_test();
+        let asked = calls_of(&seen);
+        assert_eq!(
+            asked.iter().filter(|call| call.starts_with("search.messages")).collect::<Vec<_>>(),
+            [
+                "search.messages from:me page 0",
+                "search.messages from:me page 1",
+                // One page only: its oldest match is older than the window.
+                "search.messages <@U1> page 0",
+            ],
+            "the paging is wrong"
+        );
+        // The first page carried a hundred matches for one thread; the second
+        // named the other and ended the walk on its own.
+        assert!(lines.contains(&"search.messages \"from:me\" page 1 → 100 matches · 1 thread".to_string()),
+            "{lines:#?}");
+        assert!(lines.contains(&"search.messages \"from:me\" page 2 → 1 match · 1 thread".to_string()),
+            "{lines:#?}");
+        // The match from before the window brought nothing in with it.
+        assert!(lines.contains(&"search.messages \"<@U1>\" page 1 → 100 matches · 0 threads".to_string()),
+            "{lines:#?}");
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [400_000_000, 500_000_000, 300_000_000, 210_000_000]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every match in the window names a thread the archive already holds, so
+    /// nothing is fetched at all and the status line says so.
+    #[test]
+    fn a_week_of_threads_the_archive_holds_costs_nothing_but_the_search() {
+        let dir = crate::archive::test_dir("threads-live-held");
+        let mut app = threads_test_app(&dir);
+        let (client, seen, _release) = thread_slack(
+            vec![
+                ("from:me", "C1", 500, 520),
+                ("from:me", "C1", 300, 380),
+                // Outside the window, and the archive has it either way.
+                ("<@U1>", "C9", 400, 100),
+            ],
+            live_threads(),
+            usize::MAX,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.finish_thread_fetch_for_test();
+        assert_eq!(
+            calls_of(&seen),
+            ["search.messages from:me page 0", "search.messages <@U1> page 0"],
+            "a thread the archive holds was fetched"
+        );
+        assert_eq!(thread_cards(&app).len(), 2, "a card was added twice");
+        assert!(app.status.contains("no thread of yours this week"), "{}", app.status);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A thread Slack no longer has answers `thread_not_found`, which is an
+    /// error and would otherwise stop the phase. It is a skipped candidate
+    /// instead: the search names a week of threads and one of them being
+    /// deleted, or its conversation left since, says nothing about the rest.
+    /// `channel_not_found` is the same case; every other error still stops.
+    #[test]
+    fn a_thread_slack_no_longer_has_is_skipped_and_the_phase_goes_on() {
+        let dir = crate::archive::test_dir("threads-live-gone");
+        let mut app = threads_test_app(&dir);
+        let (client, seen, _release) = thread_slack(
+            vec![
+                // Both newer than the thread that is still there, so they are
+                // asked for first and the phase has to survive them: a thread
+                // the stub's channel does not hold, and a channel it does not
+                // hold at all.
+                ("from:me", "C9", 700, 800),
+                ("from:me", "C7", 690, 790),
+                ("from:me", "C9", 210, 250),
+            ],
+            live_threads(),
+            usize::MAX,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let lines = app.finish_thread_fetch_for_test();
+        // One call for each thread that is gone — there is nothing to bound a
+        // second one with — and two for the one that is not.
+        assert_eq!(
+            calls_of(&seen).iter().filter(|call| call.starts_with("conversations.replies")).count(),
+            4
+        );
+        for said in [
+            "conversations.replies #c9 ts=700.000000 → no thread",
+            "conversations.replies #c7 ts=690.000000 → no thread",
+        ] {
+            assert!(lines.contains(&said.to_string()), "{said:?} is not in {lines:#?}");
+        }
+        // The error did not become the phase's status line.
+        assert!(!app.status.contains("thread_not_found"), "{}", app.status);
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [500_000_000, 300_000_000, 210_000_000]
+        );
+        assert!(app.status.contains("1 of 3 threads fetched from Slack"), "{}", app.status);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Slack sends `latest_reply` on every parent that has replies, but a
+    /// root that says it has replies and carries none leaves no bound to ask
+    /// the newest one from. The thread is walked forward instead — the only
+    /// order the call pages in — and the newest of what comes back is the
+    /// card's, so the card draws a reply and sorts by it rather than by its
+    /// root. The walk follows the cursor: the count sizes the page, and only
+    /// the cursor says whether more replies are behind it.
+    #[test]
+    fn a_root_without_latest_reply_is_walked_for_its_newest_reply() {
+        let dir = crate::archive::test_dir("threads-live-walk");
+        let mut app = threads_test_app(&dir);
+        // A hundred and one replies: more than one page of the walk holds.
+        let deep: Vec<(i64, &'static str)> =
+            (0..101).map(|n| (710 + n, "a deep reply")).collect();
+        let (client, seen, _release) = thread_slack(
+            vec![("from:me", "C9", 700, 810), ("from:me", "C9", 400, 600)],
+            vec![
+                ("C9", 700, "deep root", deep, false),
+                ("C9", 400, "live root A", vec![
+                    (420, "live A first"),
+                    (440, "live A second"),
+                    (600, "live A newest"),
+                ], false),
+            ],
+            usize::MAX,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let lines = app.finish_thread_fetch_for_test();
+        let asked = calls_of(&seen);
+        // The root, and then the walk: two pages of it for the deep thread
+        // and one for the shallow one, whose count fits a page and whose page
+        // came back without a cursor. The page is the count plus the parent,
+        // capped at a hundred.
+        assert_eq!(
+            asked.iter().filter(|call| call.contains("ts=700.000000")).collect::<Vec<_>>(),
+            [
+                "conversations.replies C9 ts=700.000000 oldest= limit=1",
+                "conversations.replies C9 ts=700.000000 oldest= limit=100",
+                "conversations.replies C9 ts=700.000000 oldest= limit=100",
+            ]
+        );
+        assert_eq!(
+            asked.iter().filter(|call| call.contains("ts=400.000000")).collect::<Vec<_>>(),
+            [
+                "conversations.replies C9 ts=400.000000 oldest= limit=1",
+                "conversations.replies C9 ts=400.000000 oldest= limit=4",
+            ]
+        );
+        assert!(lines.contains(&"conversations.replies #c9 ts=700.000000 page 2 → 3 messages".to_string()),
+            "{lines:#?}");
+        // Both cards carry the newest reply of their thread, and both sort by
+        // it: the deep one's 810 above the shallow one's 600, and the archive
+        // pass's cards below them.
+        assert_eq!(
+            thread_cards(&app),
+            vec![
+                ("#c9".to_string(), "u2".to_string(), 700_000_000, 100, vec![810_000_000]),
+                ("#c9".to_string(), "u2".to_string(), 400_000_000, 2, vec![600_000_000]),
+                ("#one".to_string(), "u1".to_string(), 500_000_000, 0, vec![520_000_000]),
+                ("#one".to_string(), "u1".to_string(), 300_000_000, 1, vec![380_000_000]),
+            ]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The two queries are asked one after the other, so a cap taken in the
+    /// order the candidates were collected keeps a week of the owner's own
+    /// messages and drops a mention from today. The cap orders by the newest
+    /// match that named each thread, whichever query that was — including a
+    /// thread both queries named, which sorts by the newer of the two and not
+    /// by the one that happened to be seen first.
+    #[test]
+    fn the_cap_keeps_the_newest_threads_across_both_queries() {
+        let dir = crate::archive::test_dir("threads-live-cap-order");
+        let mut app = threads_test_app(&dir);
+        // Fifty threads the owner wrote in, all of them older than the one
+        // mention, and the mention answering the second query.
+        let roots: Vec<i64> = (0..50).map(|n| 210 + n * 2).collect();
+        let mut matches: Vec<StubMatch> =
+            roots.iter().map(|root| ("from:me", "C9", *root, *root + 1)).collect();
+        matches.push(("<@U1>", "C8", 600, 601));
+        // The oldest of the fifty, named again today by the other query: the
+        // newer match is what it sorts by, so it survives the cap and the
+        // next-oldest is the one left out.
+        matches.push(("<@U1>", "C9", 210, 602));
+        let mut threads: Vec<StubThread> = roots
+            .iter()
+            .map(|root| {
+                // The oldest thread carries today's mention as its own newest
+                // reply, which is the message the second query matched.
+                let replies = if *root == 210 {
+                    vec![(211, "an older reply"), (602, "the mention today")]
+                } else {
+                    vec![(*root + 1, "an older reply")]
+                };
+                stub_thread("C9", *root, "an older root", replies)
+            })
+            .collect();
+        threads.push(stub_thread("C8", 600, "a mention today", vec![(601, "the newest reply")]));
+        let (client, seen, _release) = thread_slack(matches, threads, usize::MAX);
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.finish_thread_fetch_for_test();
+        let asked = calls_of(&seen);
+        assert!(
+            asked.iter().any(|call| call.contains("C8 ts=600.000000")),
+            "the mention from today was capped out"
+        );
+        assert!(
+            asked.iter().any(|call| call.contains("C9 ts=210.000000")),
+            "the thread the second query named again today was capped out"
+        );
+        assert!(
+            !asked.iter().any(|call| call.contains("C9 ts=212.000000")),
+            "the oldest thread was fetched over the newer mentions"
+        );
+        // The mention leads the view, above the fifty-first card the cap left
+        // out and above every thread the other query named.
+        let cards = thread_cards(&app);
+        assert_eq!(cards[0].0, "#c9", "{cards:#?}");
+        assert_eq!(cards[0].2, 210_000_000, "{cards:#?}");
+        assert_eq!(cards[1].0, "#c8", "{cards:#?}");
+        assert_eq!(cards.len(), 52, "50 live cards and the archive's 2");
+        assert!(app.status.contains("1 older thread not fetched (cap 50)"), "{}", app.status);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Fifty threads a run: the fifty-first is not fetched and the status
+    /// line counts it.
+    #[test]
+    fn the_fifty_first_thread_is_not_fetched_and_the_status_line_says_so() {
+        let dir = crate::archive::test_dir("threads-live-cap");
+        let mut app = threads_test_app(&dir);
+        // Fifty-one threads, newest first, each with one reply.
+        let roots: Vec<i64> = (0..51).map(|n| 250 + n * 2).collect();
+        let matches: Vec<StubMatch> =
+            roots.iter().map(|root| ("from:me", "C9", *root, *root + 1)).collect();
+        let threads: Vec<StubThread> = roots
+            .iter()
+            .map(|root| stub_thread("C9", *root, "a live root", vec![(*root + 1, "a live reply")]))
+            .collect();
+        let (client, seen, _release) = thread_slack(matches, threads, usize::MAX);
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let lines = app.finish_thread_fetch_for_test();
+        let asked = calls_of(&seen);
+        // Two searches and two calls for each of fifty threads, no more.
+        assert_eq!(asked.len(), 2 + 100, "the cap did not hold");
+        // The oldest thread the search found is the one left behind.
+        let oldest = format!("conversations.replies C9 ts={}.000000 oldest= limit=1", roots[0]);
+        assert!(!asked.contains(&oldest), "the fifty-first thread was fetched");
+        assert_eq!(thread_cards(&app).len(), 52, "50 live cards and the archive's 2");
+        assert!(app.status.contains("50 of 50 threads fetched from Slack"), "{}", app.status);
+        // The remainder is counted, and nothing is promised of it: every run
+        // searches the same week and caps the same way, so the next one
+        // fetches these fifty again rather than the ones behind them.
+        assert!(app.status.contains("1 older thread not fetched (cap 50)"), "{}", app.status);
+        assert!(!app.status.contains("next run"), "{}", app.status);
+        assert!(lines.iter().any(|line| line.contains("51 threads in the last week")
+            && line.contains("1 older not fetched (cap 50)")), "{lines:#?}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The navigation-generation rule: an answer that lands after the reader
+    /// has left the view lands nowhere. The stack it would have written to is
+    /// not there any more, and nothing is pushed in its place.
+    #[test]
+    fn leaving_threads_before_the_phase_lands_leaves_the_stack_alone() {
+        let dir = crate::archive::test_dir("threads-live-abandoned");
+        let mut app = threads_test_app(&dir);
+        // The first thread's first call is the one held open.
+        let (client, _seen, release) = thread_slack(
+            vec![("from:me", "C9", 400, 600), ("from:me", "C9", 210, 250)],
+            live_threads(),
+            3,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.thread_fetch.is_some() && app.scan.is_some(), "the phase never started");
+        // Gone home while a call is out.
+        app.go_home();
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.thread_fetch.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.thread_fetch.is_none(), "the phase outlived the view");
+        assert!(app.stack.is_empty(), "the fetch pushed a view over the home screen");
+        assert!(app.open.is_none());
+        assert!(app.scan_overlay.is_none(), "the box outlived the view");
+        let screen = screen_of(&mut app, 100, 30);
+        assert!(!screen.contains("live root"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The navigation-generation rule on its own. Leaving THREADS altogether
+    /// is caught by the view the answer would be written to no longer being
+    /// there; the generation is what catches a reader who left and came back,
+    /// where the view on the stack is a THREADS view either way but not the
+    /// one the phase was started under. Bumping the generation is what every
+    /// navigation primitive does, and it is all that separates the two.
+    #[test]
+    fn an_answer_from_before_a_navigation_lands_nowhere() {
+        let dir = crate::archive::test_dir("threads-live-generation");
+        let mut app = threads_test_app(&dir);
+        // The two searches answer; the first thread's first call is held.
+        let (client, seen, release) = thread_slack(
+            vec![("from:me", "C9", 400, 600), ("from:me", "C9", 210, 250)],
+            live_threads(),
+            3,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.thread_fetch.is_some(), "the phase never started");
+        // Wait for the search to land and the first thread's call to be out.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut asked: Vec<String> = Vec::new();
+        while asked.len() < 3 && Instant::now() < deadline {
+            app.tick();
+            asked.extend(calls_of(&seen));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(asked.len(), 3, "the first thread's call never went out");
+        app.nav_generation = app.nav_generation.wrapping_add(1);
+        // Both of the thread's own calls; the next thread's would be a third.
+        for _ in 0..2 {
+            release.send(()).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.thread_fetch.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.thread_fetch.is_none(), "the phase outlived the navigation");
+        assert!(app.scan_overlay.is_none(), "the box outlived the navigation");
+        // No card was added, and the next thread was never asked for.
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [500_000_000, 300_000_000]
+        );
+        asked.extend(calls_of(&seen));
+        assert!(
+            !asked.iter().any(|call| call.contains("ts=210")),
+            "the phase went on past the navigation: {asked:#?}"
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Esc abandons the phase where it stands: the cards it has already added
+    /// stay, and the threads it had not reached are left for the next run.
+    #[test]
+    fn esc_during_the_thread_fetch_keeps_the_cards_already_added() {
+        let dir = crate::archive::test_dir("threads-live-esc");
+        let mut app = threads_test_app(&dir);
+        // Two searches and the first thread's two calls answer; the second
+        // thread's first call blocks.
+        let (client, _seen, _release) = thread_slack(
+            vec![("from:me", "C9", 400, 600), ("from:me", "C9", 210, 250)],
+            live_threads(),
+            5,
+        );
+        app.api = Some(client);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.thread_fetch.as_ref().is_some_and(|phase| phase.added == 0)
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.thread_fetch.as_ref().map(|phase| phase.added), Some(1),
+            "the first thread never landed");
+        // The box is modal: Esc is the one key that reaches the phase.
+        assert!(app.scan_running());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.thread_fetch.is_none() && app.scan.is_none() && app.scan_overlay.is_none());
+        assert!(app.status.contains("thread fetch abandoned; 1 thread added"), "{}", app.status);
+        // The view is still there: the one live card, and the archive's two.
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [400_000_000, 500_000_000, 300_000_000]
+        );
+        let screen = screen_of(&mut app, 100, 44);
+        assert!(screen.contains("live root A") && screen.contains("live A newest"), "{screen}");
+        assert!(!screen.contains("live root B"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A rate-limit reply stops the phase with a status line, and every
+    /// thread it had not reached is left for the next run.
+    #[test]
+    fn a_rate_limited_reply_stops_the_thread_fetch() {
+        let dir = crate::archive::test_dir("threads-live-ratelimit");
+        let mut app = threads_test_app(&dir);
+        let matches: Vec<StubMatch> = vec![("from:me", "C9", 400, 600), ("from:me", "C9", 210, 250)];
+        let (client, _seen, _release) = thread_slack(matches, live_threads(), usize::MAX);
+        // The searches answer; the thread calls are rate-limited.
+        let limited = Arc::new(Client::for_test(move |method, params| {
+            if method == "conversations.replies" {
+                return Err("conversations.replies: ratelimited".to_string());
+            }
+            client.call(method, params)
+        }));
+        app.api = Some(limited);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.finish_thread_fetch_for_test();
+        assert!(app.status.contains("ratelimited"), "{}", app.status);
+        assert!(app.status.contains("2 threads left unfetched"), "{}", app.status);
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [500_000_000, 300_000_000],
+            "a card was added after the phase stopped"
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The two phases share one progress box and one job slot, so a job that
+    /// lands after its own box is gone must not touch the box a later phase
+    /// opened: closing it drops the channel the running worker narrates
+    /// through, and the phase stops mid-call.
+    #[test]
+    fn a_late_search_does_not_close_the_thread_fetch_box() {
+        let dir = crate::archive::test_dir("threads-live-overlay");
+        let mut app = threads_test_app(&dir);
+        let (stub, _seen, release_threads) = thread_slack(
+            vec![("from:me", "C9", 400, 600)],
+            live_threads(),
+            // Every call the phase makes waits to be let through.
+            1,
+        );
+        let (release_search, search_gate) = std::sync::mpsc::channel::<()>();
+        let search_gate = std::sync::Mutex::new(search_gate);
+        // `/find`'s Slack half is the search of a needle; the phase's is a
+        // search of its own, and the two are told apart by the query.
+        app.api = Some(Arc::new(Client::for_test(move |method, params| {
+            let query = params.iter().find(|(k, _)| *k == "query").map_or("", |(_, v)| v);
+            if method == "search.messages" && query.contains("archived") {
+                let _ = search_gate.lock().expect("gate").recv();
+                return Ok(json!({"messages": {"matches": []}}));
+            }
+            stub.call(method, params)
+        })));
+        // The archive half of a `/find` lands and the Slack half goes out.
+        app.run_command("/find message: archived", "");
+        app.finish_archive_scan_for_test();
+        assert!(app.job.is_some(), "the Slack half never started");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::Search));
+        // Esc dismisses the box; the search itself is still out.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.scan_overlay.is_none() && app.job.is_some());
+        // THREADS opens over the search view and takes the box for itself.
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.thread_fetch.is_some() && app.scan.is_some());
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::ThreadFetch));
+        // Now the abandoned search finishes.
+        release_search.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.job.is_some() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.job.is_none(), "the search never landed");
+        assert!(app.scan_running(), "the search closed the thread fetch's box");
+        assert_eq!(app.scan_overlay.as_ref().map(|o| o.owner), Some(ScanOwner::ThreadFetch));
+        assert!(app.thread_fetch.is_some(), "the search stopped the thread fetch");
+        // And the phase runs on to its end.
+        for _ in 0..8 {
+            let _ = release_threads.send(());
+        }
+        app.finish_thread_fetch_for_test();
+        assert_eq!(
+            thread_cards(&app).iter().map(|card| card.2).collect::<Vec<_>>(),
+            [400_000_000, 500_000_000, 300_000_000]
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Neither the reply a card draws nor the ones it only counts are in any
+    /// list's `msgs`, so deleting either has to reach the card itself. The
+    /// drawn one folds into the elision, whose count stays as it was; a
+    /// counted one takes the count down with it. Both orders, because the
+    /// card only knows which case it is in by looking at what it draws.
+    #[test]
+    fn deleting_a_reply_leaves_the_card_counting_the_replies_that_are_left() {
+        // One thread, root plus three replies; the card draws the newest.
+        let build = || {
+            let dir = crate::archive::test_dir("threads-delete");
+            crate::archive::thread_database(&dir, &[
+                (1, 1, "U1", "root of three"),
+                (2, 1, "U2", "oldest reply"),
+                (3, 1, "U2", "middle reply"),
+                (4, 1, "U2", "freshest answer"),
+            ]);
+            crate::archive::set_message_data(&dir, 1, json!({"reply_count": 3}));
+            let mut app = mute_test_app();
+            app.corpus.me = Some("U1".into());
+            app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+            app.corpus.convs[0].archive = 0;
+            app.corpus.convs[0].live_only = false;
+            app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+            (app, dir, ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap())
+        };
+        let screen = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, app: &mut App| {
+            terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height).map(|y| (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+        let card_last = |app: &App| match app.stack.last() {
+            Some(View::Threads { list }) => list.cards[0].tail.first().map(|m| m.id),
+            _ => panic!("not the THREADS view"),
+        };
+        // Slack confirms a delete: the reply's own id, and the thread it was
+        // a reply in, which travelled with the job from the armed `D`.
+        let deleted = |app: &mut App, id: i64| {
+            app.job = Some(Job::completed_for_test(
+                JobKind::Delete { id, cid: "C1".into(), root: Some(1_000_000) },
+                Ok(Done::Deleted),
+            ));
+            app.tick();
+        };
+        // Newest first: the drawn reply goes, then one of the two left.
+        let (mut app, dir, mut terminal) = build();
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(drawn.contains("freshest answer"), "{drawn}");
+        assert!(drawn.contains("… 2 more replies"), "{drawn}");
+        assert_eq!(card_last(&app), Some(4_000_000));
+        deleted(&mut app, 4_000_000);
+        assert_eq!(card_last(&app), None, "the deleted reply survived on the card");
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(!drawn.contains("freshest answer"), "the deleted reply is still drawn:\n{drawn}");
+        assert!(drawn.contains("root of three"), "{drawn}");
+        // Two replies are left and none is drawn, so the count is unchanged.
+        assert!(drawn.contains("… 2 more replies"), "the elision count is wrong:\n{drawn}");
+        deleted(&mut app, 3_000_000);
+        let drawn = screen(&mut terminal, &mut app);
+        assert!(drawn.contains("… 1 more reply"), "a counted reply left the count alone:\n{drawn}");
+        // Deleting the root drops the whole card, cards and roots together.
+        app.job = Some(Job::completed_for_test(
+            JobKind::Delete { id: 1_000_000, cid: "C1".into(), root: None },
+            Ok(Done::Deleted),
+        ));
+        app.tick();
+        match app.stack.last() {
+            Some(View::Threads { list }) => {
+                assert!(list.msgs.is_empty() && list.cards.is_empty(), "roots and cards diverged");
+            }
+            _ => panic!("not the THREADS view"),
+        }
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // The other order: a counted reply first, and the drawn one after.
+        let (mut app, dir, mut terminal) = build();
+        screen(&mut terminal, &mut app);
+        deleted(&mut app, 3_000_000);
+        let drawn = screen(&mut terminal, &mut app);
+        assert_eq!(card_last(&app), Some(4_000_000), "the wrong reply left the card");
+        assert!(drawn.contains("freshest answer"), "{drawn}");
+        assert!(drawn.contains("… 1 more reply"), "a counted reply left the count alone:\n{drawn}");
+        deleted(&mut app, 4_000_000);
+        let drawn = screen(&mut terminal, &mut app);
+        assert_eq!(card_last(&app), None, "the deleted reply survived on the card");
+        assert!(!drawn.contains("freshest answer"), "the deleted reply is still drawn:\n{drawn}");
+        // One reply is left, undrawn, and the count says so.
+        assert!(drawn.contains("… 1 more reply"), "the elision count is wrong:\n{drawn}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // A reply written after the view opened was never counted, so
+        // deleting it must leave the count where it is. It is reachable
+        // exactly this way: open the card's thread, read it, delete it there.
+        let (mut app, dir, mut terminal) = build();
+        screen(&mut terminal, &mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        let fresh = Msg::from_api("C1".into(), json!({
+            "ts": "5.000000", "user": "U1", "thread_ts": "1.000000", "text": "written just now",
+        })).expect("a reply");
+        match app.stack.last_mut() {
+            Some(View::Thread { list, .. }) => {
+                list.msgs.push(fresh);
+                list.mark_dirty();
+            }
+            _ => panic!("l did not open the thread"),
+        }
+        deleted(&mut app, 5_000_000);
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        let drawn = screen(&mut terminal, &mut app);
+        assert_eq!(card_last(&app), Some(4_000_000), "the card lost the reply it draws");
+        assert!(drawn.contains("… 2 more replies"), "a reply the card never counted moved the count:\n{drawn}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `hidden` is signed, so an unguarded decrement lands at −1 and the card
+    /// would offer to elide a negative number of replies. The last counted
+    /// reply going leaves zero, and zero draws no elision line at all.
+    #[test]
+    fn the_last_counted_reply_leaves_the_card_at_zero_never_below() {
+        let card = render::Card {
+            conversation: "#one".into(),
+            participants: "bea".into(),
+            hidden: 1,
+            counted_from: 1_000_000,
+            counted_through: 2_000_000,
+            tail: Vec::new(),
+            elision: render::Elision::Replies,
+        };
+        let mut list = MsgList::with_cards(vec![(msg(1, "root of one"), card)]);
+        list.drop_reply("C1", 1_000_000, 2_000_000);
+        assert_eq!(list.cards[0].hidden, 0);
+        // Nothing left to elide, at any fit: there is no drawn reply to fold.
+        assert_eq!(list.cards[0].elided(render::CardFit::Whole), 0);
+        assert_eq!(list.cards[0].elided(render::CardFit::Folded), 0);
+        assert_eq!(list.cards[0].elided(render::CardFit::Root), 0);
+        // A repeat of the same delete, and a reply the card never counted,
+        // cannot take it below zero either.
+        list.drop_reply("C1", 1_000_000, 2_000_000);
+        list.drop_reply("C1", 1_000_000, 9_000_000);
+        assert_eq!(list.cards[0].hidden, 0);
+        let corpus = Corpus::stub(&[]);
+        let palette = Palette::default();
+        let context = Ctx { archive: None, corpus: &corpus, tz: Tz::Utc,
+            image_font: None, last_read: None, palette: &palette };
+        list.rebuild_for_pane(&context, 120, 24);
+        let rows: Vec<String> = list.flat.iter().map(|line| line.line.to_string()).collect();
+        assert!(rows.iter().any(|row| row.contains("#one")), "no card drawn: {rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("more repl")), "an elision line at zero: {rows:?}");
+    }
+
+    /// A pane too short for a whole card sheds parts of it instead of drawing
+    /// nothing: `whole_message_viewport` shows no item taller than the pane,
+    /// and THREADS went blank at six rows.
+    #[test]
+    fn a_short_pane_sheds_the_reply_and_then_the_elision_line() {
+        let dir = crate::archive::test_dir("threads-short-pane");
+        // A root that wraps past three lines, so a short pane collapses it to
+        // a preview and the card still has to shed the parts around it.
+        crate::archive::thread_database(&dir, &[
+            (1, 1, "U1", "a root long enough to wrap over four lines in this pane, so that a short \
+                          pane collapses it to its first line, a hidden-line count and its last \
+                          line, which is the tallest a collapsed message ever gets and therefore \
+                          the worst case the card has to fit around"),
+            (2, 1, "U2", "oldest reply"),
+            (3, 1, "U2", "freshest answer"),
+        ]);
+        crate::archive::set_message_data(&dir, 1, json!({"reply_count": 2}));
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // `ui::draw` refuses to draw a card into fewer than seven inner rows —
+        // the blank above, the card header, a collapsed root's four rows and
+        // the blank below — so seven and eight are the shortest panes a card
+        // must survive. Two of the terminal's rows are the pane border and one
+        // is the status line. At seven the whole count moves into the header;
+        // at eight it gets its own elision line; on a tall pane the last reply
+        // is drawn and the count drops to the one reply left over.
+        // A collapsed root keeps its own last line, so this is on screen at
+        // every height and proves the card was drawn at all.
+        let tail = "worst case the card has to fit around";
+        let cases = [
+            (7 + 3, false, "#one  U1  · 2 more replies", ""),
+            (8 + 3, false, "#one  U1", "… 2 more replies"),
+            (30, true, "#one  U1", "… 1 more reply"),
+        ];
+        for (height, want_reply, want_header, want_elision) in cases {
+            let mut terminal = ratatui::Terminal::new(
+                ratatui::backend::TestBackend::new(100, height)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let drawn: String = (0..buffer.area.height).map(|y| (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+            assert!(drawn.contains(tail), "nothing drawn at height {height}:\n{drawn}");
+            assert_eq!(drawn.contains("freshest answer"), want_reply, "reply at height {height}:\n{drawn}");
+            assert!(drawn.contains(want_header), "header at height {height}:\n{drawn}");
+            // The count lives on the elision line, or in the header when the
+            // pane cannot spare a line for it, and never in both.
+            // Two spaces before the ellipsis is the elision line's own
+            // indent; the pane title truncates with a bare one.
+            assert_eq!(drawn.contains("  … "), !want_elision.is_empty(),
+                "the elision line at height {height}:\n{drawn}");
+            if !want_elision.is_empty() {
+                assert!(drawn.contains(want_elision), "{want_elision:?} missing at height {height}:\n{drawn}");
+            }
+            assert_eq!(drawn.contains("· 2 more replies"), want_header.contains('·'),
+                "the count is in the wrong place at height {height}:\n{drawn}");
+            // The whole card fits the pane, so the viewport can show it.
+            let list = app.active_list().unwrap();
+            let rows = list.last[0] - list.first[0] + 1;
+            assert!(rows <= app.msgs_height, "card is {rows} rows in a {} row pane:\n{drawn}", app.msgs_height);
+        }
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// At seven rows the count is on the header, and a narrow pane must not
+    /// clip it off the end: the elision line it moved out of is gone, so a
+    /// clipped count is a count nowhere.
+    #[test]
+    fn a_narrow_header_truncates_the_names_and_keeps_the_count() {
+        let dir = crate::archive::test_dir("threads-narrow");
+        crate::archive::thread_database(&dir, &[
+            (1, 1, "U1", "a root long enough to wrap over several lines at forty columns, so the \
+                          pane collapses it and the card has to shed everything around it"),
+            (2, 1, "U2", "oldest reply"),
+            (3, 1, "U3", "freshest answer"),
+        ]);
+        crate::archive::set_message_data(&dir, 1, json!({
+            "reply_count": 2,
+            "reply_users": ["U2", "U3", "U4"],
+            "reply_users_count": 3,
+        }));
+        let mut app = mute_test_app();
+        app.corpus.me = Some("U1".into());
+        app.corpus.merge_profiles(vec![
+            json!({"id":"U2","name":"alexander.robinson"}),
+            json!({"id":"U3","name":"marcus.shellington"}),
+            json!({"id":"U4","name":"martin.kingsford"}),
+        ]);
+        app.corpus.archives.push(Archive::open("test".into(), &dir).unwrap());
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        app.corpus.convs[0].name = "#team-cdn-core-alpha-and-everything".into();
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // Seven inner rows and sixty-six columns: the count is the last thing
+        // on the header and the first thing a clip would take.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(66, 10)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height).map(|y| (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect();
+        let drawn = rows.join("\n");
+        let header = rows.iter().find(|row| row.contains("· 2 more replies"))
+            .unwrap_or_else(|| panic!("the count was clipped off the header:\n{drawn}"));
+        // The conversation survives, cut; the participants gave way first.
+        assert!(header.contains("#team-cdn"), "the conversation is gone:\n{drawn}");
+        assert!(!header.contains("alexander.robinson"), "the names kept their room:\n{drawn}");
+        assert!(!drawn.contains("  … "), "the elision line is back:\n{drawn}");
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saved_row_navigation_rendering_commands_and_async_results() {
+        let mut app = mute_test_app();
+        let key = |code| KeyEvent::new(code,KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Char('g')));
+        assert!(app.top_section.is_some());
+        assert!(app.target_conv("").is_err());
+        assert!(app.compose_target().is_err());
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.top_section,Some(TopSection::Sent));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.top_section,Some(TopSection::Mentions));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.top_section,Some(TopSection::Threads));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.top_section,Some(TopSection::Unreads));
+        app.on_key(key(KeyCode::Char('j')));
+        assert!(app.top_section.is_none()); assert_eq!(app.conv_cursor,0);
+        for _ in 0..5 { app.on_key(key(KeyCode::Char('k'))); }
+        assert_eq!(app.top_section,Some(TopSection::Saved));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.open.is_none()); assert!(matches!(app.stack.last(),Some(View::Saved {..})));
+        assert!(app.target_conv("").is_err());
+        let mut message = msg(1,"saved body"); message.channel_id="D1".into();
+        app.job=Some(Job::completed_for_test(JobKind::Saved,Ok(Done::Saved(vec![message.clone()]))));
+        app.tick(); assert_eq!(app.selected().unwrap().text,"saved body");
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,25)).unwrap();
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap();
+        let buffer=terminal.backend().buffer();
+        let row:String=(1..20).map(|x|buffer[(x,1)].symbol()).collect(); assert!(row.starts_with("SAVED"));
+        let text:String=buffer.content.iter().map(|cell|cell.symbol()).collect(); assert!(text.contains("saved body"));
+        app.on_key(key(KeyCode::Char('l')));assert!(matches!(app.stack.last(),Some(View::Raw {..})));
+        app.on_key(key(KeyCode::Char('h')));assert!(matches!(app.stack.last(),Some(View::Saved {..})));
+        for (code,modifiers,command) in [('s',KeyModifiers::CONTROL,"/save"),('s',KeyModifiers::CONTROL|KeyModifiers::SHIFT,"/unsave")] {
+            let expected = command == "/save";
+            assert_eq!(parse_command(command),Some(Command::Save(expected)));
+            assert_eq!(app.keymap.action(KeyEvent::new(KeyCode::Char(code),modifiers)),Some(if expected {Action::Save}else{Action::Unsave}));
+            app.pending_delete = Some(PendingDelete {cid:"D1".into(),id:1,root:None});
+            app.on_key(KeyEvent::new(KeyCode::Char(code),modifiers));
+            assert!(app.pending_delete.is_none());
+            assert!(app.status.contains("sign-in")); assert!(app.job.is_none());
+            app.run_command(command,"");assert!(app.status.contains("sign-in"));
+        }
+        app.job=Some(Job::completed_for_test(JobKind::Saved,Err("denied".into())));app.tick();
+        assert_eq!(app.saved_messages.len(),1);assert_eq!(app.active_list().unwrap().len(),1);
+        app.on_key(key(KeyCode::Esc));
+        app.job=Some(Job::completed_for_test(JobKind::Saved,Ok(Done::Saved(vec![message]))));app.tick();
+        assert!(app.stack.is_empty());assert!(app.open.is_none()); // No late navigation.
+        app.on_key(key(KeyCode::Esc));assert!(app.top_section.is_some());assert_eq!(app.conv_cursor,0);
+        app.open_saved();app.apply_saved(vec![]);assert_eq!(app.active_list().unwrap().len(),0);
+        app.on_key(key(KeyCode::Char('h')));assert!(app.stack.is_empty());
+        assert!(app.focus == Focus::Convs);
+        app.on_key(key(KeyCode::Char('j'))); assert_eq!(app.top_section,Some(TopSection::Sent));
+        app.corpus.convs.clear(); app.filtered.clear();app.open_saved();
+        terminal.draw(|frame|crate::ui::draw(frame,&mut app)).unwrap(); // Empty workspaces need no fake conversation.
+    }
+
+    #[test]
+    fn raw_enter_follows_cached_link_and_h_restores_highlight() {
+        let mut app = mute_test_app();
+        app.corpus.workspace_url = "https://myorg.slack.com".into();
+        let cache = std::env::temp_dir().join(format!("slack-raw-link-test-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        app.cache_dir = cache.clone();
+        app.open_conv(0);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1,
+            "https://myorg.slack.com/archives/COTHER/p1788811422381186?thread_ts=1788765950.129609")],false);
+        std::fs::create_dir_all(cache.join("threads")).unwrap();
+        std::fs::write(live::thread_file(&cache,"COTHER",1788765950129609),json!([
+            {"ts":"1788765950.129609","text":"linked root","reply_count":1},
+            {"ts":"1788811422.381186","thread_ts":"1788765950.129609","text":"linked reply"}
+        ]).to_string()).unwrap();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100,28)).unwrap();
+        let key = |code| KeyEvent::new(code,KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Char('l')));
+        terminal.draw(|frame| crate::ui::draw(frame,&mut app)).unwrap();
+        let original = terminal.backend().buffer().clone();
+        assert!(original.content.iter().any(|cell| cell.bg == app.palette.get(Role::SelectionBackground)));
+        let source = app.open.as_ref().unwrap().conv;
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.selected().unwrap().text,"linked reply");
+        assert_eq!(app.open.as_ref().unwrap().conv,source);
+        assert!(app.title().contains("COTHER"));
+        app.on_key(key(KeyCode::Char('h')));
+        terminal.draw(|frame| crate::ui::draw(frame,&mut app)).unwrap();
+        let before = match app.stack.last().unwrap() {View::Raw {browser,..}=>(browser.cursor,browser.scroll),_=>panic!()};
+        app.on_key(key(KeyCode::Down));
+        let after = match app.stack.last().unwrap() {View::Raw {browser,..}=>browser.cursor,_=>panic!()};
+        assert_eq!(after,before.0+1);
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.selected().unwrap().text,"linked reply");
+        app.on_key(key(KeyCode::Char('h')));
+        if let Some(View::Raw {browser,..}) = app.stack.last_mut() {
+            *browser = crate::raw::Browser::new(&json!({"text":"https://myorg.slack.com/archives/COTHER/p1788811422381186"}));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.selected().unwrap().text,"linked reply"); // Resolve rootless links from root-keyed caches.
+        app.on_key(key(KeyCode::Char('h')));
+        app.corpus.workspace_url = "https://other.slack.com".into();
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.status.contains("another Slack workspace"));
+        assert!(matches!(app.stack.last(),Some(View::Raw {..})));
+        assert!(app.job.is_none());
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn raw_links_keep_source_stack_and_ignore_late_navigation() {
+        let mut app = mute_test_app();
+        app.corpus.workspace_url = "https://myorg.slack.com".into();
+        app.open_conv(0);
+        let source = app.open.as_ref().unwrap().conv;
+        let url = "https://myorg.slack.com/archives/COTHER/p1788811422381186?thread_ts=1788765950.129609";
+        let mut message = msg(1, url);
+        message.data["text"] = json!(url);
+        app.open.as_mut().unwrap().list = MsgList::new(vec![message],false);
+        app.open_raw();
+        let key = |code| KeyEvent::new(code,KeyModifiers::NONE);
+        let (raw_id, cursor) = match app.stack.last_mut().unwrap() {
+            View::Raw {browser,..} => {browser.scroll=3; (browser.id,browser.cursor)}, _=>panic!()
+        };
+        let link = crate::raw::Link::parse(url).unwrap();
+        let messages = vec![
+            Msg::from_api("COTHER".into(),json!({"ts":"1788765950.129609","text":"root","reply_count":1})).unwrap(),
+            Msg::from_api("COTHER".into(),json!({"ts":"1788811422.381186","text":"reply","thread_ts":"1788765950.129609"})).unwrap(),
+        ];
+        app.job = Some(Job::completed_for_test(JobKind::MessageLink {raw_id,link:link.clone()},Ok(Done::ThreadMsgs(messages.clone()))));
+        app.tick();
+        assert_eq!(app.open.as_ref().unwrap().conv,source);
+        assert_eq!(app.stack.len(),2);
+        assert_eq!(app.selected().unwrap().id,link.focus);
+        app.on_key(key(KeyCode::Char('h')));
+        let View::Raw {browser,..} = app.stack.last().unwrap() else {panic!()};
+        assert_eq!((browser.id,browser.cursor,browser.scroll),(raw_id,cursor,3));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.stack.is_empty());
+        app.open_raw();
+        app.job = Some(Job::completed_for_test(JobKind::MessageLink {raw_id,link:link.clone()},Ok(Done::ThreadMsgs(messages))));
+        app.tick();
+        assert_eq!(app.stack.len(),1); // An old fetch cannot hijack a newly opened raw view.
+        app.status = "current view status".into();
+        app.job = Some(Job::completed_for_test(JobKind::MessageLink {raw_id,link},Err("old fetch failure".into())));
+        app.tick();
+        assert_eq!(app.status,"current view status");
+        app.on_key(key(KeyCode::Home));
+        app.on_key(key(KeyCode::Enter)); // Nonlink leaf: stay in raw view.
+        assert_eq!(app.stack.len(),1);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.stack.is_empty() && app.open.is_none());
+    }
+
+    #[test]
+    fn horizontal_open_reads_only_collapsed_messages() {
+        for forward in [KeyCode::Char('l'), KeyCode::Right] {
+            for thread in [false, true] {
+                let mut app = mute_test_app();
+                app.open_conv(0);
+                let message = msg(1, &"body line\n".repeat(12));
+                if thread {
+                    app.stack.push(View::Thread { root: message.id,
+                        list: MsgList::new(vec![message], true), live: None, place: None });
+                } else {
+                    app.open.as_mut().unwrap().list = MsgList::new(vec![message], false);
+                }
+                let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+                for height in [24, 100, 24] {
+                    terminal.backend_mut().resize(120, height);
+                    terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+                    let collapsed = height == 24;
+                    assert_eq!(app.active_list().unwrap().collapsed, vec![collapsed]);
+                    // 13 rendered rows: the header and 12 body rows. Collapsed,
+                    // the header, the first body row and the last one stay,
+                    // and the 10 between them go.
+                    let list = app.active_list().unwrap();
+                    assert_eq!(list.flat.iter().filter(|line|
+                        line.line.to_string() == "  ... (10 more lines)").count(),
+                        usize::from(collapsed));
+                    assert_eq!(list.last[0] - list.first[0], if collapsed { 5 } else { 14 });
+                    app.on_key(key(forward));
+                    if collapsed {
+                        assert!(app.active_list().unwrap().line_scroll);
+                        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+                        assert!(!app.active_list().unwrap().flat.iter().any(|line|
+                            line.line.to_string().contains("more lines)")));
+                        app.on_key(key(forward));
+                    }
+                    assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+                    app.on_key(key(KeyCode::Char('h')));
+                    assert_eq!(app.active_list().unwrap().line_scroll, collapsed);
+                    if collapsed { app.on_key(key(KeyCode::Char('h'))); }
+                    assert_eq!(app.stack.len(), usize::from(thread));
+                }
+                assert!(app.job.is_none());
+            }
+        }
+    }
+
+    /// A collapsed message shows its header, its first body row and its last
+    /// row around the elision. The last row carries an image only when the
+    /// whole image fits on it, and the slot has to be readdressed to its new
+    /// index.
+    #[test]
+    fn collapsed_preview_keeps_the_last_row_and_only_an_image_that_fits_it() {
+        let corpus = Corpus::stub(&[]);
+        // A highlight the file name matches, so the test can tell a label that
+        // went through the palette from one that did not.
+        let mut palette = Palette::default();
+        palette.highlights = vec![crate::palette::Highlight {
+            word: "wide".into(),
+            color: ratatui::style::Color::Green,
+        }];
+        let context = Ctx { archive: None, corpus: &corpus, tz: Tz::Utc,
+            image_font: Some((8, 16)), last_read: None, palette: &palette };
+        let with_image = |width: u32, height: u32| {
+            Msg::from_api("C1".into(), json!({
+                "ts": "1.000000", "user": "U1",
+                "text": (0..20).map(|n| format!("body {n}")).collect::<Vec<_>>().join("\n"),
+                "files": [{"id": "F1", "name": "wide.png", "mimetype": "image/png",
+                    "filetype": "png", "original_w": width, "original_h": height}],
+            })).unwrap()
+        };
+        // 800x10 at an 8x16 font is one row tall, so it lands on the message's
+        // last row: header, 20 body rows, the file line, the image row.
+        let mut list = MsgList::new(vec![with_image(800, 10)], false);
+        list.rebuild_for_pane(&context, 120, 24);
+        assert_eq!(list.collapsed, vec![true]);
+        let rows: Vec<_> = list.flat[list.first[0]..=list.last[0]]
+            .iter().map(|line| line.line.to_string()).collect();
+        // blank, header, first body row, elision, last, blank.
+        assert_eq!(rows.len(), 6);
+        assert!(rows[1].contains("UTC") && !rows[1].contains("body"));
+        assert_eq!(rows[2], "  body 0");
+        assert_eq!(rows[3], "  ... (20 more lines)");
+        assert_eq!(rows[4], ""); // The image's reserved row.
+        let slot = list.flat[list.first[0] + 4].image.as_ref().expect("image kept");
+        assert_eq!((slot.line, slot.rows), (3, 1)); // Readdressed to the truncated vec.
+        assert!(list.flat.iter().filter(|line| line.image.is_some()).count() == 1);
+        // Uncollapsed, the same slot keeps its original index.
+        list.rebuild_for_pane(&context, 120, 100);
+        assert_eq!(list.collapsed, vec![false]);
+        assert_eq!(list.flat[list.first[0] + 1 + 22].image.as_ref().unwrap().line, 22);
+        // 800x800 is 14 rows tall, so it starts on a row the preview hides and
+        // would paint over the elision and the message below it. The last row
+        // is one of its reserved blanks, so the preview names the file there
+        // with the label an uncollapsed render puts above those rows.
+        let tall = with_image(800, 800);
+        let mut list = MsgList::new(vec![tall.clone()], false);
+        list.rebuild_for_pane(&context, 120, 24);
+        assert_eq!(list.collapsed, vec![true]);
+        assert!(list.flat.iter().all(|line| line.image.is_none()));
+        assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  body 0");
+        assert_eq!(list.flat[list.first[0] + 3].line.to_string(), "  ... (33 more lines)");
+        let label = render::file_label(&tall.files()[0]).to_string();
+        assert_eq!(label, "  [file] wide.png (png)");
+        let collapsed_tail = list.flat[list.first[0] + 4].line.clone();
+        assert_eq!(collapsed_tail.to_string(), label);
+        // The name went through the highlight pass: "wide" is green.
+        assert!(collapsed_tail.spans.iter().any(|span|
+            span.content == "wide" && span.style.fg == Some(ratatui::style::Color::Green)));
+        // The same label, styling included, is what the uncollapsed render
+        // shows above the image.
+        list.rebuild_for_pane(&context, 120, 100);
+        assert_eq!(list.collapsed, vec![false]);
+        assert_eq!(list.flat[list.first[0] + 1 + 21].line, collapsed_tail);
+        // A plain attachment reserves no rows, so no slot exists to drop and
+        // the message's own last row is already the file line.
+        let mut list = MsgList::new(vec![Msg::from_api("C1".into(), json!({
+            "ts": "1.000000", "user": "U1",
+            "text": (0..20).map(|n| format!("body {n}")).collect::<Vec<_>>().join("\n"),
+            "files": [{"id": "F2", "name": "notes.txt", "filetype": "text", "size": 12}],
+        })).unwrap()], false);
+        list.rebuild_for_pane(&context, 120, 24);
+        assert_eq!(list.collapsed, vec![true]);
+        assert_eq!(list.flat[list.first[0] + 2].line.to_string(), "  body 0");
+        assert_eq!(list.flat[list.first[0] + 3].line.to_string(), "  ... (19 more lines)");
+        assert_eq!(list.flat[list.first[0] + 4].line.to_string(), "  [file] notes.txt (text, 12B)");
+        // The smallest message that collapses: five rows, two of them hidden,
+        // with the header, the first body row and the last shown once each.
+        let mut list = MsgList::new(vec![msg(1, "one\ntwo\nthree\nfour")], false);
+        list.rebuild_for_pane(&context, 120, 8);
+        assert_eq!(list.collapsed, vec![true]);
+        let rows: Vec<_> = list.flat[list.first[0]..=list.last[0]]
+            .iter().map(|line| line.line.to_string()).collect();
+        assert_eq!(rows.len(), 6);
+        assert!(rows[1].contains("UTC") && !rows[1].contains("one"));
+        assert_eq!(rows[2], "  one");
+        assert_eq!(rows[3], "  ... (2 more lines)");
+        assert_eq!(rows[4], "  four");
+        // One row shorter, and collapsing would save nothing: the elision
+        // would stand in for the single line it replaced. Left whole.
+        let mut list = MsgList::new(vec![msg(1, "one\ntwo\nthree")], false);
+        list.rebuild_for_pane(&context, 120, 8);
+        assert_eq!(list.collapsed, vec![false]);
+        let rows: Vec<_> = list.flat[list.first[0]..=list.last[0]]
+            .iter().map(|line| line.line.to_string()).collect();
+        assert_eq!(rows.len(), 6);
+        assert!(rows[1].contains("UTC"));
+        assert_eq!(&rows[2..], ["  one", "  two", "  three", ""]);
+    }
+
+    #[test]
+    fn horizontal_navigation_unwinds_one_level_at_a_time() {
+        for (forward, back) in [(KeyCode::Char('l'), KeyCode::Char('h')), (KeyCode::Right, KeyCode::Left)] {
+            let mut app = App::new(
+                Corpus::stub(&[]), Tz::Utc, 30.0, false, false,
+                PathBuf::new(), PathBuf::new(), 60, None, None,
+            );
+            app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
+            let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+            app.on_key(key(forward));
+            assert!(app.focus == Focus::Msgs);
+            let mut root = msg(3, "thread root");
+            root.reply_count = 2;
+            app.open.as_mut().unwrap().list = MsgList::new(vec![msg(1, "first"), msg(2, "second"), root.clone()], false);
+            app.on_key(key(KeyCode::Char('j')));
+            app.on_key(key(KeyCode::Char('j')));
+            assert_eq!(app.active_list().unwrap().cursor, 2);
+            app.on_key(key(forward));
+            assert!(matches!(app.stack.last(), Some(View::Thread { .. })));
+            assert!(!app.open.as_ref().unwrap().list.line_scroll);
+            // Supply offline replies; this test must not access Slack.
+            let View::Thread { list, .. } = app.stack.last_mut().unwrap() else { panic!() };
+            *list = MsgList::new(vec![root, msg(4, "reply"), msg(5, "another reply")], true);
+            app.on_key(key(KeyCode::Char('j')));
+            app.on_key(key(KeyCode::Char('j')));
+            app.on_key(key(back));
+            assert!(app.stack.is_empty());
+            assert_eq!(app.active_list().unwrap().cursor, 2);
+            assert!(app.focus == Focus::Msgs);
+            // Re-enter, then descend through message reading and raw JSON.
+            app.on_key(key(forward));
+            let View::Thread { list, .. } = app.stack.last_mut().unwrap() else { panic!() };
+            *list = MsgList::new(vec![msg(4, &"reply\n".repeat(40))], true);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            app.on_key(key(forward));
+            assert!(app.active_list().unwrap().line_scroll);
+            app.on_key(key(forward));
+            assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+            app.on_key(key(back));
+            assert!(matches!(app.stack.last(), Some(View::Thread { .. })));
+            assert!(app.active_list().unwrap().line_scroll);
+            app.on_key(key(back));
+            assert!(!app.active_list().unwrap().line_scroll);
+            assert!(matches!(app.stack.last(), Some(View::Thread { .. })));
+            app.on_key(key(back));
+            assert!(app.stack.is_empty());
+            assert!(app.open.is_some());
+            app.on_key(key(back));
+            assert!(app.open.is_none());
+            assert!(app.focus == Focus::Convs);
+            app.on_key(key(back));
+            assert!(app.focus == Focus::Convs);
+        }
+    }
+
+    #[test]
+    fn back_unwinds_one_view_before_returning_home() {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            60,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![json!({"id":"C1", "name":"test", "is_member":true})]);
+        for action in [Action::Back] {
+            app.open_conv(0);
+            app.stack.push(View::Raw {
+                title: "raw".into(),
+                browser: crate::raw::Browser::new(&json!({"text":"test"})),
+                entry_focus: Focus::Msgs,
+            });
+            app.on_msg_key(Some(action));
+            assert!(app.open.is_some());
+            assert!(app.stack.is_empty());
+            app.on_msg_key(Some(action));
+            assert!(app.open.is_none());
+            assert!(app.focus == Focus::Convs);
+            assert!(app.status.is_empty());
+            assert_eq!(app.title(), "messages");
+        }
+    }
+
+    #[test]
+    fn slash_lines_parse_into_commands() {
+        assert_eq!(
+            parse_command("find team nginx"),
+            Some(Command::Find("team nginx".into()))
+        );
+        assert_eq!(parse_command("/Search x"), Some(Command::Find("x".into())));
+        assert_eq!(parse_command("find"), Some(Command::Find(String::new())));
+        assert_eq!(
+            parse_command("leave #kudos-to-you"),
+            Some(Command::Leave("#kudos-to-you".into()))
+        );
+        assert_eq!(parse_command("leave"), Some(Command::Leave(String::new())));
+        assert_eq!(parse_command("leav #x"), None);
+        assert_eq!(
+            parse_command("cache stop #x"),
+            Some(Command::Cache("stop".into(), "#x".into()))
+        );
+        assert_eq!(parse_command("cache purge"), None);
+        assert_eq!(
+            parse_command("unmute"),
+            Some(Command::Mute(false, String::new()))
+        );
+        assert_eq!(
+            parse_command("/colorpalette"),
+            Some(Command::ColorPalette(String::new()))
+        );
+        assert_eq!(
+            parse_command("colors"),
+            Some(Command::ColorPalette(String::new()))
+        );
+        assert_eq!(
+            parse_command("colorpalette vintage"),
+            Some(Command::ColorPalette("vintage".into()))
+        );
+        assert_eq!(parse_command("/version"), Some(Command::Version));
+        assert_eq!(parse_command("version now"), None);
+        assert_eq!(parse_command(""), None);
+    }
+
+    #[test]
+    fn mentions_link_known_handles_only() {
+        let users = |h: &str| (h == "gabriel.clima").then(|| "U1".to_string());
+        assert_eq!(
+            link_mentions("hi @gabriel.clima, see @nobody and @gabriel.clima.", users),
+            "hi <@U1>, see @nobody and <@U1>."
+        );
+        assert_eq!(
+            link_mentions("@channel @here (@gabriel.clima)", users),
+            "@channel @here (@gabriel.clima)"
+        );
+        assert_eq!(link_mentions("", users), "");
+    }
+
+    #[test]
+    fn unread_divider_opens_at_the_first_message_past_the_marker() {
+        // Two days, four messages; the marker sits after the second.
+        let a = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let day = 86_400;
+        let msgs = vec![
+            msg(day + 10, "old one"),
+            msg(day + 20, "old two"),
+            msg(2 * day + 10, "new one"),
+            msg(2 * day + 20, "new two"),
+        ];
+        let read_marker = 2 * day * 1_000_000; // between day 1 and day 2
+        let mut list = MsgList::new(msgs, false);
+        let ctx = Ctx {
+            archive: Some(&a),
+            corpus: &corpus,
+            tz: Tz::Utc,
+            image_font: None,
+            last_read: Some(read_marker),
+            palette: &Palette::default(),
+        };
+        list.rebuild(&ctx, 60);
+        let texts: Vec<String> = list.flat.iter().map(|fl| line_text(&fl.line)).collect();
+        let new_line = texts
+            .iter()
+            .position(|t| t.contains("new"))
+            .expect("a new divider");
+        // The divider is the day-2 header carrying "new", above "new one".
+        assert!(texts[new_line].contains("new"), "{:?}", texts[new_line]);
+        let body = texts.iter().position(|t| t.contains("new one")).unwrap();
+        assert!(new_line < body);
+        // Nothing before the marker is flagged.
+        assert!(texts[..new_line].iter().all(|t| !t.contains("· new")));
+    }
+
+    #[test]
+    fn no_marker_means_no_new_divider() {
+        let a = Archive::stub(&[], &[]);
+        let corpus = Corpus::stub(&[]);
+        let mut list = MsgList::new(vec![msg(100, "a"), msg(200, "b")], false);
+        let ctx = Ctx {
+            archive: Some(&a),
+            corpus: &corpus,
+            tz: Tz::Utc,
+            image_font: None,
+            last_read: None,
+            palette: &Palette::default(),
+        };
+        list.rebuild(&ctx, 60);
+        assert!(list
+            .flat
+            .iter()
+            .all(|fl| !line_text(&fl.line).contains("new")));
+    }
+    #[test]
+    fn star_aliases_and_stale_snapshots_preserve_confirmed_changes() {
+        for word in ["star", "pin"] {
+            assert_eq!(parse_command(&format!("/{word} #one")), Some(Command::Star(true, "#one".into())));
+        }
+        for word in ["unstar", "unpin"] {
+            assert_eq!(parse_command(word), Some(Command::Star(false, String::new())));
+        }
+        let mut app = mute_test_app();
+        app.finish_star("C1", true, vec!["C1".into()]);
+        app.take_starred_snapshot(0, vec![]);
+        assert!(app.starred.contains("C1"));
+        app.bg = Some(live::completed_job(JobKind::StarredChannels { gen: app.starred_generation }, Ok(Done::StarredChannels(vec!["D1".into()]))));
+        app.tick();
+        assert!(!app.starred.contains("C1"));
+        assert!(app.starred.contains("D1"));
+        app.job = Some(live::completed_job(JobKind::SetStarred, Ok(Done::StarChanged { cid: "D1".into(), starred: false, ids: vec![] })));
+        app.tick();
+        assert!(app.starred.is_empty());
+        assert!(app.status.contains("unstarred in Slack"));
+        app.starred.insert("C1".into());
+        app.job = Some(live::completed_job(JobKind::SetStarred, Err("denied".into())));
+        app.tick();
+        assert!(app.starred.contains("C1"));
+        assert!(app.starred_pending);
+    }
+
+    #[test]
+    fn starred_conversations_precede_unreads_and_mutes_with_a_nonselectable_divider() {
+        let mut app = mute_test_app();
+        app.starred.insert("D1".into());
+        app.muted.insert("D1".into());
+        app.corpus.convs[0].unread = true;
+        // Type comes first so the drawing below still runs under Size, the one
+        // sort in this list that draws no group divider of its own.
+        for sort in [Sort::Type, Sort::Name, Sort::Mine, Sort::Recent, Sort::Size] {
+            app.sort = sort;
+            app.apply_filter();
+            assert_eq!(app.conv(app.filtered[0]).id, "D1");
+        }
+        app.focus = Focus::Convs;
+        app.conv_cursor = 0;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("────────"));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.conv_cursor, 1);
+        assert_eq!(app.conv(app.filtered[app.conv_cursor]).id, "C1");
+        assert_eq!(app.filtered.len(), 2);
+        app.starred.clear();
+        app.apply_filter();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!((2..10).filter(|&y| buffer[(2,y)].symbol() == "─").count(), 1); // SAVED divider remains.
+    }
+
+    #[test]
+    fn combined_archives_find_secondary_files_and_refuse_partial_wipes() {
+        let root = std::env::temp_dir().join(format!("slack-union-files-{}", std::process::id()));
+        let first = root.join("first");
+        let second = root.join("second");
+        let file_path = second.join("__uploads/FTEST/image.png");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"fixture").unwrap();
+        let mut app = mute_test_app();
+        let mut archive = crate::archive::Archive::stub(&[], &[]);
+        archive.dir = first.clone();
+        archive.source_dirs = vec![first.clone(), second];
+        app.corpus.archives.push(archive);
+        app.corpus.convs[0].archive = 0;
+        app.corpus.convs[0].live_only = false;
+        let file = crate::archive::FileInfo::from_slack(&json!({"id":"FTEST","title":"image.png","mimetype":"image/png"}),"C1");
+        assert_eq!(app.local_file(&file,true),Some(file_path.clone()));
+        app.cache_cmd("wipe","#one");
+        assert!(app.status.contains("multiple archives"));
+        assert!(first.is_dir());
+        assert!(file_path.is_file());
+        let mut secondary = crate::archive::Archive::stub(&[], &[]);
+        secondary.dir = app.corpus.archives[0].source_dirs[1].clone();
+        secondary.source_dirs = vec![secondary.dir.clone()];
+        secondary.conn.execute_batch("CREATE TABLE MESSAGE(CHANNEL_ID TEXT); INSERT INTO MESSAGE VALUES ('D1');").unwrap();
+        app.corpus.archives.push(secondary);
+        app.corpus.convs[1].archive = 1;
+        app.corpus.convs[1].live_only = false;
+        assert!(app.archive_dir(1).unwrap().1);
+        let name = app.corpus.convs[1].name.clone();
+        app.cache_cmd("wipe", &name);
+        assert!(app.status.contains("shared multi-channel archive"));
+        assert!(file_path.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `/labels` is a toggle that says which way it went, completes like the
+    /// other commands, and is off at every start.
+    #[test]
+    fn the_labels_command_toggles_the_mode_and_reports_it() {
+        let mut app = mute_test_app();
+        assert!(!app.labels);
+        app.run_command("labels", "");
+        assert!(app.labels);
+        assert_eq!(app.status, "labels on");
+        app.run_command("/labels", "");
+        assert!(!app.labels);
+        assert_eq!(app.status, "labels off");
+        // An argument is not a labels command, and leaves the mode alone.
+        app.run_command("labels off", "");
+        assert!(!app.labels);
+        assert!(app.status.starts_with("unknown command"));
+        assert!(complete::COMMANDS.iter().any(|c| c.name == "labels"));
+    }
+
+    pub(crate) fn mute_test_app() -> App {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        );
+        app.merge_conversations(vec![
+            json!({"id":"C1","name":"one","is_member":true}),
+            json!({"id":"D1","user":"U1","is_im":true}),
+        ]);
+        app
+    }
+
+    /// An app whose conversations are the named ones, each of the kind given
+    /// and either cached — held by the archive — or live-only. The names come
+    /// out the way the pane draws them: `#name` for a public or private
+    /// channel, `@name` for a direct or group message.
+    pub(crate) fn kind_test_app(convs: &[(&str, Kind, bool)]) -> App {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        );
+        app.merge_conversations(
+            convs
+                .iter()
+                .enumerate()
+                .map(|(i, (name, kind, _))| {
+                    let id = format!("C{}", i + 1);
+                    match kind {
+                        Kind::Channel => json!({"id":id,"name":name,"is_member":true}),
+                        Kind::Private => {
+                            json!({"id":id,"name":name,"is_private":true,"is_member":true})
+                        }
+                        // The name a group message carries on Slack, which the
+                        // merge strips back to the handles.
+                        Kind::Mpim => json!({"id":id,"name":format!("mpdm-{name}-1"),"is_mpim":true}),
+                        Kind::Im => json!({"id":id,"user":name,"is_im":true}),
+                    }
+                })
+                .collect(),
+        );
+        for (i, (_, _, cached)) in convs.iter().enumerate() {
+            app.corpus.convs[i].live_only = !cached;
+        }
+        app.apply_filter();
+        app
+    }
+    /// An app on a pinned clock whose conversations are the named ones, each
+    /// with its newest message `age` seconds before that clock. A negative age
+    /// dates a conversation in the future; `None` gives it no newest message at
+    /// all. The names are given in no particular order: `apply_filter` puts the
+    /// list in the order the pane draws it.
+    pub(crate) fn aged_test_app(now: i64, convs: &[(&str, Option<i64>)]) -> App {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        );
+        app.clock = Some(now);
+        app.merge_conversations(
+            convs
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| {
+                    json!({"id":format!("C{}", i + 1),"name":name,"is_member":true})
+                })
+                .collect(),
+        );
+        for (i, (_, age)) in convs.iter().enumerate() {
+            app.corpus.convs[i].last_id = age.map_or(0, |age| (now - age) * 1_000_000);
+            app.corpus.convs[i].live_only = false;
+        }
+        app.apply_filter();
+        app
+    }
+
+    /// An app on a pinned clock whose conversations are the ones described:
+    /// the name the pane is to draw, the channel object Slack would answer
+    /// with, and how old the newest message is — `None` for none at all, which
+    /// only matters for the order inside a type.
+    ///
+    /// The name is written over the one the merge derives, so a row stays
+    /// findable whatever the channel object says; `is_archived` is applied
+    /// here because the live membership merge does not read it. Two users are
+    /// known to the corpus: `UBOT` is an app and `UHUMAN` a person. `USLACKBOT`
+    /// is deliberately absent from the map, the way its own record carries no
+    /// `is_bot`, and so is `UNKNOWN`.
+    pub(crate) fn type_test_app(now: i64, convs: &[(&str, Value, Option<i64>)]) -> App {
+        let mut app = App::new(
+            Corpus::stub(&[]),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        );
+        app.clock = Some(now);
+        app.corpus.merge_profiles(vec![
+            json!({"id":"UBOT","name":"appbot","is_bot":true}),
+            json!({"id":"UHUMAN","name":"alice"}),
+        ]);
+        app.merge_conversations(
+            convs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, channel, _))| {
+                    let mut channel = channel.clone();
+                    channel["id"] = json!(format!("C{}", i + 1));
+                    channel
+                })
+                .collect(),
+        );
+        for (i, (name, channel, age)) in convs.iter().enumerate() {
+            let conv = &mut app.corpus.convs[i];
+            conv.name = (*name).to_string();
+            conv.last_id = age.map_or(0, |age| (now - age) * 1_000_000);
+            conv.archived = channel["is_archived"].as_bool().unwrap_or(false);
+            conv.live_only = false;
+        }
+        app.apply_filter();
+        app
+    }
+
+    fn control_b() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+    }
+
+    /// The cycle survives a restart, and a settings file it cannot write
+    /// costs the state nothing but a note in the status line.
+    #[test]
+    fn the_pane_state_survives_a_restart() {
+        use ConversationsPaneVisibility::*;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("slack-tui-pane-restart-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let keys = dir.join("keys.json");
+        let settings = dir.join("conversations-pane.json");
+        let start = || {
+            App::new(
+                Corpus::stub(&[]),
+                Tz::Utc,
+                30.0,
+                false,
+                false,
+                PathBuf::new(),
+                PathBuf::new(),
+                0,
+                None,
+                Some(keys.clone()),
+            )
+        };
+
+        let mut app = start();
+        assert_eq!(app.conversations_pane, AlwaysShown);
+        app.on_key(control_b());
+        assert_eq!(start().conversations_pane, AlwaysHidden);
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AutoHideInsideConversation);
+        assert_eq!(app.status, AutoHideInsideConversation.label());
+        assert_eq!(start().conversations_pane, AutoHideInsideConversation);
+        // Round the cycle: the default is saved as explicitly as the rest.
+        app.on_key(control_b());
+        assert_eq!(start().conversations_pane, AlwaysShown);
+
+        // An unwritable file keeps the state for this session and says so.
+        std::fs::write(&settings, "broken").unwrap();
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AlwaysHidden);
+        assert!(app.status.starts_with(AlwaysHidden.label()), "{}", app.status);
+        assert!(app.status.contains("not saved"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "broken");
+        // The next start reads the corrupt file as the default, not a crash.
+        assert_eq!(start().conversations_pane, AlwaysShown);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The cycle order and its wrap, and the auto-hide state moving the pane
+    /// in both directions with no key pressed for it.
+    #[test]
+    fn conversations_pane_cycles_and_auto_hide_follows_the_conversation() {
+        use ConversationsPaneVisibility::*;
+        let mut app = mute_test_app();
+        assert_eq!(app.conversations_pane, AlwaysShown);
+        assert!(app.conversations_visible());
+
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AlwaysHidden);
+        assert_eq!(app.status, AlwaysHidden.label());
+        assert!(!app.conversations_visible());
+
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AutoHideInsideConversation);
+        // Browsing the list.
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(app.conversations_visible());
+        // Entering a conversation hides it.
+        app.open_conv(0);
+        assert_eq!(app.focus, Focus::Msgs);
+        assert!(app.inside_conversation());
+        assert!(!app.conversations_visible());
+        // Leaving it brings it back.
+        app.on_msg_key(Some(Action::Back));
+        assert_eq!(app.focus, Focus::Convs);
+        assert!(!app.inside_conversation());
+        assert!(app.conversations_visible());
+        // Tabbing into the conversation and back moves it too.
+        app.open_conv(0);
+        assert!(!app.conversations_visible());
+        app.on_msg_key(Some(Action::OtherPane));
+        assert!(app.conversations_visible());
+        app.on_conv_key(Some(Action::OtherPane));
+        assert!(!app.conversations_visible());
+
+        // The wrap: three presses return to where the cycle started.
+        app.on_key(control_b());
+        assert_eq!(app.conversations_pane, AlwaysShown);
+        assert!(app.conversations_visible());
+        for expected in [AlwaysHidden, AutoHideInsideConversation, AlwaysShown] {
+            app.on_key(control_b());
+            assert_eq!(app.conversations_pane, expected);
+        }
+    }
+
+    /// The hidden state never leaves the cursor in a pane nobody draws, and
+    /// never moves it while a prompt is deciding what it searches.
+    #[test]
+    fn a_hidden_conversations_pane_does_not_strand_the_cursor() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        app.on_msg_key(Some(Action::OtherPane));
+        assert_eq!(app.focus, Focus::Convs);
+        app.on_key(control_b());
+        assert_eq!(
+            app.conversations_pane,
+            ConversationsPaneVisibility::AlwaysHidden
+        );
+        assert_eq!(app.focus, Focus::Msgs);
+        // Asking for the pane again does not park the cursor on it.
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Msgs);
+        // `h` from the bare timeline empties the messages pane; with neither
+        // pane holding anything the focus stays put and the status says why
+        // the screen is bare.
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(!app.messages_pane_occupied());
+        assert_eq!(app.focus, Focus::Convs);
+        assert_eq!(app.status, PANE_HIDDEN_HINT);
+
+        // Same at a fresh start: nothing to move to, so nothing moves.
+        let mut home = mute_test_app();
+        home.on_key(control_b());
+        assert_eq!(home.focus, Focus::Convs);
+        assert!(!home.conversations_visible());
+
+        // A prompt keeps the focus it was opened with.
+        let mut prompt = mute_test_app();
+        prompt.open_conv(0);
+        prompt.on_msg_key(Some(Action::OtherPane));
+        prompt.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(matches!(prompt.mode, Mode::Prompt { .. }));
+        prompt.on_key(control_b());
+        assert_eq!(prompt.focus, Focus::Convs);
+        assert!(!prompt.conversations_visible());
+    }
+
+    #[test]
+    fn mute_snapshots_replace_removed_ids_and_ignore_stale_reads() {
+        let mut app = mute_test_app();
+        app.take_muted(vec!["C1".into()]);
+        let generation = app.muted_generation;
+        app.finish_mute("C1", false, vec!["D1".into()]);
+        assert!(!app.muted.contains("C1"));
+        assert!(app.muted.contains("D1"));
+        app.take_muted_snapshot(generation, vec!["C1".into()]);
+        assert!(!app.muted.contains("C1"));
+        app.take_muted_snapshot(app.muted_generation, vec![]);
+        assert!(app.muted.is_empty());
+        assert!(app.corpus.convs.iter().all(|c| !c.muted));
+    }
+    #[test]
+    fn mute_completion_applies_target_not_cursor_and_failures_preserve_state() {
+        let mut app = mute_test_app();
+        app.job = Some(live::completed_job(
+            JobKind::SetMuted,
+            Ok(Done::MuteChanged {
+                cid: "C1".into(),
+                muted: true,
+                ids: vec!["C1".into()],
+            }),
+        ));
+        app.conv_cursor = 1;
+        app.tick();
+        assert!(app.muted.contains("C1"));
+        assert!(app.status.contains("#one muted in Slack (verified)"));
+        let before = app.muted_generation;
+        app.job = Some(live::completed_job(
+            JobKind::SetMuted,
+            Err("verification failed".into()),
+        ));
+        app.tick();
+        assert!(app.muted.contains("C1"));
+        assert!(app.status.contains("verification failed"));
+        assert!(app.muted_generation > before);
+        // Quiet and foreground result handling must agree.
+        app.bg = Some(live::completed_job(
+            JobKind::SetMuted,
+            Ok(Done::MuteChanged {
+                cid: "C1".into(),
+                muted: false,
+                ids: vec![],
+            }),
+        ));
+        app.tick();
+        assert!(app.muted.is_empty());
+    }
+    #[test]
+    fn mute_offline_never_creates_a_local_override() {
+        let mut app = mute_test_app();
+        app.mute_cmd(true, "#one");
+        assert!(app.job.is_none());
+        assert!(app.muted.is_empty());
+        assert!(app.status.contains("sign-in"));
+    }
+    #[test]
+    fn mute_dispatch_invalidates_reads_and_blocks_preference_scheduling() {
+        use std::sync::{mpsc, Mutex};
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let release_receiver = Mutex::new(release_receiver);
+        let client = Client::for_test(move |method, _| {
+            assert_eq!(method, "users.prefs.setNotifications");
+            started_sender.send(()).unwrap();
+            release_receiver.lock().unwrap().recv_timeout(Duration::from_secs(2)).unwrap();
+            Err("write denied".into())
+        });
+        let mut app = mute_test_app();
+        app.api = Some(Arc::new(client));
+        app.live = true;
+        let generation = app.muted_generation;
+        let (snapshot, snapshot_sender) = live::pending_job(JobKind::MutedChannels { gen: generation });
+        app.bg = Some(snapshot);
+        app.mute_cmd(true, "#one");
+        started_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(app.muted_generation > generation);
+        snapshot_sender.send(Ok(Done::MutedChannels(vec!["D1".into()]))).ok().unwrap();
+        app.muted_pending = true;
+        app.tick();
+        assert!(app.muted.is_empty());
+        assert!(app.bg.is_none());
+        assert!(app.muted_pending);
+        assert!(matches!(app.job.as_ref().map(|job| &job.kind), Some(JobKind::SetMuted)));
+        // Release the worker without timing-dependent polling of its result.
+        release_sender.send(()).unwrap();
+        app.api = None;
+        let generation = app.muted_generation;
+        app.job = Some(live::completed_job(JobKind::SetMuted, Err("write denied".into())));
+        app.muted_pending = false;
+        app.tick();
+        assert!(app.muted_pending);
+        assert!(app.muted_generation > generation);
+        app.bg = Some(live::completed_job(JobKind::MutedChannels { gen: generation }, Ok(Done::MutedChannels(vec!["D1".into()]))));
+        app.tick();
+        assert!(app.muted.is_empty());
+    }
+
+    #[test]
+    fn release_picture_drops_pending_completion_and_keeps_other_images() {
+        let mut app = mute_test_app();
+        app.images.insert("F1:full".into(), ImageState::Loading);
+        app.images.insert("F2:full".into(), ImageState::Loading);
+        app.file_job = Some(live::completed_job(JobKind::File { id: "F1:full".into() },
+            Ok(Done::File(PathBuf::from("unused-image.png")))));
+        app.release_picture("F2:full");
+        assert!(app.file_job.is_some());
+        app.release_picture("F1:full");
+        assert!(app.file_job.is_none());
+        app.tick();
+        assert!(!app.images.contains_key("F1:full"));
+    }
+
+    /// An archive on disk carrying the rows `v` on a conversation row reads:
+    /// a channel object with a `purpose` and a topic holding a Slack
+    /// permalink, a group message, a direct message whose counterpart has a
+    /// `tz`, one whose counterpart the user table does not name, and one the
+    /// channel object does not name at all. Duplicate rows are written first
+    /// with the wrong value, so a reader that takes the oldest row fails.
+    fn conversation_row_archive(app: &mut App, link: &str) -> PathBuf {
+        let dir = crate::archive::test_dir("raw-conversation-rows");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.join("slackdump.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE CHANNEL(ID TEXT, NAME TEXT, DATA BLOB, CHUNK_ID INTEGER);
+                 CREATE TABLE CHANNEL_USER(CHANNEL_ID TEXT, USER_ID TEXT);
+                 CREATE TABLE S_USER(ID TEXT, USERNAME TEXT, DATA BLOB);
+                 CREATE TABLE MESSAGE(ID INTEGER, CHUNK_ID INTEGER, CHANNEL_ID TEXT, TS TEXT,
+                     PARENT_ID INTEGER, THREAD_TS TEXT, IS_PARENT INTEGER, LATEST_REPLY TEXT,
+                     TXT TEXT, DATA BLOB);",
+            )
+            .unwrap();
+            let channel = |id: &str, chunk: i64, data: Value| {
+                conn.execute(
+                    "INSERT INTO CHANNEL VALUES (?1, ?2, CAST(?3 AS BLOB), ?4)",
+                    rusqlite::params![id, "", data.to_string(), chunk],
+                )
+                .unwrap();
+            };
+            channel("C1", 1, json!({"id":"C1","purpose":{"value":"an older purpose"}}));
+            channel("C1", 2, json!({"id":"C1","name":"one","is_channel":true,
+                "purpose":{"value":"keep nginx builds moving"},"topic":{"value":link}}));
+            channel("G1", 1, json!({"id":"G1","is_mpim":true,"is_group":true,
+                "name":"mpdm-ivan--olga-1","purpose":{"value":"the three of us"}}));
+            channel("D2", 1, json!({"id":"D2","is_im":true,"user":"U2"}));
+            channel("D3", 1, json!({"id":"D3","is_im":true,"user":"U9"}));
+            // No `user` field: the counterpart comes from CHANNEL_USER.
+            // D4 settles it, D5 has the owner alone, D6 has two others.
+            channel("D4", 1, json!({"id":"D4","is_im":true}));
+            channel("D5", 1, json!({"id":"D5","is_im":true}));
+            channel("D6", 1, json!({"id":"D6","is_im":true}));
+            conn.execute_batch(
+                "INSERT INTO CHANNEL_USER VALUES ('D4','U1'), ('D4','U2'), ('D5','U1'),
+                 ('D6','U2'), ('D6','U3');",
+            )
+            .unwrap();
+            // C7's row is there and cannot be decoded; C8 has no row at all.
+            conn.execute(
+                "INSERT INTO CHANNEL VALUES ('C7', '', CAST(?1 AS BLOB), 1)",
+                rusqlite::params!["{\"id\":\"C7\", truncated"],
+            )
+            .unwrap();
+            let user = |id: &str, data: Value| {
+                conn.execute(
+                    "INSERT INTO S_USER VALUES (?1, ?2, CAST(?3 AS BLOB))",
+                    rusqlite::params![id, "oliver.hendricks", data.to_string()],
+                )
+                .unwrap();
+            };
+            user("U2", json!({"id":"U2","name":"oliver.hendricks","tz":"Etc/UTC"}));
+            user("U2", json!({"id":"U2","name":"oliver.hendricks","tz":"Europe/Prague",
+                "profile":{"display_name":"ivan","title":"nginx"}}));
+            let data = json!({"text":"the linked message","ts":"7.000000","user":"U1"}).to_string();
+            conn.execute(
+                "INSERT INTO MESSAGE VALUES (7000000,1,'C1','7.000000',NULL,NULL,0,NULL,?1,CAST(?2 AS BLOB))",
+                rusqlite::params!["the linked message", data],
+            )
+            .unwrap();
+        }
+        app.corpus.me = Some("U1".into());
+        app.corpus.workspace_url = "https://myorg.slack.com".into();
+        app.merge_conversations(vec![
+            json!({"id":"G1","name":"mpdm-ivan--olga-1","is_mpim":true}),
+            json!({"id":"D2","user":"U2","is_im":true}),
+            json!({"id":"D3","user":"U9","is_im":true}),
+            json!({"id":"D4","is_im":true}),
+            json!({"id":"D5","is_im":true}),
+            json!({"id":"D6","is_im":true}),
+            json!({"id":"C7","name":"unreadable","is_member":true}),
+            json!({"id":"C8","name":"rowless","is_member":true}),
+            json!({"id":"C9","name":"live-only","is_member":true}),
+        ]);
+        app.corpus
+            .archives
+            .push(Archive::open("full/rows".into(), &dir).unwrap());
+        let index = app.corpus.archives.len() - 1;
+        for id in ["C1", "G1", "D2", "D3", "D4", "D5", "D6", "C7", "C8"] {
+            let conv = app.corpus.conv_by_channel(id).unwrap();
+            app.corpus.convs[conv].archive = index;
+            app.corpus.convs[conv].live_only = false;
+        }
+        app.apply_filter();
+        dir
+    }
+
+    /// Put the cursor on one conversation row of the list.
+    fn select_conversation(app: &mut App, id: &str) {
+        let conv = app.corpus.conv_by_channel(id).unwrap();
+        app.top_section = None;
+        app.conv_cursor = app.filtered.iter().position(|&i| i == conv).unwrap();
+        app.focus = Focus::Convs;
+    }
+
+    fn screen(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `v` on a channel row opens the archived `CHANNEL` object, including
+    /// fields `Conv` never extracts, and takes the newest chunk's row.
+    /// `h` and Esc both come back to the same row of the list.
+    #[test]
+    fn raw_json_on_a_channel_row_draws_the_archived_channel_object() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        select_conversation(&mut app, "C1");
+        let (cursor, offset) = (app.conv_cursor, app.conv_offset);
+        for close in [KeyCode::Char('h'), KeyCode::Esc] {
+            app.on_key(key(KeyCode::Char('v')));
+            assert!(matches!(app.stack.last(), Some(View::Raw { .. })), "{close:?}");
+            assert!(app.open.is_none(), "{close:?}");
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let drawn = screen(&terminal);
+            assert!(drawn.contains("\"purpose\""), "{drawn}");
+            assert!(drawn.contains("keep nginx builds moving"), "{drawn}");
+            assert!(!drawn.contains("an older purpose"), "{drawn}");
+            assert!(drawn.contains("\"is_channel\""), "{drawn}");
+            assert!(drawn.contains("raw · #one · C1"), "{drawn}");
+            assert!(!drawn.contains("select a conversation and press Enter"), "{drawn}");
+            app.on_key(key(close));
+            assert!(app.stack.is_empty(), "{close:?}");
+            assert_eq!((app.conv_cursor, app.conv_offset), (cursor, offset), "{close:?}");
+            assert_eq!(app.focus, Focus::Convs, "{close:?}");
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            assert!(screen(&terminal).contains("select a conversation and press Enter"));
+        }
+        // With a conversation open behind the list, `h` still comes back to
+        // the row the cursor was on rather than into that conversation.
+        app.open_conv(app.corpus.conv_by_channel("G1").unwrap());
+        select_conversation(&mut app, "C1");
+        app.on_key(key(KeyCode::Char('v')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("keep nginx builds moving"));
+        app.on_key(key(KeyCode::Char('h')));
+        assert_eq!(app.focus, Focus::Convs);
+        assert_eq!((app.conv_cursor, app.conv_offset), (cursor, offset));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.open.as_ref().map(|open| open.conv), app.corpus.conv_by_channel("G1"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A group message answers with its conversation object; a direct
+    /// message with the counterpart's user object, including a field `User`
+    /// never extracts, and from the newest of the duplicate rows. The
+    /// counterpart is the channel object's `user`, or CHANNEL_USER without
+    /// the owner when the object does not name one.
+    #[test]
+    fn raw_json_on_group_and_direct_message_rows_draws_conversation_and_user() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        select_conversation(&mut app, "G1");
+        app.on_key(key(KeyCode::Char('v')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let drawn = screen(&terminal);
+        assert!(drawn.contains("\"is_mpim\""), "{drawn}");
+        assert!(drawn.contains("mpdm-ivan--olga-1"), "{drawn}");
+        assert!(drawn.contains("the three of us"), "{drawn}");
+        app.on_key(key(KeyCode::Char('h')));
+
+        for (id, title) in [("D2", "· U2"), ("D4", "· U2")] {
+            select_conversation(&mut app, id);
+            app.on_key(key(KeyCode::Char('v')));
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            let drawn = screen(&terminal);
+            assert!(drawn.contains("\"tz\""), "{id}: {drawn}");
+            assert!(drawn.contains("Europe/Prague"), "{id}: {drawn}");
+            assert!(!drawn.contains("Etc/UTC"), "{id}: {drawn}");
+            assert!(drawn.contains("oliver.hendricks"), "{id}: {drawn}");
+            assert!(drawn.contains(title), "{id}: {drawn}");
+            assert!(!drawn.contains("\"is_im\""), "{id}: user object, not the channel: {drawn}");
+            app.on_key(key(KeyCode::Char('h')));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The three rows that stand for no object it can read: a direct message
+    /// whose counterpart the user table is missing, a conversation known
+    /// from Slack alone, and a top-section row.
+    #[test]
+    fn raw_json_refuses_rows_with_no_archived_object_and_says_which() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        select_conversation(&mut app, "D3");
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("U9 is not in this archive's user table"), "{}", app.status);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("select a conversation and press Enter"));
+
+        select_conversation(&mut app, "C9");
+        app.status.clear();
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("in Slack only"), "{}", app.status);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("select a conversation and press Enter"));
+
+        for section in TopSection::ALL {
+            app.top_section = Some(section);
+            app.status = "untouched".into();
+            app.on_key(key(KeyCode::Char('v')));
+            assert!(app.stack.is_empty(), "{section:?}");
+            assert_eq!(app.status, "untouched", "{section:?}");
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            assert!(!screen(&terminal).contains("\"purpose\""), "{section:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A Slack link inside a conversation's own JSON opens the message it
+    /// points at, with no conversation open behind the raw view.
+    #[test]
+    fn a_slack_link_in_a_conversation_object_opens_its_message() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(
+            &mut app,
+            "https://myorg.slack.com/archives/C1/p7000000",
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        select_conversation(&mut app, "C1");
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.stack.last(), Some(View::Thread { .. })), "{}", app.status);
+        assert!(app.open.is_none());
+        // The thread's own keys need the messages pane to hold the focus.
+        assert_eq!(app.focus, Focus::Msgs);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let drawn = screen(&terminal);
+        assert!(drawn.contains("the linked message"), "{drawn}");
+        assert!(!drawn.contains("select a conversation and press Enter"), "{drawn}");
+        app.on_key(key(KeyCode::Char('h')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("keep nginx builds moving"));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Convs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `v` on a message still opens that message's JSON: the same buffer
+    /// before and after the conversation rows learned the key.
+    #[test]
+    fn raw_json_on_a_message_is_unchanged_by_the_conversation_row_key() {
+        let mut app = mute_test_app();
+        app.open_conv(0);
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list =
+            MsgList::new(vec![msg(1, "a message of its own")], false);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let drawn = screen(&terminal);
+        assert!(drawn.contains("raw · 1.000000 · #one"), "{drawn}");
+        assert!(drawn.contains("a message of its own"), "{drawn}");
+        assert!(drawn.contains("\"ts\": \"1.000000\""), "{drawn}");
+        assert!(!drawn.contains("\"purpose\""), "{drawn}");
+    }
+    /// The pane `v` was pressed in gets the focus back, whatever a followed
+    /// link did to it in between and whether or not another conversation is
+    /// open behind the raw view.
+    #[test]
+    fn following_a_link_out_of_a_raw_view_returns_the_focus_it_was_opened_from() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(
+            &mut app,
+            "https://myorg.slack.com/archives/C1/p7000000",
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // From the list, with another conversation open behind it.
+        let other = app.corpus.conv_by_channel("G1").unwrap();
+        app.open_conv(other);
+        select_conversation(&mut app, "C1");
+        let cursor = app.conv_cursor;
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.stack.last(), Some(View::Thread { .. })), "{}", app.status);
+        assert_eq!(app.focus, Focus::Msgs);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("the linked message"));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(matches!(app.stack.last(), Some(View::Raw { .. })));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Convs);
+        assert_eq!(app.conv_cursor, cursor);
+        assert_eq!(app.open.as_ref().map(|open| open.conv), Some(other));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("select a conversation and press Enter"));
+
+        // The mirror: a message's own raw view keeps the messages pane.
+        app.open_conv(app.corpus.conv_by_channel("C1").unwrap());
+        app.focus = Focus::Msgs;
+        app.open.as_mut().unwrap().list = MsgList::new(
+            vec![msg(1, "see https://myorg.slack.com/archives/C1/p7000000 for it")],
+            false,
+        );
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.stack.last(), Some(View::Thread { .. })), "{}", app.status);
+        app.on_key(key(KeyCode::Char('h')));
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.stack.is_empty());
+        assert_eq!(app.focus, Focus::Msgs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Without a `user` field on the channel object, the membership answers
+    /// only when it settles the question: a known owner and exactly one
+    /// other member. Anything else names the ambiguity instead of picking.
+    #[test]
+    fn the_direct_message_counterpart_refuses_an_ambiguous_membership() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // One member who is not the owner: that member.
+        select_conversation(&mut app, "D4");
+        app.on_key(key(KeyCode::Char('v')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("Europe/Prague"));
+        app.on_key(key(KeyCode::Char('h')));
+
+        // The owner alone, and two members who are neither of them the owner.
+        for (id, count) in [("D5", "1 members"), ("D6", "2 members")] {
+            select_conversation(&mut app, id);
+            app.status.clear();
+            app.on_key(key(KeyCode::Char('v')));
+            assert!(app.stack.is_empty(), "{id}");
+            assert!(
+                app.status.contains(&format!("cannot tell the counterpart from {count}")),
+                "{id}: {}",
+                app.status
+            );
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+            assert!(screen(&terminal).contains("select a conversation and press Enter"), "{id}");
+        }
+
+        // No known owner: no member can be ruled out, so none is picked.
+        app.corpus.me = None;
+        select_conversation(&mut app, "D4");
+        app.status.clear();
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("no known owner"), "{}", app.status);
+        // The channel object's own `user` field still answers without one.
+        select_conversation(&mut app, "D2");
+        app.on_key(key(KeyCode::Char('v')));
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("Europe/Prague"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A row that is there and cannot be decoded says so, and does not read
+    /// as a row that is not there. A refusal over an open raw view leaves
+    /// the view and the focus alone.
+    #[test]
+    fn an_unreadable_row_is_not_reported_as_a_missing_one() {
+        let mut app = mute_test_app();
+        let dir = conversation_row_archive(&mut app, "");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        select_conversation(&mut app, "C7");
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("could not read this archive's channel row"), "{}", app.status);
+        assert!(!app.status.contains("holds no channel row"), "{}", app.status);
+
+        select_conversation(&mut app, "C8");
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.stack.is_empty());
+        assert!(app.status.contains("holds no channel row"), "{}", app.status);
+
+        // A refusal with a raw view already open, and a conversation open
+        // behind it, changes neither the stack nor the focus. `v` itself no
+        // longer reaches the handler there: an open raw view takes the key
+        // first, and answers to none of its own.
+        app.open_conv(app.corpus.conv_by_channel("G1").unwrap());
+        select_conversation(&mut app, "C1");
+        app.on_key(key(KeyCode::Char('v')));
+        let (depth, focus) = (app.stack.len(), app.focus);
+        assert_eq!(depth, 1);
+        app.conv_cursor = app
+            .filtered
+            .iter()
+            .position(|&i| i == app.corpus.conv_by_channel("C9").unwrap())
+            .unwrap();
+        app.status.clear();
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(app.status, "");
+        assert_eq!(app.stack.len(), depth);
+        app.on_conv_key(Some(Action::RawJson));
+        assert!(app.status.contains("in Slack only"), "{}", app.status);
+        assert_eq!(app.stack.len(), depth);
+        assert_eq!(app.focus, focus);
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("keep nginx builds moving"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // --------------------------------------------- the threads/ archive set
+
+    /// Build an App over a real archive root, through `Corpus::open`.
+    fn corpus_app(root: &Path) -> App {
+        App::new(
+            Corpus::open(root, 30.0, None).unwrap(),
+            Tz::Utc,
+            30.0,
+            false,
+            false,
+            PathBuf::new(),
+            PathBuf::new(),
+            0,
+            None,
+            None,
+        )
+    }
+
+    /// A `dms/` archive that settles the owner: two direct messages, `me` the
+    /// only user in both, which is what `self_user` counts.
+    fn dm_archive(dir: &Path, me: &str) {
+        crate::archive::channel_database(
+            dir,
+            &[("D1", "", Kind::Im), ("D2", "", Kind::Im)],
+            &[("D1", 100, 0, me, "hello"), ("D2", 101, 0, "U7", "hi")],
+        );
+        crate::archive::add_members(dir, &[("D1", me), ("D1", "U5"), ("D2", me), ("D2", "U7")]);
+    }
+
+    fn drawn(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Walk the open timeline's cursor to the message with this text, so a
+    /// test does not depend on how many top-level messages sit below it.
+    fn select_message(app: &mut App, text: &str) {
+        for _ in 0..64 {
+            if app.selected().map(|m| m.text.as_str()) == Some(text) {
+                return;
+            }
+            app.on_msg_key(Some(Action::Up));
+        }
+        panic!("{text:?} is not in the open timeline");
+    }
+
+    fn open_named(app: &mut App, name: &str) {
+        let idx = app.corpus.conv_by_name(name).unwrap_or_else(|| {
+            panic!("{name} is not in the conversation list: {:?}",
+                app.corpus.convs.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+        });
+        app.conv_cursor = app.filtered.iter().position(|&i| i == idx).unwrap();
+        assert!(app.open_conv(idx));
+    }
+
+    /// A `threads/` archive is the only cache of its channel: the `CHANNEL`
+    /// row names the conversation, the thread opens out of it, and THREADS
+    /// finds it. Nothing here has a `CHANNEL_USER` row.
+    #[test]
+    fn a_thread_only_archive_lists_its_channel_and_opens_the_thread() {
+        let root = crate::archive::test_dir("threads-set-alone");
+        dm_archive(&root.join("dms/self"), "U1");
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C9", "deploys", Kind::Channel)],
+            &[
+                ("C9", 1, 1, "U2", "the root"),
+                ("C9", 2, 1, "U1", "my reply"),
+                ("C9", 3, 1, "U2", "their answer"),
+            ],
+        );
+        let mut app = corpus_app(&root);
+        assert_eq!(app.corpus.me.as_deref(), Some("U1"));
+        let conv = &app.corpus.convs[app.corpus.conv_by_channel("C9").unwrap()];
+        // Everything `Conv` needs is there without a membership: the name and
+        // the kind off the CHANNEL row, the counts off MESSAGE. The score is
+        // vanishingly small only because the fixture's timestamps are 1970.
+        assert_eq!((conv.name.as_str(), conv.kind), ("#deploys", Kind::Channel));
+        assert_eq!((conv.msgs, conv.mine, conv.first_id, conv.last_id), (3, 1, 1_000_000, 3_000_000));
+        assert!(conv.score > 0.0 && !conv.live_only && !conv.archived);
+        assert_eq!(
+            app.corpus.archives[conv.archive].im_counterpart("C9", Some("U1")),
+            Ok(crate::archive::Counterpart::Ambiguous(0))
+        );
+
+        // The conversation holds the root; the replies are one level in.
+        open_named(&mut app, "#deploys");
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("#deploys") && screen.contains("the root"), "{screen}");
+        app.on_msg_key(Some(Action::Open));
+        assert!(matches!(app.stack.last(), Some(View::Thread { root: 1_000_000, .. })));
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("my reply") && screen.contains("their answer"), "{screen}");
+
+        // THREADS: the owner replied in it, so the card is there.
+        app.escape_home();
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(matches!(app.stack.last(), Some(View::Threads { .. })));
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000]
+        );
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("#deploys") && screen.contains("the root"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `threads/` archive of a channel `full/` already caches unions into
+    /// it: one conversation, the full archive's membership untouched, the
+    /// replies reachable, and one THREADS card rather than two.
+    #[test]
+    fn a_thread_archive_unions_into_the_full_archive_of_the_same_channel() {
+        let root = crate::archive::test_dir("threads-set-union");
+        dm_archive(&root.join("dms/self"), "U1");
+        let full = root.join("full/y");
+        crate::archive::channel_database(
+            &full,
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 1, 1, "U2", "the root"), ("C9", 9, 0, "U3", "unrelated line")],
+        );
+        crate::archive::add_members(&full, &[("C9", "U1"), ("C9", "U2"), ("C9", "U3")]);
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C9", "deploys", Kind::Channel)],
+            &[
+                ("C9", 1, 1, "U2", "the root"),
+                ("C9", 2, 1, "U1", "my reply"),
+                ("C9", 3, 1, "U2", "their answer"),
+            ],
+        );
+        let mut app = corpus_app(&root);
+        assert_eq!(app.corpus.convs.iter().filter(|c| c.id == "C9").count(), 1);
+        let index = app.corpus.conv_by_channel("C9").unwrap();
+        let conv = &app.corpus.convs[index];
+        assert_eq!((conv.name.as_str(), conv.msgs, conv.mine), ("#deploys", 4, 1));
+        let archive = app.corpus.conv_archive(conv).unwrap();
+        // The union folds in MESSAGE rows only; the full archive keeps the
+        // three members the thread archive has none of.
+        assert_eq!(archive.rel, "full/y");
+        assert_eq!(
+            archive.im_counterpart("C9", Some("U1")),
+            Ok(crate::archive::Counterpart::Ambiguous(3))
+        );
+        // The root arrives from both archives and is one message, not two.
+        assert_eq!(
+            archive.thread("C9", 1_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000, 2_000_000, 3_000_000]
+        );
+        assert_eq!(archive.timeline_count("C9").unwrap(), 2);
+
+        open_named(&mut app, "#deploys");
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("the root") && screen.contains("unrelated line"), "{screen}");
+        select_message(&mut app, "the root");
+        app.on_msg_key(Some(Action::Open));
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("my reply") && screen.contains("their answer"), "{screen}");
+
+        app.escape_home();
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000],
+            "the same thread out of two archives is one card"
+        );
+        let screen = drawn(&mut app, 120, 30);
+        assert_eq!(screen.matches("their answer").count(), 1, "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One `threads/` archive can hold threads from several channels; each
+    /// becomes its own conversation.
+    #[test]
+    fn threads_from_two_channels_in_one_archive_make_two_conversations() {
+        let root = crate::archive::test_dir("threads-set-two");
+        dm_archive(&root.join("dms/self"), "U1");
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C8", "alerts", Kind::Channel), ("C9", "deploys", Kind::Channel)],
+            &[
+                ("C8", 1, 1, "U2", "alert root"),
+                ("C8", 2, 1, "U1", "alert reply"),
+                ("C9", 3, 3, "U2", "deploy root"),
+                ("C9", 4, 3, "U1", "deploy reply"),
+            ],
+        );
+        let mut app = corpus_app(&root);
+        let mut named: Vec<&str> = app
+            .corpus
+            .convs
+            .iter()
+            .filter(|c| c.id.starts_with('C'))
+            .map(|c| c.name.as_str())
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, ["#alerts", "#deploys"]);
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("#alerts") && screen.contains("#deploys"), "{screen}");
+        open_named(&mut app, "#alerts");
+        assert!(drawn(&mut app, 120, 30).contains("alert root"));
+        open_named(&mut app, "#deploys");
+        assert!(drawn(&mut app, 120, 30).contains("deploy root"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A hidden directory is an archive still being written, in the new set as
+    /// in the old ones.
+    #[test]
+    fn a_hidden_directory_in_the_threads_set_is_skipped() {
+        let root = crate::archive::test_dir("threads-set-hidden");
+        dm_archive(&root.join("dms/self"), "U1");
+        crate::archive::channel_database(
+            &root.join("threads/.tmp"),
+            &[("C7", "half-written", Kind::Channel)],
+            &[("C7", 1, 1, "U2", "not ready yet")],
+        );
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 2, 2, "U2", "ready")],
+        );
+        let mut app = corpus_app(&root);
+        assert!(app.corpus.conv_by_channel("C7").is_none());
+        assert!(app.corpus.conv_by_channel("C9").is_some());
+        let screen = drawn(&mut app, 120, 30);
+        assert!(!screen.contains("half-written"), "{screen}");
+        assert!(screen.contains("#deploys"), "{screen}");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `me` still comes from `dms/` when a `threads/` archive carries direct
+    /// messages of its own. This pins owner discovery, not the set order:
+    /// `Corpus::open` sorts `dms/` archives to the front before asking any of
+    /// them, whatever position `dms` has in `ARCHIVE_SETS`. The set order is
+    /// what the two union tests above pin.
+    #[test]
+    fn the_owner_is_read_from_the_dm_archive_not_a_thread_archive() {
+        let root = crate::archive::test_dir("threads-set-me");
+        dm_archive(&root.join("dms/self"), "U1");
+        let threads = root.join("threads/x");
+        crate::archive::channel_database(
+            &threads,
+            &[
+                ("D8", "", Kind::Im),
+                ("D9", "", Kind::Im),
+                ("C9", "deploys", Kind::Channel),
+            ],
+            &[
+                ("D8", 200, 0, "U9", "one"),
+                ("D9", 201, 0, "U9", "two"),
+                ("C9", 1, 1, "U2", "the root"),
+                ("C9", 2, 1, "U1", "my reply"),
+            ],
+        );
+        crate::archive::add_members(
+            &threads,
+            &[("D8", "U9"), ("D8", "U4"), ("D9", "U9"), ("D9", "U6")],
+        );
+        let mut app = corpus_app(&root);
+        assert_eq!(app.corpus.me.as_deref(), Some("U1"));
+        // The owner is what the recency score counts, so it lands in the list.
+        assert_eq!(app.corpus.convs[app.corpus.conv_by_channel("C9").unwrap()].mine, 1);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.active_list().unwrap().msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000]
+        );
+        assert!(drawn(&mut app, 120, 30).contains("the root"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `threads/` archive of a direct message unions into the `dms/`
+    /// archive, not the other way round. That pins `threads` after `dms` in
+    /// `ARCHIVE_SETS`: the thread archive's `CHANNEL` row for a DM carries no
+    /// membership, so were it the primary the conversation would lose its
+    /// counterpart and answer to `@D1`.
+    #[test]
+    fn a_thread_archive_of_a_direct_message_unions_into_the_dm_archive() {
+        let root = crate::archive::test_dir("threads-set-dm");
+        let dms = root.join("dms/self");
+        crate::archive::channel_database(
+            &dms,
+            &[("D1", "", Kind::Im), ("D2", "", Kind::Im)],
+            &[
+                ("D1", 10, 10, "U5", "dm root"),
+                ("D1", 11, 0, "U1", "plain dm line"),
+                ("D2", 101, 0, "U7", "hi"),
+            ],
+        );
+        crate::archive::add_members(
+            &dms,
+            &[("D1", "U1"), ("D1", "U5"), ("D2", "U1"), ("D2", "U7")],
+        );
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("D1", "", Kind::Im)],
+            &[("D1", 10, 10, "U5", "dm root"), ("D1", 12, 10, "U1", "my dm reply")],
+        );
+        let mut app = corpus_app(&root);
+        assert_eq!(app.corpus.me.as_deref(), Some("U1"));
+        assert_eq!(app.corpus.convs.iter().filter(|c| c.id == "D1").count(), 1);
+        let conv = &app.corpus.convs[app.corpus.conv_by_channel("D1").unwrap()];
+        let archive = app.corpus.conv_archive(conv).unwrap();
+        assert_eq!(archive.rel, "dms/self");
+        // The name and the counterpart both come off the membership the
+        // thread archive has none of.
+        assert_eq!((conv.name.as_str(), conv.kind), ("@u5", Kind::Im));
+        assert_eq!(
+            archive.im_counterpart("D1", Some("U1")),
+            Ok(Counterpart::User("U5".to_string()))
+        );
+        // The thread archive's reply is unioned in, and the root both hold is
+        // one message.
+        assert_eq!(
+            archive.thread("D1", 10_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [10_000_000, 12_000_000]
+        );
+        assert_eq!((conv.msgs, conv.mine), (3, 2));
+
+        open_named(&mut app, "@u5");
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("@u5") && screen.contains("dm root"), "{screen}");
+        assert!(!screen.contains("@D1"), "{screen}");
+        select_message(&mut app, "dm root");
+        app.on_msg_key(Some(Action::Open));
+        assert!(drawn(&mut app, 120, 30).contains("my dm reply"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `/cache start` on a channel only a `threads/` archive holds: the new
+    /// `full/` archive takes over as primary the moment it is registered,
+    /// rather than at the next restart. Until it does, the conversation reads
+    /// its name, kind and membership out of the thread archive, which has no
+    /// members at all.
+    #[test]
+    fn a_full_archive_added_at_runtime_takes_over_from_a_thread_archive() {
+        let root = crate::archive::test_dir("threads-set-takeover");
+        dm_archive(&root.join("dms/self"), "U1");
+        crate::archive::channel_database(
+            &root.join("threads/x"),
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 1, 1, "U2", "the root"), ("C9", 2, 1, "U1", "my reply")],
+        );
+        let mut app = corpus_app(&root);
+        open_named(&mut app, "#deploys");
+        let index = app.corpus.conv_by_channel("C9").unwrap();
+        assert_eq!(app.corpus.archives[app.corpus.convs[index].archive].rel, "threads/x");
+        assert_eq!(
+            app.corpus.archives[app.corpus.convs[index].archive]
+                .im_counterpart("C9", Some("U1")),
+            Ok(Counterpart::Ambiguous(0))
+        );
+
+        // A second thread of the same channel arrives first and folds into the
+        // one already primary, both being in the same set. It has to come
+        // along when the primary changes, or its messages are lost.
+        let sibling = root.join("threads/y");
+        crate::archive::channel_database(
+            &sibling,
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 3, 3, "U2", "another root"), ("C9", 4, 3, "U1", "another reply")],
+        );
+        app.corpus.add_archive(&sibling).unwrap();
+
+        // What the ArchiveNew job leaves behind: slackdump writes the whole
+        // channel into a hidden directory under full/, and the Done arm hands
+        // it to finish_archive, which names it and registers it.
+        let written = root.join("full/.new-1");
+        crate::archive::channel_database(
+            &written,
+            &[("C9", "deploys", Kind::Channel)],
+            &[("C9", 1, 1, "U2", "the root"), ("C9", 9, 0, "U3", "unrelated line")],
+        );
+        crate::archive::add_members(&written, &[("C9", "U1"), ("C9", "U2"), ("C9", "U3")]);
+
+        // What Slack told this session about the conversation is in no
+        // archive, so rebuilding the Conv from the new primary has to carry it.
+        app.muted.insert("C9".to_string());
+        {
+            let conv = &mut app.corpus.convs[index];
+            conv.last_read = 1_500_000;
+            conv.unread = true;
+            conv.unread_count = Some(4);
+            conv.unread_snapshot = Some("1.500000".to_string());
+            conv.muted = true;
+            conv.mentions = 2;
+        }
+        app.finish_archive(&written, "#deploys", false);
+        assert!(app.status.starts_with("archived deploys"), "{}", app.status);
+
+        let index = app.corpus.conv_by_channel("C9").unwrap();
+        let conv = &app.corpus.convs[index];
+        let archive = app.corpus.conv_archive(conv).unwrap();
+        assert!(archive.rel.starts_with("full/"), "{}", archive.rel);
+        // Both thread archives are now its sources, not its replacements.
+        assert_eq!(archive.source_dirs.len(), 3);
+        assert_eq!(
+            archive.thread("C9", 3_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [3_000_000, 4_000_000],
+            "the sibling thread archive came along"
+        );
+        assert_eq!(
+            archive.im_counterpart("C9", Some("U1")),
+            Ok(Counterpart::Ambiguous(3))
+        );
+        assert_eq!((conv.name.as_str(), conv.kind, conv.msgs, conv.mine), ("#deploys", Kind::Channel, 5, 2));
+        assert_eq!(
+            (conv.last_read, conv.unread, conv.unread_count, conv.unread_snapshot.as_deref(), conv.muted, conv.mentions),
+            (1_500_000, true, Some(4), Some("1.500000"), true, 2),
+            "the swap kept what only Slack knows"
+        );
+        assert_eq!(
+            archive.thread("C9", 1_000_000).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1_000_000, 2_000_000]
+        );
+
+        // Reopening reads the union: the full archive's own line and the
+        // thread archive's reply are both there.
+        open_named(&mut app, "#deploys");
+        let screen = drawn(&mut app, 120, 30);
+        assert!(screen.contains("the root") && screen.contains("unrelated line"), "{screen}");
+        select_message(&mut app, "the root");
+        app.on_msg_key(Some(Action::Open));
+        assert!(drawn(&mut app, 120, 30).contains("my reply"));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
