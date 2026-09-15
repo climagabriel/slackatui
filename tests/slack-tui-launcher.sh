@@ -3,8 +3,8 @@
 set -euo pipefail
 unset XDG_CACHE_HOME SLACK_TUI_REBUILD SLACK_TUI_FAKE_BUILD_FAILURE
 
-plugin_root=$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-launcher=$plugin_root/bin/slack-tui
+repo_root=$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+launcher=$repo_root/bin/slack-tui
 test_root=$(mktemp --directory /tmp/slack-tui-launcher.XXXXXX)
 trap 'rm --recursive --force -- "$test_root"' EXIT
 

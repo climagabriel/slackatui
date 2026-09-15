@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # maturity: low; issues-found: 3
-# slack-tui - front door for libexec/slack-tui, a Rust crate. Builds it on
+# slack-tui - front door for the crate in the repository root. Builds it on
 # first use into the user's cache and execs the binary; rebuilds when the
-# source changes (checksum), so a plugin update takes effect on the next run.
-# The build never lands beside the source: a plugin install is read-only and
-# replaced wholesale on update.
+# source changes (checksum), so a pull takes effect on the next run.
+# The build never lands beside the source: the checkout stays clean and the
+# same launcher serves a read-only install.
 #
 # Needs cargo (https://rustup.rs) and a C compiler for the bundled SQLite.
 set -euo pipefail
 
 here=$(cd "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
-src="$here/../libexec/slack-tui"
+src="$here/.."
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/slack-tui"
 bin="$cache/bin/slack-tui"
 stamp="$cache/source.sha256"
@@ -68,7 +68,7 @@ launcher flags
                       Reject --build/--rebuild/--build-debug and all application
                       arguments. --help takes precedence without pruning.
                       Waits for builds using this launcher's lock; stop builds
-                      from older plugin releases before pruning.
+                      from older checkouts before pruning.
   --build, --rebuild  synonyms; force a slack-tui release rebuild and imply
                       --verbose
   --build-debug      always rebuild the dev profile with full debug symbols,
@@ -170,12 +170,10 @@ if ((debug_build)); then
     export RUST_BACKTRACE=full
 fi
 
-# What /version shows: the plugin manifest beside this launcher, so a plugin
-# update is visible in the TUI without a rebuild.
-if [[ -z "${SLACK_TUI_VERSION:-}" && -r "$here/../.claude-plugin/plugin.json" ]]; then
-    SLACK_TUI_VERSION=$(sed --quiet \
-        's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-        "$here/../.claude-plugin/plugin.json" | head -1)
+# What /version shows: the checkout's git description, so a pull is visible in
+# the TUI without a rebuild; the crate's own version when git cannot answer.
+if [[ -z "${SLACK_TUI_VERSION:-}" ]] && command -v git >/dev/null 2>&1; then
+    SLACK_TUI_VERSION=$(git -C "$src" describe --tags --always --dirty 2>/dev/null || true)
     export SLACK_TUI_VERSION
 fi
 

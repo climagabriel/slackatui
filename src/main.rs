@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-/// What `/version` shows: the plugin version the launcher exports, and the
+/// What `/version` shows: the git description the launcher exports, and the
 /// crate's own when slack-tui was started some other way.
 pub fn version() -> &'static str {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -248,7 +248,7 @@ environment
   SLACK_TUI_KEYS       where /keys saves the key bindings (default keys.json
                        beside the palette)
   SLACK_TUI_VERSION    the version /version shows (the launcher sets it from
-                       the plugin manifest; the crate's own version otherwise)
+                       git describe; the crate's own version otherwise)
   SLACKDUMPS           archive root when --root is not given
   SLACK_WORKSPACE      workspace name or HTTPS Slack URL when no archive
                        identifies it; defaults to slackdump's selected workspace

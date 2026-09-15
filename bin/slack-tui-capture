@@ -14,9 +14,9 @@ usage: slack-tui-capture --keys "g j j Enter" [--binary PATH] [--size 170x50]
 --keys     tmux send-keys tokens, space separated. A token `sleep:N` waits N
            seconds before the next key; `Enter`, `Escape`, `Tab`, `Up`, `Down`
            and other tmux key names pass through; anything else is typed.
---binary   the launcher to run (default: slack-tui on PATH). Pass the versioned
-           plugin-cache path when the session's PATH is frozen on an older
-           release, as the slack-tui-developer agent prose explains.
+--binary   the launcher to run (default: slack-tui on PATH). Pass the
+           branch's own bin/slack-tui to capture the source under review
+           rather than whatever PATH resolves to.
 --size     terminal columns x rows (default 170x50).
 --settle   seconds to wait after launch before the first key (default 10),
            and after the last key before capturing (same value).
