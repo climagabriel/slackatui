@@ -177,11 +177,19 @@ if [[ -z "${SLACK_TUI_VERSION:-}" ]] && command -v git >/dev/null 2>&1; then
     export SLACK_TUI_VERSION
 fi
 
+# rustup installs cargo outside the system PATH and a service does not source
+# ~/.cargo/env, so a headless run (systemd, cron) would not find it. Probe the
+# default location before concluding a build is impossible.
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "slack-tui: cargo not found; install a Rust toolchain from https://rustup.rs" >&2
-    exit 2
+    cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+    [[ -x "$cargo_bin/cargo" ]] && PATH="$cargo_bin:$PATH"
 fi
-sum=$(cat "$src/Cargo.toml" "$src/Cargo.lock" "$src"/src/*.rs | sha256sum | cut --delimiter=' ' --fields=1)
+# The source digest must not depend on the caller's locale: a glob's expansion
+# order does, and a differing digest makes the launcher rebuild — demanding a
+# toolchain — on every run whose locale differs from the one that wrote the
+# stamp (a systemd service has none of the interactive shell's locale). Pin C
+# collation for the expansion only, so the exec'd application keeps its own.
+sum=$( ( export LC_ALL=C; cat "$src/Cargo.toml" "$src/Cargo.lock" "$src"/src/*.rs ) | sha256sum | cut --delimiter=' ' --fields=1)
 cached_sum=$(cat "$stamp" 2>/dev/null || true)
 needs_build=0
 build_reason="cached binary is current"
@@ -204,6 +212,12 @@ elif [[ "$cached_sum" != "$sum" ]]; then
 fi
 
 if ((needs_build)); then
+    # Only a build needs a toolchain; a current cached binary launches without
+    # one, so a headless caller is not blocked when cargo is absent.
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "slack-tui: cargo not found; install a Rust toolchain from https://rustup.rs" >&2
+        exit 2
+    fi
     echo "slack-tui: building ($build_reason)..." >&2
 elif ((verbose)); then
     echo "slack-tui: $build_reason; using $bin" >&2
