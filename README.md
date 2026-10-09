@@ -23,7 +23,7 @@ An archive is required. The root is `--root`, else `$SLACKDUMPS`, else `/srv/sla
   threads/my-threads_<yyyymm>/slackdump.sqlite  # the owner's threads
 ```
 
-Sign-in is optional and Linux-only: the client imports the session of a Slack desktop app already signed in on the same machine, from `~/snap/slack/current/.config/Slack` or `~/.config/Slack` (`SLACK_APP_DIR` overrides). `SLACK_TOKEN` (an `xoxc-` token) and `SLACK_COOKIE` (the `d` cookie, `xoxd-`) bypass the import. Credentials go only to slack.com hosts.
+Sign-in is optional and Linux-only: the client imports the session of a Slack desktop app already signed in on the same machine, from `~/snap/slack/current/.config/Slack` or `~/.config/Slack` (`SLACK_APP_DIR` overrides). `SLACK_TOKEN` (an `xoxc-` token) and `SLACK_COOKIE` (the `d` cookie, `xoxd-`) bypass the import. The imported pair is cached owner-only in `~/.config/slack-tui/auth.json` and reused by later runs, including headless `--call`. Credentials go only to slack.com hosts.
 
 ## Develop
 

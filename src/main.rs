@@ -674,7 +674,12 @@ fn run() -> i32 {
     {
         let scratch = std::env::temp_dir().join("slack-tui");
         let agent = api::agent();
-        let auth = match auth::from_env() {
+        // Credentials, in order: the environment, the cached session (the
+        // owner-only file sign-in writes), the desktop app. The CLI is the
+        // headless path -- scripts such as slackdump-my-threads run it where
+        // no desktop profile exists -- so the cache must be tried here too,
+        // as the TUI's sign-in already does.
+        let auth = match auth::from_env().or_else(auth::load_cached) {
             Some(a) => a,
             None => match auth::from_desktop(&agent, &corpus.workspace_url, &scratch) {
                 Ok(a) => a,
