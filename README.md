@@ -12,7 +12,7 @@ bin/slack-tui --help                        # launcher flags, then the applicati
 bin/slack-tui --rebuild                     # rebuild unconditionally
 ```
 
-Needs cargo ([rustup.rs](https://rustup.rs)), a C compiler for the bundled SQLite, and `flock`. The launcher rebuilds when the source checksum changes and builds into the cache, never beside the source.
+Needs cargo ([rustup.rs](https://rustup.rs)) and a C compiler for the bundled SQLite to build, and `flock`. The launcher rebuilds when the source checksum changes and builds into the cache, never beside the source; a current cached binary is run directly, so a headless caller (a service) needs no toolchain.
 
 An archive is required. The root is `--root`, else `$SLACKDUMPS`, else `/srv/slackdumps`. Under it, one directory per conversation set, each holding what `slackdump archive` writes:
 
