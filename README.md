@@ -35,6 +35,34 @@ bin/slack-tui-capture --binary bin/slack-tui --keys "g j Enter sleep:5"   # text
 
 See the [development instructions](.claude/agents/slack-tui-developer.md) for the crate layout, the auth model, the Web API writes the tool makes, and the live-write test rules.
 
+## Canvases without the TUI
+
+Reading and writing a canvas run headless, so a script can list a canvas's
+sections and replace one without opening the interface:
+
+```sh
+bin/slack-tui --dump-canvas F0123ABCD                       # the whole canvas as Markdown
+bin/slack-tui --canvas-sections F0123ABCD                   # one JSON line a section: id, editable, markdown
+printf '%s\n' '- a new bullet' \
+  | bin/slack-tui --canvas-edit F0123ABCD --op insert-at-end --markdown-file -
+bin/slack-tui --canvas-edit F0123ABCD --op replace --section temp:C:ABC --markdown-file new.md
+```
+
+`--op` is one of `replace`, `insert-after`, `insert-before`, `insert-at-start`,
+`insert-at-end`, `delete`. Every operation but `insert-at-start` and
+`insert-at-end` needs `--section SECTION_ID`; every one but `delete` needs
+`--markdown-file PATH` (or `-` for stdin). The write ends by reloading the
+canvas and printing the affected section. Slack offers no atomic revision
+check, so a `replace` or `delete` can overwrite an edit that landed since the
+last read; reload with `--canvas-sections` first.
+
+Writing needs a token Slack accepts for `canvases.edit`. The imported desktop
+session is an `xoxc-` token, and Slack answers `not_allowed_token_type` for
+`canvases.edit` on it, whether the token is sent as a bearer or in the form
+body. Reads work on the desktop session; writes need an app token with the
+`canvases:write` scope (`xoxb-` or `xoxp-`) passed through `SLACK_TOKEN`. The
+TUI's `:w` canvas save is subject to the same limit.
+
 ## Provenance
 
 slack-tui was imported from a private repository with its commit history on 2026-09-15. This repository is a GitHub fork of [MasonLiebe/slackatui](https://github.com/MasonLiebe/slackatui); the import merge replaced the fork's contents with slack-tui, and the previous contents remain in the earlier commits.

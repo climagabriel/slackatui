@@ -665,6 +665,116 @@ fn save_with(
     }
 }
 
+/// The `--op` names of `canvases.edit`, and how the debug CLI is used.
+pub const CANVAS_OPERATIONS: &str =
+    "replace, insert-after, insert-before, insert-at-start, insert-at-end or delete";
+
+/// The Slack operation name behind a CLI `--op` value.
+fn canvas_operation(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "replace" => "replace",
+        "insert-after" => "insert_after",
+        "insert-before" => "insert_before",
+        "insert-at-start" => "insert_at_start",
+        "insert-at-end" => "insert_at_end",
+        "delete" => "delete",
+        _ => return None,
+    })
+}
+
+/// Whether an operation names one section, and whether it carries Markdown.
+fn canvas_op_shape(op: &str) -> Option<(bool, bool)> {
+    Some(match op {
+        "replace" | "insert-after" | "insert-before" => (true, true),
+        "insert-at-start" | "insert-at-end" => (false, true),
+        "delete" => (true, false),
+        _ => return None,
+    })
+}
+
+/// Build the `changes` array for one `canvases.edit` call.
+pub fn edit_changes(
+    op: &str,
+    section: Option<&str>,
+    markdown: Option<&str>,
+) -> Result<Value, String> {
+    let operation = canvas_operation(op).ok_or_else(|| {
+        format!("unknown canvas operation '{op}'; expected {CANVAS_OPERATIONS}")
+    })?;
+    let (addresses_section, carries_markdown) = canvas_op_shape(op).expect("operation is known");
+    let mut change = serde_json::Map::new();
+    change.insert("operation".into(), json!(operation));
+    if addresses_section {
+        let id = section.filter(|id| !id.is_empty()).ok_or_else(|| {
+            format!("--op {op} needs --section SECTION_ID (list them with --canvas-sections)")
+        })?;
+        change.insert("section_id".into(), json!(id));
+    }
+    if carries_markdown {
+        let text = markdown.ok_or_else(|| {
+            format!("--op {op} needs --markdown-file PATH, or - to read the draft from stdin")
+        })?;
+        if text.trim().is_empty() {
+            return Err(
+                "a section cannot be saved empty; use --op delete to remove it instead".into(),
+            );
+        }
+        if text.len() > 1024 * 1024 {
+            return Err("section exceeds the 1 MiB canvases.edit limit".into());
+        }
+        change.insert(
+            "document_content".into(),
+            json!({"type": "markdown", "markdown": text}),
+        );
+    }
+    Ok(Value::Array(vec![Value::Object(change)]))
+}
+
+/// Apply one `canvases.edit` operation and return the reloaded document.
+///
+/// Slack has no atomic revision check, so a replace or delete can overwrite an
+/// edit that landed between the load and the write, exactly as the TUI's
+/// section editor can. Reload and re-derive the section id before writing.
+pub fn edit_document(
+    client: &Client,
+    canvas_id: &str,
+    op: &str,
+    section: Option<&str>,
+    markdown: Option<&str>,
+) -> Result<Document, String> {
+    let changes = edit_changes(op, section, markdown)?;
+    let current = load_document(client, canvas_id)?;
+    if !current.writable {
+        return Err(format!("canvas {canvas_id} is read-only for this account"));
+    }
+    if canvas_op_shape(op).is_some_and(|(addresses_section, _)| addresses_section) {
+        let wanted = section.unwrap_or("");
+        match current.sections.iter().find(|s| s.id == wanted) {
+            None => {
+                return Err(format!(
+                    "no section '{wanted}' in canvas {canvas_id}; list them with --canvas-sections"
+                ))
+            }
+            Some(s) if matches!(op, "replace" | "delete") && !s.editable => {
+                return Err(format!(
+                    "section '{wanted}' has unsupported formatting; edit it in Slack"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    client
+        .call(
+            "canvases.edit",
+            &[
+                ("canvas_id", canvas_id),
+                ("changes", &changes.to_string()),
+            ],
+        )
+        .map(|_| ())?;
+    load_document(client, canvas_id)
+}
+
 enum Loaded {
     Tabs(Vec<Tab>),
     Entries(Vec<Tab>),
@@ -1330,6 +1440,37 @@ mod tests {
     use super::*;
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn edit_changes_builds_one_operation_per_cli_name() {
+        let replace = edit_changes("replace", Some("sec1"), Some("- hello")).unwrap();
+        assert_eq!(
+            replace,
+            json!([{"operation": "replace", "section_id": "sec1",
+                "document_content": {"type": "markdown", "markdown": "- hello"}}])
+        );
+        let after = edit_changes("insert-after", Some("sec1"), Some("x")).unwrap();
+        assert_eq!(after[0]["operation"], json!("insert_after"));
+        assert_eq!(after[0]["section_id"], json!("sec1"));
+        let end = edit_changes("insert-at-end", None, Some("tail")).unwrap();
+        assert_eq!(end[0]["operation"], json!("insert_at_end"));
+        assert!(end[0].get("section_id").is_none());
+        let delete = edit_changes("delete", Some("sec1"), None).unwrap();
+        assert_eq!(delete[0]["operation"], json!("delete"));
+        assert!(delete[0].get("document_content").is_none());
+    }
+
+    #[test]
+    fn edit_changes_refuses_a_missing_piece_or_an_empty_section() {
+        assert!(edit_changes("replace", None, Some("x")).is_err());
+        assert!(edit_changes("replace", Some("sec1"), None).is_err());
+        assert!(edit_changes("delete", Some(""), None).is_err());
+        assert!(edit_changes("insert-at-end", None, Some("   \n")).is_err());
+        let huge = "x".repeat(1024 * 1024 + 1);
+        assert!(edit_changes("insert-at-end", None, Some(&huge)).is_err());
+        let error = edit_changes("frobnicate", Some("sec1"), Some("x")).unwrap_err();
+        assert!(error.contains("unknown canvas operation"), "{error}");
     }
     /// The wrapper the compose box, the `/find` overlay and the raw canvas
     /// view share: it breaks at spaces, and it keeps every byte, so a byte

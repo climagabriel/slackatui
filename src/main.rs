@@ -222,6 +222,27 @@ flags
   --call 'METHOD k=v ...'
                   one allowlisted read-only Web API call, JSON out (debug)
   --dump-canvas ID read a Slack canvas as Markdown and exit
+  --canvas-sections ID
+                  list a canvas's sections, one JSON object a line (id,
+                  editable, markdown), so a section id can be chosen for
+                  --canvas-edit; READ-ONLY
+  --canvas-edit ID
+                  write to a canvas with one canvases.edit operation and
+                  exit. Needs --op and, except for insert-at-start and
+                  insert-at-end, --section SECTION_ID; carries Markdown from
+                  --markdown-file PATH (or - for stdin). Ops: replace,
+                  insert-after, insert-before, insert-at-start,
+                  insert-at-end, delete. Slack offers no atomic revision
+                  check, so a replace or delete can overwrite an edit that
+                  landed since the load; reload with --canvas-sections first.
+                  Slack refuses canvases.edit on the imported xoxc desktop
+                  session, so a write needs an app token with canvases:write
+                  (xoxb-/xoxp-) in SLACK_TOKEN; reads need no such token
+  --op OP         the canvases.edit operation for --canvas-edit
+  --section SECTION_ID
+                  the section --canvas-edit addresses
+  --markdown-file PATH
+                  the Markdown --canvas-edit writes; - reads stdin
   --delete-message URL
                   delete your own message at that permalink (debug)
   --fetch-file URL OUT
@@ -416,6 +437,9 @@ examples
   slack-tui --channel '#team-alpha'
   slack-tui --dump alerts-alpha --limit 20
   SLACKDUMPS=/data/slackdumps slack-tui --list
+  slack-tui --canvas-sections F0123ABCD
+  slack-tui --canvas-edit F0123ABCD --op replace --section sec4 --markdown-file new.md
+  printf '%s\n' '- a new bullet' | slack-tui --canvas-edit F0123ABCD --op insert-at-end --markdown-file -
 ";
 
 struct Opts {
@@ -437,6 +461,11 @@ struct Opts {
     delete_message: Option<String>,
     call: Option<String>,
     dump_canvas: Option<String>,
+    canvas_sections: Option<String>,
+    canvas_edit: Option<String>,
+    op: Option<String>,
+    section: Option<String>,
+    markdown_file: Option<String>,
 }
 
 /// Methods the debug `--call` escape hatch may invoke. Keep this exact: Slack
@@ -510,6 +539,11 @@ fn parse_args() -> Result<Opts, String> {
         delete_message: None,
         call: None,
         dump_canvas: None,
+        canvas_sections: None,
+        canvas_edit: None,
+        op: None,
+        section: None,
+        markdown_file: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -554,6 +588,13 @@ fn parse_args() -> Result<Opts, String> {
                 opts.delete_message = Some(value("--delete-message")?);
             }
             "--dump-canvas" => opts.dump_canvas = Some(value("--dump-canvas")?),
+            "--canvas-sections" => {
+                opts.canvas_sections = Some(value("--canvas-sections")?)
+            }
+            "--canvas-edit" => opts.canvas_edit = Some(value("--canvas-edit")?),
+            "--op" => opts.op = Some(value("--op")?),
+            "--section" => opts.section = Some(value("--section")?),
+            "--markdown-file" => opts.markdown_file = Some(value("--markdown-file")?),
             "--call" => {
                 let spec = value("--call")?;
                 read_only_call_method(&spec)?;
@@ -629,7 +670,8 @@ fn run() -> i32 {
         }
     };
     let interactive = !opts.list && opts.dump.is_none() && !opts.auth_check && opts.fetch_file.is_none()
-        && opts.delete_message.is_none() && opts.call.is_none() && opts.dump_canvas.is_none();
+        && opts.delete_message.is_none() && opts.call.is_none() && opts.dump_canvas.is_none()
+        && opts.canvas_sections.is_none() && opts.canvas_edit.is_none();
     if interactive {
         match session_log::start() {
             Ok(path) => eprintln!("slack-tui: session log {}", path.display()),
@@ -671,6 +713,8 @@ fn run() -> i32 {
         || opts.delete_message.is_some()
         || opts.call.is_some()
         || opts.dump_canvas.is_some()
+        || opts.canvas_sections.is_some()
+        || opts.canvas_edit.is_some()
     {
         let scratch = std::env::temp_dir().join("slack-tui");
         let agent = api::agent();
@@ -695,6 +739,87 @@ fn run() -> i32 {
             return match canvas::load_document(&client, id) {
                 Ok(document) => emit(&(document.sections.iter().map(|s|s.markdown.as_str()).collect::<Vec<_>>().join("\n\n") + "\n")),
                 Err(error) => { eprintln!("slack-tui: {error}"); 1 },
+            };
+        }
+        if let Some(id) = &opts.canvas_sections {
+            let client = api::Client::new(auth);
+            return match canvas::load_document(&client, id) {
+                Ok(document) => {
+                    let mut out = String::new();
+                    for section in &document.sections {
+                        out.push_str(
+                            &serde_json::json!({
+                                "id": section.id,
+                                "editable": section.editable,
+                                "markdown": section.markdown,
+                            })
+                            .to_string(),
+                        );
+                        out.push('\n');
+                    }
+                    emit(&out)
+                }
+                Err(error) => {
+                    eprintln!("slack-tui: {error}");
+                    1
+                }
+            };
+        }
+        if let Some(id) = &opts.canvas_edit {
+            let Some(op) = opts.op.clone() else {
+                eprintln!(
+                    "slack-tui: --canvas-edit needs --op ({})",
+                    canvas::CANVAS_OPERATIONS
+                );
+                return 2;
+            };
+            let markdown = match opts.markdown_file.as_deref() {
+                Some("-") => {
+                    use std::io::Read;
+                    let mut text = String::new();
+                    match std::io::stdin().read_to_string(&mut text) {
+                        Ok(_) => Some(text),
+                        Err(e) => {
+                            eprintln!("slack-tui: reading stdin: {e}");
+                            return 1;
+                        }
+                    }
+                }
+                Some(path) => match std::fs::read_to_string(path) {
+                    Ok(text) => Some(text),
+                    Err(e) => {
+                        eprintln!("slack-tui: reading {path}: {e}");
+                        return 1;
+                    }
+                },
+                None => None,
+            };
+            let client = api::Client::new(auth);
+            let section = opts.section.as_deref();
+            return match canvas::edit_document(&client, id, &op, section, markdown.as_deref()) {
+                Ok(document) => {
+                    let now = document.sections.len();
+                    match section {
+                        Some(sid) if document.sections.iter().any(|s| s.id == sid) => {
+                            let text = document
+                                .sections
+                                .iter()
+                                .find(|s| s.id == sid)
+                                .map(|s| s.markdown.clone())
+                                .unwrap_or_default();
+                            println!("{op} {sid} on canvas {id}; {now} sections now:\n{text}");
+                        }
+                        Some(sid) => println!(
+                            "{op} applied on canvas {id}; section {sid} is gone, {now} sections now"
+                        ),
+                        None => println!("{op} applied on canvas {id}; {now} sections now"),
+                    }
+                    0
+                }
+                Err(error) => {
+                    eprintln!("slack-tui: {error}");
+                    1
+                }
             };
         }
         if let Some(spec) = &opts.call {
