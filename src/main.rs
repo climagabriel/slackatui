@@ -5,6 +5,7 @@ mod app;
 mod canvas;
 mod canvas_markdown;
 mod canvas_history;
+mod canvas_internal;
 mod file_message;
 mod archive;
 mod auth;
@@ -238,11 +239,33 @@ flags
                   Slack refuses canvases.edit on the imported xoxc desktop
                   session, so a write needs an app token with canvases:write
                   (xoxb-/xoxp-) in SLACK_TOKEN; reads need no such token
+  --canvas-internal-dump ID
+                  read a canvas through the internal canvas/-/ endpoints the
+                  desktop client uses, one JSON line per section: the
+                  document id, then each section's id, key, kind, edit token
+                  and text; READ-ONLY. Unlike --canvas-sections, which parses
+                  the HTML export, this exposes the section key and edit
+                  token
+  --canvas-internal-append ID
+                  append one new section to a canvas through the internal
+                  canvas/-/edit-document endpoint the desktop client uses,
+                  which accepts the imported xoxc session token. The section
+                  is --markdown-file PATH (or - for standard input); the
+                  server assigns its kind and a key that sorts after the
+                  last existing section's
+  --canvas-internal-set ID
+                  replace one existing section's text through the same
+                  endpoint. Needs --section SECTION_ID (from
+                  --canvas-internal-dump, not --canvas-sections) and
+                  --markdown-file PATH. The section's key and kind go back
+                  unchanged
   --op OP         the canvases.edit operation for --canvas-edit
   --section SECTION_ID
-                  the section --canvas-edit addresses
+                  the section --canvas-edit or --canvas-internal-set
+                  addresses
   --markdown-file PATH
-                  the Markdown --canvas-edit writes; - reads stdin
+                  the Markdown --canvas-edit, --canvas-internal-append and
+                  --canvas-internal-set write; - reads standard input
   --delete-message URL
                   delete your own message at that permalink (debug)
   --fetch-file URL OUT
@@ -463,6 +486,9 @@ struct Opts {
     dump_canvas: Option<String>,
     canvas_sections: Option<String>,
     canvas_edit: Option<String>,
+    canvas_internal_dump: Option<String>,
+    canvas_internal_append: Option<String>,
+    canvas_internal_set: Option<String>,
     op: Option<String>,
     section: Option<String>,
     markdown_file: Option<String>,
@@ -541,6 +567,9 @@ fn parse_args() -> Result<Opts, String> {
         dump_canvas: None,
         canvas_sections: None,
         canvas_edit: None,
+        canvas_internal_dump: None,
+        canvas_internal_append: None,
+        canvas_internal_set: None,
         op: None,
         section: None,
         markdown_file: None,
@@ -592,6 +621,15 @@ fn parse_args() -> Result<Opts, String> {
                 opts.canvas_sections = Some(value("--canvas-sections")?)
             }
             "--canvas-edit" => opts.canvas_edit = Some(value("--canvas-edit")?),
+            "--canvas-internal-dump" => {
+                opts.canvas_internal_dump = Some(value("--canvas-internal-dump")?)
+            }
+            "--canvas-internal-append" => {
+                opts.canvas_internal_append = Some(value("--canvas-internal-append")?)
+            }
+            "--canvas-internal-set" => {
+                opts.canvas_internal_set = Some(value("--canvas-internal-set")?)
+            }
             "--op" => opts.op = Some(value("--op")?),
             "--section" => opts.section = Some(value("--section")?),
             "--markdown-file" => opts.markdown_file = Some(value("--markdown-file")?),
@@ -648,6 +686,138 @@ pub fn trace(what: &str) {
 }
 
 /// Print, and treat a closed pipe (`| head`) as a normal end.
+/// `--canvas-internal-dump`: the canvas through the endpoints the desktop
+/// client uses, which give the section key and edit token the HTML export
+/// does not.
+fn canvas_internal_read(client: &api::Client, file_id: &str) -> Result<String, String> {
+    let context = canvas_internal_context(client, file_id)?;
+    let mut out = serde_json::json!({
+        "document": context.state.document,
+        "thread": context.state.thread,
+        "sections": context.state.sections.len(),
+    })
+    .to_string();
+    out.push('\n');
+    for section in &context.state.sections {
+        out.push_str(
+            &serde_json::json!({
+                "id": section.id,
+                "key": section.key,
+                "kind": section.kind,
+                "token": section.token,
+                "text": section.text,
+            })
+            .to_string(),
+        );
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// `--canvas-internal-append`: append one new section through the internal
+/// endpoint, which accepts the imported session token `canvases.edit` refuses.
+fn canvas_internal_append(
+    client: &api::Client,
+    file_id: &str,
+    markdown: &str,
+) -> Result<String, String> {
+    let context = canvas_internal_context(client, file_id)?;
+    let id = canvas_internal::mint_section_id();
+    let session = canvas_internal::mint_session();
+    let key = canvas_internal::next_key(context.state.sections.iter().map(|s| s.key.clone()));
+    let token = format!("{session}-0");
+    let change = canvas_internal::append_change(&id, &key, markdown.trim_end(), &token);
+    canvas_internal::edit_document(
+        client,
+        &context.target.host,
+        &context.target,
+        &context.state.document,
+        &change,
+        &session,
+        1,
+    )?;
+    Ok(format!(
+        "appended section {id} (key {key}) to canvas {file_id}; {} sections now\n",
+        context.state.sections.len() + 1
+    ))
+}
+
+/// `--canvas-internal-set`: replace one existing section's text through the
+/// same endpoint, leaving its key and kind as they were.
+fn canvas_internal_set(
+    client: &api::Client,
+    file_id: &str,
+    section_id: &str,
+    markdown: &str,
+) -> Result<String, String> {
+    let context = canvas_internal_context(client, file_id)?;
+    let section = context
+        .state
+        .sections
+        .iter()
+        .find(|s| s.id == section_id)
+        .ok_or_else(|| {
+            format!(
+                "no section {section_id} in canvas {file_id}; list the ids with \
+                 --canvas-internal-dump"
+            )
+        })?;
+    let session = canvas_internal::mint_session();
+    let token = format!("{session}-0");
+    let change = canvas_internal::set_change(
+        &section.id,
+        section.kind,
+        &section.key,
+        markdown.trim_end(),
+        &token,
+    );
+    canvas_internal::edit_document(
+        client,
+        &context.target.host,
+        &context.target,
+        &context.state.document,
+        &change,
+        &session,
+        1,
+    )?;
+    Ok(format!(
+        "replaced the text of section {section_id} on canvas {file_id}\n"
+    ))
+}
+
+/// The host, thread and current state every internal call starts from.
+struct InternalContext {
+    target: canvas_internal::Target,
+    state: canvas_internal::State,
+}
+
+fn canvas_internal_context(
+    client: &api::Client,
+    file_id: &str,
+) -> Result<InternalContext, String> {
+    let target = canvas_internal::target(client, file_id)?;
+    let bytes = canvas_internal::load_state(client, &target.host, &target.thread)?;
+    let state = canvas_internal::parse_state(&bytes)?;
+    Ok(InternalContext { target, state })
+}
+
+/// The markdown the internal write flags send: `--markdown-file PATH`, or
+/// stdin for `-`.
+fn internal_markdown(opts: &Opts) -> Result<String, String> {
+    match opts.markdown_file.as_deref() {
+        Some("-") => {
+            use std::io::Read;
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|e| format!("reading stdin: {e}"))?;
+            Ok(text)
+        }
+        Some(path) => std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}")),
+        None => Err("needs --markdown-file PATH (or - for stdin)".to_string()),
+    }
+}
+
 fn emit(text: &str) -> i32 {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -671,7 +841,9 @@ fn run() -> i32 {
     };
     let interactive = !opts.list && opts.dump.is_none() && !opts.auth_check && opts.fetch_file.is_none()
         && opts.delete_message.is_none() && opts.call.is_none() && opts.dump_canvas.is_none()
-        && opts.canvas_sections.is_none() && opts.canvas_edit.is_none();
+        && opts.canvas_sections.is_none() && opts.canvas_edit.is_none()
+        && opts.canvas_internal_dump.is_none() && opts.canvas_internal_append.is_none()
+        && opts.canvas_internal_set.is_none();
     if interactive {
         match session_log::start() {
             Ok(path) => eprintln!("slack-tui: session log {}", path.display()),
@@ -715,6 +887,9 @@ fn run() -> i32 {
         || opts.dump_canvas.is_some()
         || opts.canvas_sections.is_some()
         || opts.canvas_edit.is_some()
+        || opts.canvas_internal_dump.is_some()
+        || opts.canvas_internal_append.is_some()
+        || opts.canvas_internal_set.is_some()
     {
         let scratch = std::env::temp_dir().join("slack-tui");
         let agent = api::agent();
@@ -759,6 +934,54 @@ fn run() -> i32 {
                     }
                     emit(&out)
                 }
+                Err(error) => {
+                    eprintln!("slack-tui: {error}");
+                    1
+                }
+            };
+        }
+        if let Some(id) = &opts.canvas_internal_dump {
+            let client = api::Client::new(auth);
+            return match canvas_internal_read(&client, id) {
+                Ok(text) => emit(&text),
+                Err(error) => {
+                    eprintln!("slack-tui: {error}");
+                    1
+                }
+            };
+        }
+        if let Some(id) = &opts.canvas_internal_append {
+            let markdown = match internal_markdown(&opts) {
+                Ok(markdown) => markdown,
+                Err(error) => {
+                    eprintln!("slack-tui: --canvas-internal-append {error}");
+                    return 2;
+                }
+            };
+            let client = api::Client::new(auth);
+            return match canvas_internal_append(&client, id, &markdown) {
+                Ok(text) => emit(&text),
+                Err(error) => {
+                    eprintln!("slack-tui: {error}");
+                    1
+                }
+            };
+        }
+        if let Some(id) = &opts.canvas_internal_set {
+            let Some(section) = opts.section.clone() else {
+                eprintln!("slack-tui: --canvas-internal-set needs --section SECTION_ID");
+                return 2;
+            };
+            let markdown = match internal_markdown(&opts) {
+                Ok(markdown) => markdown,
+                Err(error) => {
+                    eprintln!("slack-tui: --canvas-internal-set {error}");
+                    return 2;
+                }
+            };
+            let client = api::Client::new(auth);
+            return match canvas_internal_set(&client, id, &section, &markdown) {
+                Ok(text) => emit(&text),
                 Err(error) => {
                     eprintln!("slack-tui: {error}");
                     1

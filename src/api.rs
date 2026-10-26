@@ -89,6 +89,42 @@ impl Client {
         Err(format!("{method}: rate limited"))
     }
 
+    /// POST a form to a workspace host and return the raw body. The
+    /// `<workspace>/canvas/-/...` endpoints carry the session token in the
+    /// form body, not an `Authorization` header, and answer with protobuf
+    /// rather than JSON, so `call` cannot serve them.
+    pub fn internal_post(
+        &self,
+        host: &str,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> Result<Vec<u8>, String> {
+        let url = format!("https://{host}{path}");
+        let mut fields: Vec<(&str, &str)> = form.to_vec();
+        fields.push(("token", self.auth.token.as_str()));
+        let mut resp = self
+            .agent
+            .post(&url)
+            .header("Cookie", &format!("d={}", self.auth.cookie))
+            .header("Origin", "https://app.slack.com")
+            .send_form(fields)
+            .map_err(|e| format!("{path}: {e}"))?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(16 * 1024 * 1024)
+            .read_to_vec()
+            .map_err(|e| format!("{path}: {e}"))?;
+        if status != 200 {
+            return Err(format!(
+                "{path}: HTTP {status} {}",
+                String::from_utf8_lossy(&body).trim()
+            ));
+        }
+        Ok(body)
+    }
+
     /// Who the token is: (user id, user name, team name).
     pub fn auth_test(&self) -> Result<(String, String, String), String> {
         let v = self.call("auth.test", &[])?;
